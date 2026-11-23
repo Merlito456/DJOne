@@ -38,11 +38,14 @@ import {
   Check,
   Upload,
   Trash2,
+  Sliders,
 } from 'lucide-react';
 import { ALL_VOICE_IDS, DJ_VOICE_CATEGORIES, DJ_VOICE_LIBRARY } from '../audio/djVoices';
+import { DEFAULT_AI_FEATURE_TOGGLES } from '../audio/offlineAiDj';
 import {
   AiDjVibe,
   AiEnergyMode,
+  AiFeatureKey,
   AutopilotState,
   CustomVoiceDropMeta,
   CustomVoiceSlotId,
@@ -50,8 +53,10 @@ import {
   DjVoiceCategory,
   DjVoiceDropId,
   GrooveBridgePattern,
+  MashupTemplateId,
   Playlist,
   SoundTrickType,
+  VoiceFrequencyMode,
 } from '../types/dj';
 
 const BRIDGE_LABELS: Record<GrooveBridgePattern, string> = {
@@ -62,6 +67,13 @@ const BRIDGE_LABELS: Record<GrooveBridgePattern, string> = {
   'afro-perc': 'Bridge: Afro',
   'chord-arp': 'Bridge: Arp',
 };
+
+const MASHUP_TEMPLATES: { id: MashupTemplateId; label: string; title: string }[] = [
+  { id: 'club-groove-swap', label: 'Club', title: 'Club Groove Swap: Smooth 16-bar vocal ride + dynamic mid carving' },
+  { id: 'festival-double-drop', label: 'Fest', title: 'Festival Double-Drop: 8-bar HPF snare build + 1-beat silence + dual slam' },
+  { id: 'hiphop-cut', label: 'HipHop', title: 'Hip-Hop Cut: Wordplay cue-juggles + baby-scratch + 2-beat ping-pong' },
+  { id: 'dub-echo-flip', label: 'Dub', title: 'Dub & Echo Flip: Dotted dub delays + tape-brake + vocal callbacks' },
+];
 
 interface AiAutopilotPanelProps {
   autopilot: AutopilotState;
@@ -80,6 +92,7 @@ interface AiAutopilotPanelProps {
   onTriggerWildTake: () => void;
   onTargetPlaylistChange: (playlistId: string) => void;
   onVibeChange: (vibe: AiDjVibe) => void;
+  onMashupTemplateChange: (template: MashupTemplateId) => void;
   onMixNow: () => void;
   onDirectAi: (direction: string) => void;
   onMashupBlend: () => void;
@@ -88,6 +101,8 @@ interface AiAutopilotPanelProps {
   onSwapUpcomingStyle: () => void;
   onToggleMuteSfx: () => void;
   onToggleVoiceFx: () => void;
+  onVoiceVolumeChange: (vol: number) => void;
+  onVoiceFrequencyChange: (freq: VoiceFrequencyMode) => void;
   onToggleVoiceItem: (voiceId: DjVoiceDropId) => void;
   onSetVoiceCategoryEnabled: (category: DjVoiceCategory, enabled: boolean) => void;
   onEnableAllVoices: (enableAll: boolean) => void;
@@ -99,10 +114,69 @@ interface AiAutopilotPanelProps {
   onUploadCustomSlot: (slotId: CustomVoiceSlotId, file: File) => void;
   onTriggerCustomSlot: (slotId: CustomVoiceSlotId) => void;
   onToggleCustomSlotEnabled: (slotId: CustomVoiceSlotId) => void;
+  onTrimCustomSlot: (slotId: CustomVoiceSlotId) => void;
   onClearCustomSlot: (slotId: CustomVoiceSlotId) => void;
+  onToggleFeature: (key: AiFeatureKey) => void;
+  onApplyFeaturePreset: (preset: 'all-on' | 'clean-mix') => void;
   onCycleGrooveBridge: () => void;
   onOpenCrate?: () => void;
 }
+
+const AI_FEATURE_CONTROLS: {
+  key: AiFeatureKey;
+  label: string;
+  sub: string;
+  desc: string;
+}[] = [
+  {
+    key: 'vipSkip',
+    label: 'VIP Skip',
+    sub: 'Off = full song length',
+    desc: 'Allow AI to skip long intros/verses on long tracks (disable to keep full song length)',
+  },
+  {
+    key: 'breakdownTease',
+    label: 'Next Tease',
+    sub: 'Vocal breakdown peek',
+    desc: 'Preview upcoming track vocals during breakdowns before transition',
+  },
+  {
+    key: 'vocalCarryover',
+    label: 'Vox Carry',
+    sub: 'Float old vocals',
+    desc: 'Keep outgoing track vocals floating over incoming track after crossfade',
+  },
+  {
+    key: 'songMoments',
+    label: 'Mid FX',
+    sub: 'Sweeps & loops',
+    desc: 'Trigger beat-quantized sweeps, echoes, filters & loops mid-track',
+  },
+  {
+    key: 'dropFakeouts',
+    label: 'Fakeouts',
+    sub: 'Drop build rolls',
+    desc: 'Trigger VIP loop-roll fakeouts before song drops',
+  },
+  {
+    key: 'beatSliceStutter',
+    label: 'Beat Slice',
+    sub: 'Stutters & juggles',
+    desc: 'Trigger transient beat-slice stutters, chops & hot-cue wordplay juggles',
+  },
+  {
+    key: 'autoGrooveBridge',
+    label: 'Auto Drums',
+    sub: 'Groove Bridge synth',
+    desc: 'Auto-layer Groove Bridge synth drums during transitions & YT takeovers',
+  },
+  {
+    key: 'spectralSidechain',
+    label: 'Vox Duck',
+    sub: '1.75kHz mid carve',
+    desc: 'Automatically dip competing 1.75kHz mids when vocals overlap',
+  },
+];
 
 const VIBES: { id: AiDjVibe; label: string }[] = [
   { id: 'club-blend', label: 'Club' },
@@ -164,6 +238,7 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
   onTriggerWildTake,
   onTargetPlaylistChange,
   onVibeChange,
+  onMashupTemplateChange,
   onMixNow,
   onDirectAi,
   onMashupBlend,
@@ -172,6 +247,8 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
   onSwapUpcomingStyle,
   onToggleMuteSfx,
   onToggleVoiceFx,
+  onVoiceVolumeChange,
+  onVoiceFrequencyChange,
   onToggleVoiceItem,
   onSetVoiceCategoryEnabled,
   onEnableAllVoices,
@@ -183,15 +260,22 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
   onUploadCustomSlot,
   onTriggerCustomSlot,
   onToggleCustomSlotEnabled,
+  onTrimCustomSlot,
   onClearCustomSlot,
+  onToggleFeature,
+  onApplyFeaturePreset,
   onCycleGrooveBridge,
   onOpenCrate,
 }) => {
   const [directionInput, setDirectionInput] = useState('');
-  const [zone3Tab, setZone3Tab] = useState<'tricks' | 'voices'>('tricks');
+  const [zone3Tab, setZone3Tab] = useState<'tricks' | 'voices' | 'features'>('tricks');
   const [voiceCategoryFilter, setVoiceCategoryFilter] = useState<DjVoiceCategory | 'all'>('all');
+  const [dragOverSlotId, setDragOverSlotId] = useState<CustomVoiceSlotId | null>(null);
   const isTransitioning = autopilot.phase === 'transitioning';
   const isPlanning = autopilot.phase === 'planning';
+  const enabledFeaturesCount = AI_FEATURE_CONTROLS.filter(
+    (f) => autopilot.features?.[f.key] ?? DEFAULT_AI_FEATURE_TOGGLES[f.key]
+  ).length;
 
   const enabledVoiceSet = new Set(autopilot.enabledVoiceIds);
   const filteredVoices =
@@ -433,6 +517,30 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
             </button>
           ))}
         </div>
+
+        {/* 4 Selectable 32-Bar Mashup Styles */}
+        <div className="flex items-center gap-1">
+          <span className="text-[9px] font-mono uppercase tracking-wider text-purple-300/80 shrink-0">
+            Style
+          </span>
+          <div className="grid grid-cols-4 gap-1 flex-1">
+            {MASHUP_TEMPLATES.map((tpl) => (
+              <button
+                key={tpl.id}
+                type="button"
+                onClick={() => onMashupTemplateChange(tpl.id)}
+                title={tpl.title}
+                className={`h-5 px-1 rounded text-[9.5px] font-semibold border transition-colors truncate ${
+                  autopilot.mashupTemplate === tpl.id
+                    ? 'bg-purple-500/25 border-purple-400/60 text-purple-200'
+                    : 'bg-[#0B0E14] border-white/[0.06] text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {tpl.label}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       {/* ZONE 2 (Center, 4 cols): Pre-Transition Blueprint Preview, Overrides & Instant Choreography */}
@@ -646,6 +754,19 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
                 Voices ({autopilot.enabledVoiceIds.length}/{ALL_VOICE_IDS.length})
               </span>
             </button>
+            <button
+              type="button"
+              onClick={() => setZone3Tab('features')}
+              title="Enable or disable VIP Skip and automatic AI DJ behaviors"
+              className={`h-5 px-2 rounded text-[10px] font-display font-bold uppercase tracking-wide flex items-center gap-1 transition-colors ${
+                zone3Tab === 'features'
+                  ? 'bg-amber-400 text-[#090B0F]'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Sliders className="w-2.5 h-2.5 shrink-0" />
+              <span>Auto ({enabledFeaturesCount}/8)</span>
+            </button>
           </div>
 
           <button
@@ -684,8 +805,46 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
               );
             })}
           </div>
-        ) : (
+        ) : zone3Tab === 'voices' ? (
           <div className="flex flex-col gap-1 flex-1 min-h-0">
+            {/* Dedicated Voice Mix Level Slider + AI Trigger Frequency */}
+            <div className="flex items-center gap-2 px-1.5 py-0.5 rounded bg-[#0B0E14] border border-white/[0.06] shrink-0">
+              <div className="flex items-center gap-1 flex-1 min-w-0">
+                <Volume2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                <span className="text-[9px] font-semibold text-slate-400 shrink-0">Vox</span>
+                <input
+                  type="range"
+                  aria-label="DJ Voice Mix Level"
+                  min={0}
+                  max={150}
+                  step={5}
+                  value={Math.round(autopilot.voiceVolume * 100)}
+                  onChange={(e) => onVoiceVolumeChange(parseInt(e.target.value, 10) / 100)}
+                  className="dj-fader flex-1 h-3.5"
+                />
+                <span className="text-[9.5px] font-mono tabular-nums text-emerald-300 shrink-0 w-7 text-right">
+                  {Math.round(autopilot.voiceVolume * 100)}%
+                </span>
+              </div>
+              <div className="flex items-center gap-0.5 shrink-0">
+                {(['rare', 'normal', 'hype'] as VoiceFrequencyMode[]).map((freq) => (
+                  <button
+                    key={freq}
+                    type="button"
+                    onClick={() => onVoiceFrequencyChange(freq)}
+                    title={`AI DJ Voice trigger frequency: ${freq}`}
+                    className={`h-4 px-1.5 rounded text-[8.5px] font-semibold uppercase border transition-colors ${
+                      autopilot.voiceFrequency === freq
+                        ? 'bg-emerald-500/25 border-emerald-500/50 text-emerald-200'
+                        : 'bg-[#121620] border-white/[0.06] text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {freq === 'normal' ? 'Norm' : freq}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             {/* Category Filter + Bulk Enable/Disable Row */}
             <div className="flex items-center justify-between gap-1 shrink-0 overflow-x-auto">
               <div className="flex items-center gap-1 min-w-0">
@@ -737,7 +896,7 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
             </div>
 
             {/* Scrollable Voice Pads Grid: Click label to play live, click check to enable/disable for AI */}
-            <div className="grid grid-cols-3 sm:grid-cols-4 gap-1 overflow-y-auto max-h-[78px] pr-0.5 flex-1">
+            <div className="grid grid-cols-3 sm:grid-cols-4 gap-1 overflow-y-auto max-h-[62px] pr-0.5 flex-1">
               {filteredVoices.map((v) => {
                 const isEnabled = enabledVoiceSet.has(v.id);
                 return (
@@ -789,11 +948,33 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
               <div className="grid grid-cols-4 gap-1 shrink-0">
                 {customVoiceDrops.map((slot) => {
                   const isRec = recordingSlotId === slot.id;
+                  const isDragOver = dragOverSlotId === slot.id;
                   return (
                     <div
                       key={slot.id}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = 'copy';
+                        if (dragOverSlotId !== slot.id) setDragOverSlotId(slot.id);
+                      }}
+                      onDragLeave={() => {
+                        if (dragOverSlotId === slot.id) setDragOverSlotId(null);
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        setDragOverSlotId(null);
+                        const files = Array.from(e.dataTransfer.files);
+                        const audioFile = files.find(
+                          (f) =>
+                            f.type.startsWith('audio/') ||
+                            /\.(wav|mp3|ogg|flac|m4a|aac|webm)$/i.test(f.name)
+                        );
+                        if (audioFile) onUploadCustomSlot(slot.id, audioFile);
+                      }}
                       className={`h-[26px] rounded-md border flex items-center overflow-hidden transition-colors ${
-                        isRec
+                        isDragOver
+                          ? 'bg-cyan-500/25 border-cyan-400 text-white'
+                          : isRec
                           ? 'bg-rose-500/20 border-rose-500 text-rose-200 animate-pulse'
                           : slot.hasAudio && slot.enabled && autopilot.voiceFxEnabled
                           ? 'bg-[#161D28] border-cyan-500/45 text-cyan-100'
@@ -811,8 +992,8 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
                         }
                         title={
                           slot.hasAudio
-                            ? `${slot.label} (${slot.durationSec.toFixed(1)}s) — Click to fire live`
-                            : `Click Mic to record up to 4s or Upload .wav/.mp3 into ${slot.label}`
+                            ? `${slot.label} (${slot.durationSec.toFixed(1)}s) — Click to fire live or drop audio file`
+                            : `Click Mic to record up to 4s or drop/upload .wav/.mp3 into ${slot.label}`
                         }
                         className="flex-1 h-full px-1 text-[9px] font-semibold text-left truncate hover:bg-white/10 transition-colors"
                       >
@@ -834,7 +1015,7 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
                       </button>
 
                       <label
-                        title={`Upload .wav/.mp3 to ${slot.label}`}
+                        title={`Upload or drop .wav/.mp3 to ${slot.label}`}
                         className="w-4 h-full flex items-center justify-center border-l border-white/[0.06] text-slate-400 hover:text-cyan-300 hover:bg-white/5 cursor-pointer"
                       >
                         <Upload className="w-2.5 h-2.5" />
@@ -852,6 +1033,15 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
 
                       {slot.hasAudio && (
                         <>
+                          <button
+                            type="button"
+                            onClick={() => onTrimCustomSlot(slot.id)}
+                            title="Auto-trim silence, fade & normalize"
+                            aria-label={`Trim and fade ${slot.label}`}
+                            className="w-4 h-full flex items-center justify-center border-l border-white/[0.06] text-amber-300/80 hover:text-amber-200 hover:bg-white/5"
+                          >
+                            <Scissors className="w-2.5 h-2.5" />
+                          </button>
                           <button
                             type="button"
                             onClick={() => onToggleCustomSlotEnabled(slot.id)}
@@ -884,6 +1074,70 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
                   );
                 })}
               </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-1.5 flex-1 min-h-0">
+            <div className="flex items-center justify-between gap-1.5 px-1.5 py-0.5 rounded bg-[#0B0E14] border border-white/[0.06] shrink-0">
+              <span className="text-[9.5px] font-semibold text-slate-300 truncate">
+                AI Auto Behaviors (Live &amp; Offline WAV)
+              </span>
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => onApplyFeaturePreset('all-on')}
+                  className="h-4.5 px-1.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-[9px] font-semibold text-emerald-200 transition-colors"
+                  title="Enable all 8 AI DJ features"
+                >
+                  All On
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onApplyFeaturePreset('clean-mix')}
+                  className="h-4.5 px-1.5 rounded bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 text-[9px] font-semibold text-amber-200 transition-colors"
+                  title="Play full songs with clean transitions (disables VIP Skip, Tease, Mid FX, Fakeouts, Beat Slice & Auto Drums)"
+                >
+                  Clean Mix
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-1 flex-1 min-h-0 overflow-y-auto pr-0.5">
+              {AI_FEATURE_CONTROLS.map((feat) => {
+                const enabled = autopilot.features?.[feat.key] ?? DEFAULT_AI_FEATURE_TOGGLES[feat.key];
+                return (
+                  <button
+                    key={feat.key}
+                    type="button"
+                    onClick={() => onToggleFeature(feat.key)}
+                    title={feat.desc}
+                    aria-pressed={enabled}
+                    className={`min-h-[30px] px-2 py-1 rounded-md border flex items-center justify-between gap-1.5 text-left transition-colors ${
+                      enabled
+                        ? 'bg-[#171C26] border-amber-400/40 text-slate-100 hover:bg-white/10'
+                        : 'bg-[#0C0F15] border-white/[0.06] text-slate-500 hover:text-slate-300 hover:border-white/15'
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[10px] font-semibold leading-tight truncate">
+                        {feat.label}
+                      </div>
+                      <div className="text-[8.5px] text-slate-400 leading-tight truncate">
+                        {feat.sub}
+                      </div>
+                    </div>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[8.5px] font-mono font-bold uppercase shrink-0 ${
+                        enabled
+                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/35'
+                          : 'bg-white/5 text-slate-500 border border-white/10'
+                      }`}
+                    >
+                      {enabled ? 'ON' : 'OFF'}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
           </div>
         )}

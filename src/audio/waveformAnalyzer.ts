@@ -3,6 +3,8 @@ import {
   TempoSegmentPoint,
   TrackSectionLabel,
   TrackSectionSegment,
+  VocalDensityTag,
+  VocalPhrasePocket,
   WaveformBandSample,
 } from '../types/dj';
 
@@ -868,5 +870,363 @@ export function findSparsestMashupPocket(params: {
     clashProfile,
     pocketSummary: `Pocket @ ${Math.round(qOutPct * 100)}%→${Math.round(qInPct * 100)}% (${bestBars}b · ${Math.round((1 - (clashProfile.bassClash + clashProfile.midClash) * 0.5) * 100)}% clean)`,
   };
+}
+
+/**
+ * Real Audio Vocal Detection (300 Hz - 3.5 kHz Mid-Harmonic & HPSS Analysis per 4-Bar Phrase).
+ * Measures center-channel 300Hz-3.5kHz energy, harmonic-vs-percussive ratio (when HPSS buffers are provided),
+ * and syllabic envelope modulation to map vocal sections vs. instrumental pockets.
+ */
+export function analyzeAudioVocalPockets(
+  buffer: AudioBuffer,
+  bpm = 124,
+  harmonicBuffer?: AudioBuffer | null,
+  percussiveBuffer?: AudioBuffer | null
+): { density: VocalDensityTag; pockets: VocalPhrasePocket[]; avgVocalScore: number } {
+  const sr = buffer.sampleRate || 44100;
+  const totalLen = buffer.length;
+  const durationSec = Math.max(1, buffer.duration);
+  if (totalLen < sr) {
+    return {
+      density: 'balanced',
+      pockets: [{ startSec: 0, endSec: durationSec, vocalScore: 0.45, instrumentalScore: 0.55 }],
+      avgVocalScore: 0.45,
+    };
+  }
+
+  const ch0 = buffer.getChannelData(0);
+  const ch1 = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : ch0;
+  const harm0 = harmonicBuffer ? harmonicBuffer.getChannelData(0) : null;
+  const harm1 =
+    harmonicBuffer && harmonicBuffer.numberOfChannels > 1 ? harmonicBuffer.getChannelData(1) : harm0;
+  const perc0 = percussiveBuffer ? percussiveBuffer.getChannelData(0) : null;
+
+  const safeBpm = Math.max(65, Math.min(185, bpm || 124));
+  const phraseSec = Math.max(4, Math.min(16, (60 / safeBpm) * 16)); // 4-bar phrase window
+  const phraseCount = Math.max(1, Math.min(64, Math.ceil(durationSec / phraseSec)));
+  const stride = Math.max(2, Math.floor(sr / 11025)); // ~11 kHz analysis sample rate
+  const effSr = sr / stride;
+
+  // 1-pole crossover alphas calibrated to effective sample rate
+  const aLow = 1 - Math.exp((-2 * Math.PI * 240) / effSr);
+  const aVocLow = 1 - Math.exp((-2 * Math.PI * 300) / effSr);
+  const aVocHigh = 1 - Math.exp((-2 * Math.PI * 3500) / effSr);
+  const aEnvFast = 1 - Math.exp((-2 * Math.PI * 14) / effSr);
+  const aEnvSlow = 1 - Math.exp((-2 * Math.PI * 1.8) / effSr);
+
+  const pockets: VocalPhrasePocket[] = [];
+  let sumVoc = 0;
+  let sumBassRatio = 0;
+  let vocalActivePhrases = 0;
+
+  for (let p = 0; p < phraseCount; p++) {
+    const startSec = Math.round(p * phraseSec * 100) / 100;
+    const endSec = Math.round(Math.min(durationSec, (p + 1) * phraseSec) * 100) / 100;
+    const startIdx = Math.floor(startSec * sr);
+    const endIdx = Math.min(totalLen, Math.floor(endSec * sr));
+    if (endIdx - startIdx < stride * 32) continue;
+
+    let lp240 = 0;
+    let midLp300 = 0;
+    let midLp3500 = 0;
+    let sideLp300 = 0;
+    let sideLp3500 = 0;
+    let harmLp300 = 0;
+    let harmLp3500 = 0;
+    let percLp300 = 0;
+    let percLp3500 = 0;
+
+    let totalSq = 0;
+    let bassSq = 0;
+    let midVocSq = 0;
+    let sideVocSq = 0;
+    let harmVocSq = 0;
+    let percVocSq = 0;
+    let envFast = 0;
+    let envSlow = 0;
+    let syllabicModSum = 0;
+    let samples = 0;
+
+    for (let i = startIdx; i < endIdx; i += stride) {
+      const l = ch0[i];
+      const r = ch1[i];
+      const mid = 0.5 * (l + r);
+      const side = 0.5 * (l - r);
+
+      lp240 += aLow * (mid - lp240);
+      midLp300 += aVocLow * (mid - midLp300);
+      midLp3500 += aVocHigh * (mid - midLp3500);
+      const midVoc = midLp3500 - midLp300;
+
+      sideLp300 += aVocLow * (side - sideLp300);
+      sideLp3500 += aVocHigh * (side - sideLp3500);
+      const sideVoc = sideLp3500 - sideLp300;
+
+      totalSq += mid * mid + side * side;
+      bassSq += lp240 * lp240;
+      midVocSq += midVoc * midVoc;
+      sideVocSq += sideVoc * sideVoc;
+
+      const absV = Math.abs(midVoc);
+      envFast += aEnvFast * (absV - envFast);
+      envSlow += aEnvSlow * (absV - envSlow);
+      syllabicModSum += Math.abs(envFast - envSlow);
+
+      if (harm0 && harm1 && perc0) {
+        const hm = 0.5 * (harm0[i] + harm1[i]);
+        harmLp300 += aVocLow * (hm - harmLp300);
+        harmLp3500 += aVocHigh * (hm - harmLp3500);
+        const hv = harmLp3500 - harmLp300;
+        harmVocSq += hv * hv;
+
+        const pm = perc0[i];
+        percLp300 += aVocLow * (pm - percLp300);
+        percLp3500 += aVocHigh * (pm - percLp3500);
+        const pv = percLp3500 - percLp300;
+        percVocSq += pv * pv;
+      }
+
+      samples++;
+    }
+
+    if (samples === 0) continue;
+    const totalRms = Math.sqrt(totalSq / samples) + 1e-6;
+    const bassRms = Math.sqrt(bassSq / samples);
+    const midVocRms = Math.sqrt(midVocSq / samples);
+    const sideVocRms = Math.sqrt(sideVocSq / samples);
+
+    const vocRatio = Math.min(1, midVocRms / totalRms);
+    const centerFocus = midVocRms / (midVocRms + sideVocRms + 1e-5);
+    const syllabicNorm = Math.min(1, (syllabicModSum / samples) / (midVocRms + 1e-5) * 1.45);
+    const bassRatio = Math.min(1, bassRms / totalRms);
+
+    let score = vocRatio * 0.46 + centerFocus * 0.34 + syllabicNorm * 0.2;
+    if (harm0 && perc0) {
+      const hRms = Math.sqrt(harmVocSq / samples);
+      const pRms = Math.sqrt(percVocSq / samples);
+      const hpssHarmRatio = hRms / (hRms + pRms + 1e-5);
+      score = score * 0.55 + hpssHarmRatio * 0.45;
+    }
+
+    // Quiet silence/intro noise floor suppression
+    if (totalRms < 0.015) {
+      score *= totalRms / 0.015;
+    }
+
+    const vocalScore = Math.round(Math.max(0.02, Math.min(0.98, score)) * 1000) / 1000;
+    const instrumentalScore = Math.round((1 - vocalScore) * 1000) / 1000;
+    pockets.push({ startSec, endSec, vocalScore, instrumentalScore });
+
+    sumVoc += vocalScore;
+    sumBassRatio += bassRatio;
+    if (vocalScore >= 0.55) vocalActivePhrases++;
+  }
+
+  if (pockets.length === 0) {
+    return {
+      density: 'balanced',
+      pockets: [{ startSec: 0, endSec: durationSec, vocalScore: 0.45, instrumentalScore: 0.55 }],
+      avgVocalScore: 0.45,
+    };
+  }
+
+  const avgVocalScore = Math.round((sumVoc / pockets.length) * 1000) / 1000;
+  const avgBassRatio = sumBassRatio / pockets.length;
+  const activeRatio = vocalActivePhrases / pockets.length;
+
+  let density: VocalDensityTag = 'balanced';
+  if (avgVocalScore >= 0.66 && avgBassRatio < 0.26) {
+    density = 'acapella';
+  } else if (avgVocalScore >= 0.54 || activeRatio >= 0.48) {
+    density = 'vocal-dense';
+  } else if (avgVocalScore <= 0.36 && activeRatio <= 0.16) {
+    density = 'instrumental';
+  }
+
+  return { density, pockets, avgVocalScore };
+}
+
+/**
+ * Waveform-based Vocal Pocket estimation (fallback for YouTube IFrame or pre-scanned tracks).
+ */
+export function analyzeWaveformVocalPockets(
+  waveform: WaveformBandSample[] | undefined,
+  durationSec: number,
+  bpm = 124
+): { density: VocalDensityTag; pockets: VocalPhrasePocket[]; avgVocalScore: number } {
+  const dur = Math.max(10, durationSec || 180);
+  if (!waveform || waveform.length < 12) {
+    return {
+      density: 'balanced',
+      pockets: [{ startSec: 0, endSec: dur, vocalScore: 0.45, instrumentalScore: 0.55 }],
+      avgVocalScore: 0.45,
+    };
+  }
+
+  const safeBpm = Math.max(65, Math.min(185, bpm || 124));
+  const phraseSec = Math.max(4, Math.min(16, (60 / safeBpm) * 16));
+  const phraseCount = Math.max(1, Math.min(48, Math.ceil(dur / phraseSec)));
+  const pockets: VocalPhrasePocket[] = [];
+  let sum = 0;
+
+  for (let p = 0; p < phraseCount; p++) {
+    const startSec = Math.round(p * phraseSec * 100) / 100;
+    const endSec = Math.round(Math.min(dur, (p + 1) * phraseSec) * 100) / 100;
+    const sIdx = Math.floor((startSec / dur) * waveform.length);
+    const eIdx = Math.min(waveform.length, Math.max(sIdx + 1, Math.ceil((endSec / dur) * waveform.length)));
+
+    let midSum = 0;
+    let totalSum = 0;
+    let lowSum = 0;
+    for (let i = sIdx; i < eIdx; i++) {
+      const w = waveform[i];
+      midSum += w.mid;
+      lowSum += w.low;
+      totalSum += w.low + w.mid + w.high + 0.01;
+    }
+    const n = Math.max(1, eIdx - sIdx);
+    const avgMid = midSum / n;
+    const avgLow = lowSum / n;
+    const midDom = midSum / totalSum;
+    const rawScore = Math.max(0.05, Math.min(0.95, midDom * 1.42 + (avgMid - avgLow * 0.45) * 0.42));
+    const vocalScore = Math.round(rawScore * 1000) / 1000;
+    pockets.push({
+      startSec,
+      endSec,
+      vocalScore,
+      instrumentalScore: Math.round((1 - vocalScore) * 1000) / 1000,
+    });
+    sum += vocalScore;
+  }
+
+  const avgVocalScore = Math.round((sum / pockets.length) * 1000) / 1000;
+  const density: VocalDensityTag =
+    avgVocalScore >= 0.56 ? 'vocal-dense' : avgVocalScore <= 0.36 ? 'instrumental' : 'balanced';
+
+  return { density, pockets, avgVocalScore };
+}
+
+/**
+ * Offline WSOLA (Waveform Similarity Overlap-Add) Pitch-Preserving Time-Stretcher & Semitone Shifter.
+ * Matches large BPM gaps without chipmunk/slowed pitch drift and optionally applies clean harmonic semitone snaps.
+ */
+export function timeStretchAudioBuffer(
+  ctx: BaseAudioContext,
+  source: AudioBuffer,
+  tempoRatio: number,
+  semitoneShift = 0
+): AudioBuffer {
+  const safeTempo = Math.max(0.55, Math.min(1.75, tempoRatio || 1));
+  const clampedSemi = Math.max(-5, Math.min(5, semitoneShift || 0));
+  const pitchRatio = Math.pow(2, clampedSemi / 12);
+
+  if (Math.abs(safeTempo - 1) < 0.006 && Math.abs(pitchRatio - 1) < 0.004) {
+    return source;
+  }
+
+  const sr = source.sampleRate;
+  const numCh = Math.min(2, source.numberOfChannels);
+  const inLen = source.length;
+  const speedScale = safeTempo / pitchRatio;
+
+  let stretchedChannels: Float32Array[] = [];
+  let stretchedLen = inLen;
+
+  if (Math.abs(speedScale - 1) < 0.006) {
+    for (let c = 0; c < numCh; c++) {
+      stretchedChannels.push(source.getChannelData(c));
+    }
+  } else {
+    const winSize = 2048;
+    const synHop = 512;
+    const anaHop = synHop * speedScale;
+    const searchRad = 160;
+
+    const win = new Float32Array(winSize);
+    for (let n = 0; n < winSize; n++) {
+      win[n] = 0.5 * (1 - Math.cos((2 * Math.PI * n) / winSize));
+    }
+
+    stretchedLen = Math.max(winSize, Math.round(inLen / speedScale));
+    const outArrs = Array.from({ length: numCh }, () => new Float32Array(stretchedLen + winSize));
+    const normArr = new Float32Array(stretchedLen + winSize);
+    const ch0In = source.getChannelData(0);
+
+    let outPos = 0;
+    let nomInPos = 0;
+    let prevInEnd = 0;
+
+    while (outPos < stretchedLen && Math.floor(nomInPos) + winSize < inLen) {
+      let bestIn = Math.floor(nomInPos);
+
+      // WSOLA similarity search on overlapping segment for phase-locked transients
+      if (outPos > 0) {
+        const minCand = Math.max(0, bestIn - searchRad);
+        const maxCand = Math.min(inLen - winSize - 1, bestIn + searchRad);
+        const refStart = Math.max(0, Math.min(inLen - synHop - 1, prevInEnd - synHop));
+        let bestCorr = -Infinity;
+
+        for (let cand = minCand; cand <= maxCand; cand += 4) {
+          let corr = 0;
+          for (let k = 0; k < synHop; k += 4) {
+            corr += ch0In[refStart + k] * ch0In[cand + k];
+          }
+          if (corr > bestCorr) {
+            bestCorr = corr;
+            bestIn = cand;
+          }
+        }
+      }
+
+      for (let c = 0; c < numCh; c++) {
+        const inData = source.getChannelData(c);
+        const outData = outArrs[c];
+        for (let n = 0; n < winSize; n++) {
+          outData[outPos + n] += inData[bestIn + n] * win[n];
+        }
+      }
+      for (let n = 0; n < winSize; n++) {
+        normArr[outPos + n] += win[n];
+      }
+
+      prevInEnd = bestIn + synHop;
+      outPos += synHop;
+      nomInPos += anaHop;
+    }
+
+    for (let c = 0; c < numCh; c++) {
+      const outData = outArrs[c];
+      for (let i = 0; i < stretchedLen; i++) {
+        const nw = normArr[i];
+        if (nw > 1e-4) outData[i] /= nw;
+      }
+      stretchedChannels.push(outData.subarray(0, stretchedLen));
+    }
+  }
+
+  // Apply pitch shift resampling if semitoneShift !== 0 (maintains target duration = inLen / safeTempo)
+  if (Math.abs(pitchRatio - 1) >= 0.004) {
+    const finalLen = Math.max(256, Math.round(stretchedLen / pitchRatio));
+    const outBuf = ctx.createBuffer(numCh, finalLen, sr);
+    for (let c = 0; c < numCh; c++) {
+      const src = stretchedChannels[c];
+      const dst = outBuf.getChannelData(c);
+      const maxIdx = src.length - 1;
+      for (let i = 0; i < finalLen; i++) {
+        const fIdx = i * pitchRatio;
+        const i0 = Math.min(maxIdx, Math.floor(fIdx));
+        const i1 = Math.min(maxIdx, i0 + 1);
+        const frac = fIdx - i0;
+        dst[i] = src[i0] + (src[i1] - src[i0]) * frac;
+      }
+    }
+    return outBuf;
+  }
+
+  const outBuf = ctx.createBuffer(numCh, stretchedLen, sr);
+  for (let c = 0; c < numCh; c++) {
+    outBuf.getChannelData(c).set(stretchedChannels[c]);
+  }
+  return outBuf;
 }
 

@@ -307,6 +307,229 @@ async function startServer() {
   });
 
 
+  // Groq AI Remix Director (server-side proxy — keeps GROQ_API_KEY off the client)
+  app.post('/api/ai/remix-director', async (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const mode = String(body.mode || 'mashup-32').slice(0, 32);
+    const vibe = String(body.vibe || 'club-blend').slice(0, 32);
+    const directionPrompt = String(body.directionPrompt || '').trim().slice(0, 260);
+    const tracksRaw = Array.isArray(body.tracks) ? body.tracks.slice(0, 20) : [];
+
+    const tracks = tracksRaw
+      .filter((t: any) => t && typeof t === 'object')
+      .map((t: any) => ({
+        title: String(t.title || 'Untitled').slice(0, 80),
+        artist: String(t.artist || '').slice(0, 60),
+        bpm: Number.isFinite(Number(t.bpm)) ? Math.round(Number(t.bpm) * 10) / 10 : 124,
+        key: String(t.musicalKey || '8A').slice(0, 6),
+        vocalDensity: String(t.detectedVocalDensity || 'balanced').slice(0, 24),
+      }));
+
+    if (tracks.length === 0) {
+      res.status(400).json({ error: 'At least one track summary is required.' });
+      return;
+    }
+
+    const buildFallbackPlan = (reason?: string) => {
+      const a = tracks[0];
+      const b = tracks[1] || a;
+      const isHipHop = a.bpm < 108 || b.bpm < 108;
+      const isHighEnergy = a.bpm >= 128 || vibe === 'festival-drop';
+      const recommendedTemplate = isHipHop
+        ? 'hiphop-cut'
+        : isHighEnergy
+        ? 'festival-double-drop'
+        : vibe === 'techno-hypnotic'
+        ? 'dub-echo-flip'
+        : 'club-groove-swap';
+      const recommendedBridge = isHipHop ? 'sub-808' : vibe === 'chill-sunset' ? 'chord-arp' : 'house-4x4';
+      const stemSwapPreference =
+        a.vocalDensity === 'vocal-dense' && b.vocalDensity !== 'vocal-dense'
+          ? 'a-vocal-b-beat'
+          : b.vocalDensity === 'vocal-dense' && a.vocalDensity !== 'vocal-dense'
+          ? 'b-vocal-a-beat'
+          : 'auto';
+      const shortA = a.title.split('(')[0].trim().slice(0, 22);
+      const shortB = b.title.split('(')[0].trim().slice(0, 22);
+      const calloutScript =
+        tracks.length === 1
+          ? `[cheerful] DJOne exclusive! Turning up ${shortA} right now, let's go!`
+          : `[cheerful] You're locked into DJOne! Mixing ${shortA} straight into ${shortB}, hands up!`;
+
+      return {
+        source: 'heuristic-fallback',
+        configured: Boolean(process.env.GROQ_API_KEY),
+        reason,
+        mixTitle:
+          tracks.length === 1
+            ? `DJOne Club Flip — ${shortA}`
+            : `DJOne Live Blend: ${shortA} × ${shortB}`,
+        recommendedTemplate,
+        recommendedBridge,
+        stemSwapPreference,
+        masteringProfile: isHighEnergy ? 'festival-loud' : 'club-punch',
+        calloutScript,
+        directorNotes: `${a.bpm} BPM (${a.key}) → ${b.bpm} BPM (${b.key}) curated for ${vibe}.`,
+        reharmonizeSynth: tracks.length === 1 || a.key !== b.key,
+      };
+    };
+
+    const apiKey = process.env.GROQ_API_KEY?.trim();
+    if (!apiKey) {
+      res.json(buildFallbackPlan('Set GROQ_API_KEY in server secrets for Groq LLM planning.'));
+      return;
+    }
+
+    try {
+      const systemPrompt = [
+        'You are the expert AI Music Director inside DJOne, a pro DJ mixing studio.',
+        'Return ONLY valid JSON matching this schema:',
+        '{',
+        '  "mixTitle": string (max 64 chars),',
+        '  "recommendedTemplate": "club-groove-swap" | "festival-double-drop" | "hiphop-cut" | "dub-echo-flip",',
+        '  "recommendedBridge": "off" | "house-4x4" | "sub-808" | "afro-perc" | "chord-arp",',
+        '  "stemSwapPreference": "auto" | "a-vocal-b-beat" | "b-vocal-a-beat" | "dual-hook",',
+        '  "masteringProfile": "clean" | "club-punch" | "festival-loud" | "vinyl-warmth",',
+        '  "calloutScript": string (1 energetic short DJ shoutout line <= 140 chars mentioning DJOne and track names),',
+        '  "directorNotes": string (<= 160 chars technical reason why stems/key/tempo blend),',
+        '  "reharmonizeSynth": boolean',
+        '}',
+      ].join('\n');
+
+      const userPrompt = JSON.stringify({
+        mode,
+        vibe,
+        directionPrompt: directionPrompt || 'Craft a clean, club-ready, tightly beat-matched edit.',
+        tracks,
+      });
+
+      const upstream = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          temperature: 0.55,
+          max_tokens: 420,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+        }),
+        signal: AbortSignal.timeout(12000),
+      });
+
+      if (!upstream.ok) {
+        const errText = await upstream.text().catch(() => '');
+        res.json(buildFallbackPlan(`Groq API returned ${upstream.status}${errText ? `: ${errText.slice(0, 80)}` : ''}`));
+        return;
+      }
+
+      const data = (await upstream.json()) as any;
+      const content = data?.choices?.[0]?.message?.content;
+      const parsed = typeof content === 'string' ? JSON.parse(content) : {};
+      const fallback = buildFallbackPlan();
+
+      const validTemplates = new Set([
+        'club-groove-swap',
+        'festival-double-drop',
+        'hiphop-cut',
+        'dub-echo-flip',
+      ]);
+      const validBridges = new Set(['off', 'house-4x4', 'sub-808', 'afro-perc', 'chord-arp']);
+      const validSwaps = new Set(['auto', 'a-vocal-b-beat', 'b-vocal-a-beat', 'dual-hook']);
+      const validMasters = new Set(['clean', 'club-punch', 'festival-loud', 'vinyl-warmth']);
+
+      res.json({
+        source: 'groq',
+        configured: true,
+        mixTitle: String(parsed.mixTitle || fallback.mixTitle).slice(0, 70),
+        recommendedTemplate: validTemplates.has(parsed.recommendedTemplate)
+          ? parsed.recommendedTemplate
+          : fallback.recommendedTemplate,
+        recommendedBridge: validBridges.has(parsed.recommendedBridge)
+          ? parsed.recommendedBridge
+          : fallback.recommendedBridge,
+        stemSwapPreference: validSwaps.has(parsed.stemSwapPreference)
+          ? parsed.stemSwapPreference
+          : fallback.stemSwapPreference,
+        masteringProfile: validMasters.has(parsed.masteringProfile)
+          ? parsed.masteringProfile
+          : fallback.masteringProfile,
+        calloutScript: String(parsed.calloutScript || fallback.calloutScript).slice(0, 180),
+        directorNotes: String(parsed.directorNotes || fallback.directorNotes).slice(0, 200),
+        reharmonizeSynth:
+          typeof parsed.reharmonizeSynth === 'boolean'
+            ? parsed.reharmonizeSynth
+            : fallback.reharmonizeSynth,
+      });
+    } catch (err: any) {
+      res.json(buildFallbackPlan(err?.message || 'Groq Director fallback active.'));
+    }
+  });
+
+  // Groq Orpheus TTS proxy for custom spoken DJ intro drops
+  app.post('/api/ai/tts-drop', async (req, res) => {
+    const apiKey = process.env.GROQ_API_KEY?.trim();
+    if (!apiKey) {
+      res.status(422).json({
+        fallback: 'synth',
+        reason: 'GROQ_API_KEY not configured; falling back to onboard DJOne synth drops.',
+      });
+      return;
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const text = String(body.text || '').trim().slice(0, 220);
+    if (!text) {
+      res.status(400).json({ error: 'Text prompt is required.' });
+      return;
+    }
+
+    const allowedVoices = new Set(['troy', 'daniel', 'austin', 'diana', 'hannah', 'autumn']);
+    const voice = allowedVoices.has(String(body.voice || '').toLowerCase())
+      ? String(body.voice).toLowerCase()
+      : 'troy';
+
+    try {
+      const upstream = await fetch('https://api.groq.com/openai/v1/audio/speech', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'canopylabs/orpheus-v1-english',
+          voice,
+          input: text,
+          response_format: 'wav',
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (!upstream.ok) {
+        res.status(422).json({
+          fallback: 'synth',
+          reason: `Groq TTS unavailable (${upstream.status}).`,
+        });
+        return;
+      }
+
+      const audioBuf = Buffer.from(await upstream.arrayBuffer());
+      res.setHeader('Content-Type', 'audio/wav');
+      res.setHeader('Content-Length', String(audioBuf.length));
+      res.send(audioBuf);
+    } catch {
+      res.status(422).json({
+        fallback: 'synth',
+        reason: 'Groq TTS request timed out; using onboard synth voice.',
+      });
+    }
+  });
+
   // Vite middleware in development, static dist in production
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -324,7 +547,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`DeckForge server listening on http://0.0.0.0:${PORT}`);
+    console.log(`DJOne server listening on http://0.0.0.0:${PORT}`);
   });
 }
 

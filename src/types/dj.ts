@@ -78,9 +78,26 @@ export type GrooveBridgePattern =
 
 export type VocalDensityTag = 'instrumental' | 'balanced' | 'vocal-dense' | 'acapella';
 
+export type MashupTemplateId =
+  | 'festival-double-drop'
+  | 'hiphop-cut'
+  | 'club-groove-swap'
+  | 'dub-echo-flip';
+
+export type VoiceFrequencyMode = 'rare' | 'normal' | 'hype';
+
+export interface VocalPhrasePocket {
+  startSec: number;
+  endSec: number;
+  vocalScore: number;        // 0..1 active vocal/mid-harmonic energy
+  instrumentalScore: number; // 0..1 sparse/instrumental pocket suitability
+}
+
 export interface VocalProfile {
   density: VocalDensityTag;
   flavorTags: string[];
+  avgVocalScore?: number;
+  pockets?: VocalPhrasePocket[];
 }
 
 export interface TrackCalibration {
@@ -120,6 +137,8 @@ export interface TrackItem {
   sections?: TrackSectionSegment[];
   tempoMap?: TempoSegmentPoint[];
   autoTrimGain?: number;
+  detectedVocalDensity?: VocalDensityTag;
+  vocalPockets?: VocalPhrasePocket[];
   calibrated?: boolean;
   addedAt: number;
 }
@@ -212,14 +231,50 @@ export interface YouTubeSearchResult {
   bpmHint: number | null;
 }
 
+export type OfflineRenderMode = 'mashup-32' | 'ai-transition' | 'playlist-mix' | 'single-flip';
+export type PlaylistMixPacing = 'megamix' | 'extended' | 'full-songs';
+export type CueStartMode = 'auto' | 'playhead' | 'cue-0' | 'cue-1' | 'cue-2' | 'cue-3';
+export type OfflineExportFormat = 'wav' | 'ogg';
+export type StemSwapMode = 'auto' | 'a-vocal-b-beat' | 'b-vocal-a-beat' | 'dual-hook';
+export type MasteringProfile = 'clean' | 'club-punch' | 'festival-loud' | 'vinyl-warmth';
+export type GroqVoicePersona = 'troy' | 'daniel' | 'austin' | 'diana' | 'hannah' | 'autumn';
+export type OfflineRenderVariant = 'master' | 'dj-edit' | 'instrumental' | 'acapella';
+
+export interface OfflineBlueprintSegment {
+  index: number;
+  label: string;
+  barStart: number;
+  barEnd: number;
+  kind: 'intro' | 'vocal-ride' | 'swap' | 'build' | 'drop' | 'ramp';
+  detail?: string;
+  bpmRampLabel?: string;
+}
+
+export interface GroqDirectorPlan {
+  source: 'groq' | 'heuristic-fallback';
+  configured?: boolean;
+  reason?: string;
+  mixTitle: string;
+  recommendedTemplate: MashupTemplateId;
+  recommendedBridge: GrooveBridgePattern;
+  stemSwapPreference: StemSwapMode;
+  masteringProfile: MasteringProfile;
+  calloutScript: string;
+  directorNotes: string;
+  reharmonizeSynth: boolean;
+}
+
 export interface RecordingItem {
   id: string;
   title: string;
   createdAt: number;
   durationSec: number;
-  format: 'wav' | 'webm';
+  format: 'wav' | 'ogg' | 'webm';
   url: string;
   sizeBytes: number;
+  cueSheetText?: string;
+  tracklistCount?: number;
+  packRole?: OfflineRenderVariant;
 }
 
 export type AiDjVibe =
@@ -490,8 +545,14 @@ export interface AiMashupPhase {
   deckBStemMode?: StemIsolationMode;
   deckAFilter?: number;
   deckBFilter?: number;
+  deckAFx?: Partial<DeckFxState>;
+  deckBFx?: Partial<DeckFxState>;
   pingPongBars?: number;
   isDoubleDrop?: boolean;
+  silenceGapBeats?: number;
+  scratchDeck?: DeckId;
+  tapeBrakeDeck?: DeckId;
+  cueJuggleDeck?: DeckId;
   label: string;
 }
 
@@ -523,6 +584,19 @@ export interface AiMashupBlendAdvice {
   phases?: AiMashupPhase[];
 }
 
+export interface AiFeatureToggles {
+  vipSkip: boolean;
+  breakdownTease: boolean;
+  vocalCarryover: boolean;
+  songMoments: boolean;
+  dropFakeouts: boolean;
+  beatSliceStutter: boolean;
+  autoGrooveBridge: boolean;
+  spectralSidechain: boolean;
+}
+
+export type AiFeatureKey = keyof AiFeatureToggles;
+
 export interface AutopilotState {
   enabled: boolean;
   remixMode: boolean;
@@ -548,5 +622,9 @@ export interface AutopilotState {
   nextTransitionEtaSec: number | null;
   holdExtraBars: number;
   mashupRoutineActive: boolean;
+  mashupTemplate: MashupTemplateId;
+  voiceVolume: number;       // 0 .. 1.5
+  voiceFrequency: VoiceFrequencyMode;
+  features: AiFeatureToggles;
 }
 

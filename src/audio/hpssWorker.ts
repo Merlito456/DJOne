@@ -327,7 +327,7 @@ function getHpssWorker(): Worker | null {
 }
 
 export async function runHpssSeparation(
-  ctx: AudioContext,
+  ctx: BaseAudioContext,
   sourceBuffer: AudioBuffer
 ): Promise<{
   harmonicBuffer: AudioBuffer;

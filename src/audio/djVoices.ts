@@ -5,6 +5,7 @@ import {
   DjVoiceCategory,
   DjVoiceDropId,
   DjVoicePresetMeta,
+  VoiceFrequencyMode,
 } from '../types/dj';
 
 export const CUSTOM_VOICE_SLOT_IDS: CustomVoiceSlotId[] = [
@@ -270,31 +271,70 @@ const STORAGE_KEY = 'deckforge_voice_pack_v1';
 export interface SavedVoicePackConfig {
   voiceFxEnabled: boolean;
   enabledVoiceIds: DjVoiceDropId[];
+  voiceVolume: number;
+  voiceFrequency: VoiceFrequencyMode;
 }
 
 export function loadVoicePackSettings(): SavedVoicePackConfig {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
-      return { voiceFxEnabled: true, enabledVoiceIds: [...ALL_VOICE_IDS] };
+      return {
+        voiceFxEnabled: true,
+        enabledVoiceIds: [...ALL_VOICE_IDS],
+        voiceVolume: 1.0,
+        voiceFrequency: 'normal',
+      };
     }
     const parsed = JSON.parse(raw) as Partial<SavedVoicePackConfig>;
     const validSet = new Set<DjVoiceDropId>(ALL_VOICE_IDS);
     const cleanedIds = Array.isArray(parsed.enabledVoiceIds)
       ? parsed.enabledVoiceIds.filter((id): id is DjVoiceDropId => validSet.has(id as DjVoiceDropId))
       : [...ALL_VOICE_IDS];
+    const vol =
+      typeof parsed.voiceVolume === 'number' && Number.isFinite(parsed.voiceVolume)
+        ? Math.max(0, Math.min(1.5, parsed.voiceVolume))
+        : 1.0;
+    const freq: VoiceFrequencyMode =
+      parsed.voiceFrequency === 'rare' ||
+      parsed.voiceFrequency === 'normal' ||
+      parsed.voiceFrequency === 'hype'
+        ? parsed.voiceFrequency
+        : 'normal';
     return {
       voiceFxEnabled: typeof parsed.voiceFxEnabled === 'boolean' ? parsed.voiceFxEnabled : true,
       enabledVoiceIds: cleanedIds,
+      voiceVolume: vol,
+      voiceFrequency: freq,
     };
   } catch {
-    return { voiceFxEnabled: true, enabledVoiceIds: [...ALL_VOICE_IDS] };
+    return {
+      voiceFxEnabled: true,
+      enabledVoiceIds: [...ALL_VOICE_IDS],
+      voiceVolume: 1.0,
+      voiceFrequency: 'normal',
+    };
   }
 }
 
-export function saveVoicePackSettings(cfg: SavedVoicePackConfig): void {
+export function saveVoicePackSettings(cfg: Partial<SavedVoicePackConfig> & { voiceFxEnabled: boolean; enabledVoiceIds: DjVoiceDropId[] }): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+    const prev = loadVoicePackSettings();
+    const merged: SavedVoicePackConfig = {
+      voiceFxEnabled: cfg.voiceFxEnabled,
+      enabledVoiceIds: cfg.enabledVoiceIds,
+      voiceVolume:
+        typeof cfg.voiceVolume === 'number' && Number.isFinite(cfg.voiceVolume)
+          ? Math.max(0, Math.min(1.5, cfg.voiceVolume))
+          : prev.voiceVolume,
+      voiceFrequency:
+        cfg.voiceFrequency === 'rare' ||
+        cfg.voiceFrequency === 'normal' ||
+        cfg.voiceFrequency === 'hype'
+          ? cfg.voiceFrequency
+          : prev.voiceFrequency,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
   } catch {
     // ignore storage quota failures
   }
@@ -440,6 +480,76 @@ export async function deleteCustomVoiceBufferFromIdb(slotId: CustomVoiceSlotId):
   } catch {
     // ignore
   }
+}
+
+/**
+ * Strips leading/trailing dead air, applies tight club fade-in/out ramps,
+ * and normalizes quiet recordings/samples toward -0.7 dB FS so custom drops snap onto Beat 1.
+ */
+export function trimAndFadeVoiceBuffer(
+  ctx: BaseAudioContext,
+  buffer: AudioBuffer
+): AudioBuffer {
+  const sr = buffer.sampleRate;
+  const numCh = Math.min(2, buffer.numberOfChannels);
+  const len = buffer.length;
+  if (len < Math.floor(sr * 0.08)) return buffer;
+
+  let globalPeak = 0;
+  for (let ch = 0; ch < numCh; ch++) {
+    const data = buffer.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      const a = Math.abs(data[i]);
+      if (a > globalPeak) globalPeak = a;
+    }
+  }
+  const threshold = Math.max(0.012, globalPeak * 0.035);
+
+  let firstActive = 0;
+  outerStart: for (let i = 0; i < len; i++) {
+    for (let ch = 0; ch < numCh; ch++) {
+      if (Math.abs(buffer.getChannelData(ch)[i]) >= threshold) {
+        firstActive = i;
+        break outerStart;
+      }
+    }
+  }
+
+  let lastActive = len - 1;
+  outerEnd: for (let i = len - 1; i >= firstActive; i--) {
+    for (let ch = 0; ch < numCh; ch++) {
+      if (Math.abs(buffer.getChannelData(ch)[i]) >= threshold) {
+        lastActive = i;
+        break outerEnd;
+      }
+    }
+  }
+
+  const prePad = Math.floor(sr * 0.012);
+  const postPad = Math.floor(sr * 0.035);
+  const startIdx = Math.max(0, firstActive - prePad);
+  const endIdx = Math.min(len, lastActive + postPad);
+  const outLen = Math.max(Math.min(len, Math.floor(sr * 0.12)), endIdx - startIdx);
+
+  const fadeInSamples = Math.min(Math.floor(sr * 0.008), Math.floor(outLen * 0.15));
+  const fadeOutSamples = Math.min(Math.floor(sr * 0.028), Math.floor(outLen * 0.25));
+  const normScale = globalPeak > 0.008 ? Math.min(3.5, Math.max(1.0, 0.92 / globalPeak)) : 1.0;
+
+  const out = ctx.createBuffer(numCh, outLen, sr);
+  for (let ch = 0; ch < numCh; ch++) {
+    const src = buffer.getChannelData(ch);
+    const dst = out.getChannelData(ch);
+    for (let i = 0; i < outLen; i++) {
+      let env = 1;
+      if (i < fadeInSamples) env = i / Math.max(1, fadeInSamples);
+      else if (i >= outLen - fadeOutSamples) {
+        env = (outLen - i) / Math.max(1, fadeOutSamples);
+      }
+      const s = (src[startIdx + i] || 0) * normScale * env;
+      dst[i] = Math.max(-0.98, Math.min(0.98, s));
+    }
+  }
+  return out;
 }
 
 /**

@@ -4,10 +4,14 @@ import { djEngine } from './audio/djEngine';
 import { ALL_CAMELOT_KEYS, recordAiFeedbackEvent } from './audio/aiMemory';
 import { runHpssSeparation } from './audio/hpssWorker';
 import {
+  ALL_ON_AI_FEATURE_TOGGLES,
   computeAutoHotCues,
   computeOfflineMashupBlend,
+  DEFAULT_AI_FEATURE_TOGGLES,
   generateOfflineWildTake,
+  loadAiFeatureToggles,
   planOfflineTransition,
+  saveAiFeatureToggles,
 } from './audio/offlineAiDj';
 import {
   buildElasticTempoMap,
@@ -20,8 +24,11 @@ import {
   generateDeterministicBeatWaveform,
   resolveElasticPhraseAtTime,
   segmentTrackStructure,
+  analyzeAudioVocalPockets,
+  analyzeWaveformVocalPockets,
 } from './audio/waveformAnalyzer';
-import { renderOfflineAiRemixWav } from './audio/offlineMixRenderer';
+import { OfflineRenderDeckInput, renderOfflineAiRemixWav } from './audio/offlineMixRenderer';
+import { fetchGroqTtsDropBuffer } from './audio/groqDirector';
 import { YouTubeDeckPlayer } from './audio/youtubeBridge';
 import { AiAutopilotPanel } from './components/AiAutopilotPanel';
 import { DeckPanel } from './components/DeckPanel';
@@ -29,7 +36,11 @@ import { DualWaveformDisplay } from './components/DualWaveformDisplay';
 import { LibraryPanel } from './components/LibraryPanel';
 import { MixerConsole } from './components/MixerConsole';
 import { PlaylistBuilderModal } from './components/PlaylistBuilderModal';
-import { RecordingModal } from './components/RecordingModal';
+import {
+  OfflinePreviewResult,
+  OfflineRenderOptions,
+  RecordingModal,
+} from './components/RecordingModal';
 import {
   downloadCarloPlaylistFile,
   parseCarloPlaylistText,
@@ -47,16 +58,20 @@ import {
   saveCustomVoiceMetas,
   saveVoicePackSettings,
   startMicDropCapture,
+  trimAndFadeVoiceBuffer,
   VOICE_PRESET_MAP,
 } from './audio/djVoices';
 import {
   AiChopPatternType,
   AiDjVibe,
   AiEnergyMode,
+  AiFeatureKey,
+  AiFeatureToggles,
   AiMashupPhase,
   AiTransitionPlan,
   AnyVoiceDropId,
   AutopilotState,
+  CueStartMode,
   CustomVoiceDropMeta,
   CustomVoiceSlotId,
   DeckFxState,
@@ -65,11 +80,14 @@ import {
   DjVoiceCategory,
   DjVoiceDropId,
   GrooveBridgePattern,
+  MashupTemplateId,
   MixerState,
+  OfflineRenderVariant,
   Playlist,
   SoundTrickType,
   StemIsolationMode,
   TrackItem,
+  VoiceFrequencyMode,
   WaveformAiMarker,
 } from './types/dj';
 
@@ -175,7 +193,11 @@ export default function App() {
       nextTransitionEtaSec: null,
       holdExtraBars: 0,
       mashupRoutineActive: false,
+      mashupTemplate: 'club-groove-swap',
+      voiceVolume: savedVoices.voiceVolume,
+      voiceFrequency: savedVoices.voiceFrequency,
       mutedMomentIndices: [],
+      features: loadAiFeatureToggles(),
     };
   });
   const [mashupLoading, setMashupLoading] = useState(false);
@@ -255,6 +277,8 @@ export default function App() {
     mashupSyncDeck: DeckId;
     lastMashupLabel: string;
     lastMashupDoubleDropFired: boolean;
+    lastMashupPhaseIdx: number;
+    lastMashupMicroTrickIdx: number;
     // Upgrade #1: Bar-1 / Beat-1 Phase-Locked Quantizer
     pendingMomentIdx: number | null;
     pendingMomentQueuedAtMs: number;
@@ -326,6 +350,8 @@ export default function App() {
     mashupSyncDeck: 'B',
     lastMashupLabel: '',
     lastMashupDoubleDropFired: false,
+    lastMashupPhaseIdx: -1,
+    lastMashupMicroTrickIdx: -1,
     pendingMomentIdx: null,
     pendingMomentQueuedAtMs: 0,
     pendingTransitionQuantize: false,
@@ -358,17 +384,24 @@ export default function App() {
     teaseUntilMs: 0,
   });
 
+  const spectralDuckActiveRef = useRef(false);
+
   const ensureCustomBuffersLoaded = useCallback(async () => {
     if (customBuffersLoadedRef.current) return;
     customBuffersLoadedRef.current = true;
     try {
       const ctx = await djEngine.resume();
+      djEngine.setVoiceVolume(autopilotRef.current.voiceVolume);
       const loaded = await loadAllCustomVoiceBuffers(ctx);
       customVoiceBuffersRef.current = { ...loaded, ...customVoiceBuffersRef.current };
     } catch {
       customBuffersLoadedRef.current = false;
     }
   }, []);
+
+  useEffect(() => {
+    djEngine.setVoiceVolume(autopilot.voiceVolume);
+  }, [autopilot.voiceVolume]);
 
   const isAnyVoiceEnabled = useCallback((voiceId: AnyVoiceDropId): boolean => {
     if (isCustomVoiceDropId(voiceId)) {
@@ -538,7 +571,7 @@ export default function App() {
     }
   }, [deckB.playbackMode, deckB.stemMode]);
 
-  // Keep playing state synced for Web Audio end-of-track & YouTube IFrame looping
+  // Keep playing state synced & run Automatic Spectral Sidechain (Vocal-over-Beat Clarity)
   useEffect(() => {
     const id = setInterval(() => {
       (['A', 'B'] as DeckId[]).forEach((deckId) => {
@@ -555,6 +588,56 @@ export default function App() {
           }
         }
       });
+
+      const dA = deckARef.current;
+      const dB = deckBRef.current;
+      if (
+        autopilotRef.current.features.spectralSidechain &&
+        dA.playbackMode === 'webaudio' &&
+        dB.playbackMode === 'webaudio' &&
+        dA.isPlaying &&
+        dB.isPlaying
+      ) {
+        const midA = djEngine.getDeckMidBandLevel('A');
+        const midB = djEngine.getDeckMidBandLevel('B');
+        const bonusA =
+          dA.stemMode === 'vocal-focus'
+            ? 0.35
+            : dA.track?.detectedVocalDensity === 'vocal-dense' || dA.track?.detectedVocalDensity === 'acapella'
+            ? 0.14
+            : 0;
+        const bonusB =
+          dB.stemMode === 'vocal-focus'
+            ? 0.35
+            : dB.track?.detectedVocalDensity === 'vocal-dense' || dB.track?.detectedVocalDensity === 'acapella'
+            ? 0.14
+            : 0;
+        const scoreA = midA + bonusA;
+        const scoreB = midB + bonusB;
+        if (scoreA > scoreB + 0.04) {
+          djEngine.setDeckVocalPresenceDuck('A', 0);
+          djEngine.setDeckVocalPresenceDuck('B', -Math.min(5.2, 2.4 + midA * 4.8));
+          spectralDuckActiveRef.current = true;
+        } else if (scoreB > scoreA + 0.04) {
+          djEngine.setDeckVocalPresenceDuck('B', 0);
+          djEngine.setDeckVocalPresenceDuck('A', -Math.min(5.2, 2.4 + midB * 4.8));
+          spectralDuckActiveRef.current = true;
+        } else if (midA > 0.12 || midB > 0.12) {
+          const dipA = scoreA < scoreB ? -1.4 : 0;
+          const dipB = scoreB < scoreA ? -1.4 : 0;
+          djEngine.setDeckVocalPresenceDuck('A', dipA);
+          djEngine.setDeckVocalPresenceDuck('B', dipB);
+          spectralDuckActiveRef.current = true;
+        } else if (spectralDuckActiveRef.current) {
+          djEngine.setDeckVocalPresenceDuck('A', 0);
+          djEngine.setDeckVocalPresenceDuck('B', 0);
+          spectralDuckActiveRef.current = false;
+        }
+      } else if (spectralDuckActiveRef.current) {
+        djEngine.setDeckVocalPresenceDuck('A', 0);
+        djEngine.setDeckVocalPresenceDuck('B', 0);
+        spectralDuckActiveRef.current = false;
+      }
     }, 45);
     return () => clearInterval(id);
   }, [setDeckState]);
@@ -630,11 +713,12 @@ export default function App() {
           const tempoMap = buildElasticTempoMap(buf, detected.bpm, detected.firstBeatSec);
           const loudness = estimateTrackLoudnessGain(buf);
           const autoTrimGain = track.autoTrimGain ?? loudness.autoTrimGain;
+          const vocalInit = analyzeAudioVocalPockets(buf, detected.bpm);
 
           djEngine.setDeckBuffer(deckId, buf);
           djEngine.setDeckKeyLock(deckId, getDeckRef(deckId).keyLock);
           djEngine.setDeckSemitoneShift(deckId, 0);
-          // Background 3-Stem HPSS Worker separation (non-blocking) for vocal/drum/bass stems
+          // Background 3-Stem HPSS Worker separation (non-blocking) + refined vocal pocket map
           djEngine.resume().then((audioCtx) => {
             void runHpssSeparation(audioCtx, buf).then((res) => {
               if (res && seq === loadSeqRef.current[deckId]) {
@@ -643,6 +727,28 @@ export default function App() {
                   res.harmonicBuffer,
                   res.percussiveBuffer,
                   res.bassBuffer
+                );
+                const refinedVocal = analyzeAudioVocalPockets(
+                  buf,
+                  detected.bpm,
+                  res.harmonicBuffer,
+                  res.percussiveBuffer
+                );
+                libraryRef.current.updateTrackMeta(track.id, {
+                  detectedVocalDensity: refinedVocal.density,
+                  vocalPockets: refinedVocal.pockets,
+                });
+                setDeckState(deckId, (prev) =>
+                  prev.track?.id === track.id
+                    ? {
+                        ...prev,
+                        track: {
+                          ...prev.track,
+                          detectedVocalDensity: refinedVocal.density,
+                          vocalPockets: refinedVocal.pockets,
+                        },
+                      }
+                    : prev
                 );
               }
             });
@@ -656,6 +762,8 @@ export default function App() {
             sections: seg.segments,
             tempoMap,
             autoTrimGain,
+            detectedVocalDensity: vocalInit.density,
+            vocalPockets: vocalInit.pockets,
           });
           const autoCues = computeAutoHotCues(
             buf.duration,
@@ -676,6 +784,8 @@ export default function App() {
               sections: seg.segments,
               tempoMap,
               autoTrimGain,
+              detectedVocalDensity: vocalInit.density,
+              vocalPockets: vocalInit.pockets,
             },
             isLoading: false,
             playbackMode: 'webaudio',
@@ -717,6 +827,7 @@ export default function App() {
               const tempoMap = buildElasticTempoMap(buf, detected.bpm, detected.firstBeatSec);
               const loudness = estimateTrackLoudnessGain(buf);
               const autoTrimGain = track.autoTrimGain ?? loudness.autoTrimGain;
+              const vocalInit = analyzeAudioVocalPockets(buf, detected.bpm);
 
               djEngine.setDeckBuffer(deckId, buf);
               djEngine.setDeckKeyLock(deckId, getDeckRef(deckId).keyLock);
@@ -729,6 +840,28 @@ export default function App() {
                       res.harmonicBuffer,
                       res.percussiveBuffer,
                       res.bassBuffer
+                    );
+                    const refinedVocal = analyzeAudioVocalPockets(
+                      buf,
+                      detected.bpm,
+                      res.harmonicBuffer,
+                      res.percussiveBuffer
+                    );
+                    libraryRef.current.updateTrackMeta(track.id, {
+                      detectedVocalDensity: refinedVocal.density,
+                      vocalPockets: refinedVocal.pockets,
+                    });
+                    setDeckState(deckId, (prev) =>
+                      prev.track?.id === track.id
+                        ? {
+                            ...prev,
+                            track: {
+                              ...prev.track,
+                              detectedVocalDensity: refinedVocal.density,
+                              vocalPockets: refinedVocal.pockets,
+                            },
+                          }
+                        : prev
                     );
                   }
                 });
@@ -743,6 +876,8 @@ export default function App() {
                 sections: seg.segments,
                 tempoMap,
                 autoTrimGain,
+                detectedVocalDensity: vocalInit.density,
+                vocalPockets: vocalInit.pockets,
               });
               const autoCues = computeAutoHotCues(
                 buf.duration,
@@ -764,6 +899,8 @@ export default function App() {
                   sections: seg.segments,
                   tempoMap,
                   autoTrimGain,
+                  detectedVocalDensity: vocalInit.density,
+                  vocalPockets: vocalInit.pockets,
                 },
                 isLoading: false,
                 playbackMode: 'webaudio',
@@ -804,11 +941,18 @@ export default function App() {
                     const segReal = segmentTrackStructure(wfReal, realDuration, prev.baseBpm);
                     const autoTrimGain =
                       prev.track.autoTrimGain ?? computeWaveformLoudnessGain(wfReal);
+                    const wfVocalReal = analyzeWaveformVocalPockets(
+                      wfReal,
+                      realDuration,
+                      prev.baseBpm
+                    );
                     libraryRef.current.updateTrackMeta(prev.track.id, {
                       durationSec: realDuration,
                       detectedDropSec: segReal.autoDropSec,
                       sections: segReal.segments,
                       autoTrimGain,
+                      detectedVocalDensity: wfVocalReal.density,
+                      vocalPockets: wfVocalReal.pockets,
                     });
                     return {
                       ...prev,
@@ -823,6 +967,8 @@ export default function App() {
                         detectedDropSec: segReal.autoDropSec,
                         sections: segReal.segments,
                         autoTrimGain,
+                        detectedVocalDensity: wfVocalReal.density,
+                        vocalPockets: wfVocalReal.pockets,
                       },
                       hotCues: computeAutoHotCues(
                         realDuration,
@@ -841,7 +987,12 @@ export default function App() {
             const wf = generateDeterministicBeatWaveform(track.youtubeId, estDur, track.bpm);
             const seg = segmentTrackStructure(wf, estDur, track.bpm);
             const autoTrimGain = track.autoTrimGain ?? computeWaveformLoudnessGain(wf);
-            libraryRef.current.updateTrackMeta(track.id, { autoTrimGain });
+            const wfVocal = analyzeWaveformVocalPockets(wf, estDur, track.bpm);
+            libraryRef.current.updateTrackMeta(track.id, {
+              autoTrimGain,
+              detectedVocalDensity: wfVocal.density,
+              vocalPockets: wfVocal.pockets,
+            });
             const autoCues = computeAutoHotCues(
               estDur,
               track.bpm,
@@ -863,6 +1014,8 @@ export default function App() {
                     detectedDropSec: seg.autoDropSec,
                     sections: seg.segments,
                     autoTrimGain,
+                    detectedVocalDensity: wfVocal.density,
+                    vocalPockets: wfVocal.pockets,
                   }
                 : prev.track,
               hotCues: autoCues,
@@ -1300,6 +1453,8 @@ export default function App() {
         dropCueSec: t.dropCueSec,
         detectedDropSec: t.detectedDropSec,
         sections: t.sections,
+        detectedVocalDensity: t.detectedVocalDensity,
+        vocalPockets: t.vocalPockets,
       }));
 
       if (candidates.length === 0) {
@@ -1360,8 +1515,10 @@ export default function App() {
             setTensionScore: aiSessionRef.current.setTensionScore,
             peakMixStreak: aiSessionRef.current.peakMixStreak,
             voiceFxEnabled: autopilotRef.current.voiceFxEnabled,
+            voiceFrequency: autopilotRef.current.voiceFrequency,
             enabledVoiceIds: autopilotRef.current.enabledVoiceIds,
             enabledCustomDrops: customVoiceDropsRef.current,
+            features: autopilotRef.current.features,
           });
 
           chosenTrack = libraryRef.current.tracks.find((t) => t.id === plan.nextTrackId);
@@ -2529,12 +2686,129 @@ export default function App() {
     }));
   }, [setAutopilotState]);
 
+  const applyAiFeatureSideEffects = useCallback(
+    (next: AiFeatureToggles) => {
+      const sess = aiSessionRef.current;
+      if (!next.spectralSidechain && spectralDuckActiveRef.current) {
+        djEngine.setDeckVocalPresenceDuck('A', 0);
+        djEngine.setDeckVocalPresenceDuck('B', 0);
+        spectralDuckActiveRef.current = false;
+      }
+      if (!next.vocalCarryover) {
+        stopCarryoverIfActive();
+      }
+      if (!next.autoGrooveBridge) {
+        if (sess.aiAutoBridgeActive) {
+          sess.aiAutoBridgeActive = false;
+          djEngine.stopGrooveBridge();
+        }
+        if (sess.ytPumpBridgeActive) {
+          sess.ytPumpBridgeActive = false;
+          djEngine.stopGrooveBridge();
+        }
+      }
+      if (!next.breakdownTease && sess.teaseActive) {
+        sess.teaseUntilMs = 0;
+      }
+      if (!next.songMoments) {
+        sess.pendingMomentIdx = null;
+      }
+      if (!next.beatSliceStutter) {
+        sess.cruisingChopPattern = 'off';
+        sess.cruisingChopUntilMs = 0;
+        sess.cruisingCueSeq = null;
+        sess.cruisingCueUntilMs = 0;
+      }
+    },
+    [stopCarryoverIfActive]
+  );
+
+  const sanitizePlanForFeatures = useCallback(
+    (plan: AiTransitionPlan | null, next: AiFeatureToggles): AiTransitionPlan | null => {
+      if (!plan) return null;
+      const filteredMoments = next.songMoments
+        ? (plan.songMoments || [])
+            .filter((m) => (next.dropFakeouts ? true : !m.isVipDropFakeout))
+            .map((m) =>
+              next.beatSliceStutter
+                ? m
+                : { ...m, beatSlicePattern: undefined, chopPattern: undefined, cueJuggleSeq: undefined }
+            )
+        : [];
+      return {
+        ...plan,
+        vipSkipEdit: next.vipSkip ? plan.vipSkipEdit : undefined,
+        teasePreview: next.breakdownTease ? plan.teasePreview : undefined,
+        songMoments: filteredMoments,
+        vocalCarryoverBars: next.vocalCarryover ? plan.vocalCarryoverBars : 0,
+        recommendedBridge: next.autoGrooveBridge ? plan.recommendedBridge : 'off',
+        useBeatSliceStutter: next.beatSliceStutter ? plan.useBeatSliceStutter : false,
+      };
+    },
+    []
+  );
+
+  const handleToggleAiFeature = useCallback(
+    (key: AiFeatureKey) => {
+      const featureLabels: Record<AiFeatureKey, string> = {
+        vipSkip: 'VIP Skip (full song mode when OFF)',
+        breakdownTease: 'Next Track Breakdown Tease',
+        vocalCarryover: 'Vocal Carryover',
+        songMoments: 'Mid-Song Auto FX Moments',
+        dropFakeouts: 'VIP Drop Fakeouts',
+        beatSliceStutter: 'Beat-Slice Stutters & Juggles',
+        autoGrooveBridge: 'Auto Groove Bridge Drums',
+        spectralSidechain: 'Spectral Vocal Ducking',
+      };
+      setAutopilotState((prev) => {
+        const current = prev.features || DEFAULT_AI_FEATURE_TOGGLES;
+        const next: AiFeatureToggles = { ...current, [key]: !current[key] };
+        saveAiFeatureToggles(next);
+        applyAiFeatureSideEffects(next);
+        const sanitized = sanitizePlanForFeatures(aiSessionRef.current.plan, next);
+        aiSessionRef.current.plan = sanitized;
+        return {
+          ...prev,
+          features: next,
+          activePlan: sanitized ?? prev.activePlan,
+          currentActionLabel: `${featureLabels[key]}: ${next[key] ? 'ON' : 'OFF'}`,
+        };
+      });
+    },
+    [applyAiFeatureSideEffects, sanitizePlanForFeatures, setAutopilotState]
+  );
+
+  const handleApplyFeaturePreset = useCallback(
+    (preset: 'all-on' | 'clean-mix') => {
+      const next: AiFeatureToggles =
+        preset === 'all-on'
+          ? { ...ALL_ON_AI_FEATURE_TOGGLES }
+          : { ...DEFAULT_AI_FEATURE_TOGGLES };
+      saveAiFeatureToggles(next);
+      applyAiFeatureSideEffects(next);
+      const sanitized = sanitizePlanForFeatures(aiSessionRef.current.plan, next);
+      aiSessionRef.current.plan = sanitized;
+      setAutopilotState((prev) => ({
+        ...prev,
+        features: next,
+        activePlan: sanitized ?? prev.activePlan,
+        currentActionLabel:
+          preset === 'all-on'
+            ? 'All 8 AI Automation features enabled'
+            : 'Clean Mix preset: Full songs (VIP Skip OFF, smooth blends)',
+      }));
+    },
+    [applyAiFeatureSideEffects, sanitizePlanForFeatures, setAutopilotState]
+  );
+
   const handleToggleVoiceFx = useCallback(() => {
     setAutopilotState((prev) => {
       const nextEnabled = !prev.voiceFxEnabled;
       saveVoicePackSettings({
         voiceFxEnabled: nextEnabled,
         enabledVoiceIds: prev.enabledVoiceIds,
+        voiceVolume: prev.voiceVolume,
+        voiceFrequency: prev.voiceFrequency,
       });
       return {
         ...prev,
@@ -2546,6 +2820,46 @@ export default function App() {
     });
   }, [setAutopilotState]);
 
+  const handleVoiceVolumeChange = useCallback(
+    (vol: number) => {
+      const clamped = Math.max(0, Math.min(1.5, Math.round(vol * 20) / 20));
+      djEngine.setVoiceVolume(clamped);
+      setAutopilotState((prev) => {
+        saveVoicePackSettings({
+          voiceFxEnabled: prev.voiceFxEnabled,
+          enabledVoiceIds: prev.enabledVoiceIds,
+          voiceVolume: clamped,
+          voiceFrequency: prev.voiceFrequency,
+        });
+        return {
+          ...prev,
+          voiceVolume: clamped,
+          currentActionLabel: `DJ Voice Mix Level set to ${Math.round(clamped * 100)}%`,
+        };
+      });
+    },
+    [setAutopilotState]
+  );
+
+  const handleVoiceFrequencyChange = useCallback(
+    (voiceFrequency: VoiceFrequencyMode) => {
+      setAutopilotState((prev) => {
+        saveVoicePackSettings({
+          voiceFxEnabled: prev.voiceFxEnabled,
+          enabledVoiceIds: prev.enabledVoiceIds,
+          voiceVolume: prev.voiceVolume,
+          voiceFrequency,
+        });
+        return {
+          ...prev,
+          voiceFrequency,
+          currentActionLabel: `AI Voice frequency set to ${voiceFrequency.toUpperCase()}`,
+        };
+      });
+    },
+    [setAutopilotState]
+  );
+
   const handleToggleVoiceItem = useCallback(
     (voiceId: DjVoiceDropId) => {
       setAutopilotState((prev) => {
@@ -2556,6 +2870,8 @@ export default function App() {
         saveVoicePackSettings({
           voiceFxEnabled: prev.voiceFxEnabled,
           enabledVoiceIds: nextIds,
+          voiceVolume: prev.voiceVolume,
+          voiceFrequency: prev.voiceFrequency,
         });
         const meta = VOICE_PRESET_MAP[voiceId];
         return {
@@ -2581,6 +2897,8 @@ export default function App() {
         saveVoicePackSettings({
           voiceFxEnabled: prev.voiceFxEnabled,
           enabledVoiceIds: nextIds,
+          voiceVolume: prev.voiceVolume,
+          voiceFrequency: prev.voiceFrequency,
         });
         return {
           ...prev,
@@ -2599,6 +2917,8 @@ export default function App() {
         saveVoicePackSettings({
           voiceFxEnabled: prev.voiceFxEnabled,
           enabledVoiceIds: nextIds,
+          voiceVolume: prev.voiceVolume,
+          voiceFrequency: prev.voiceFrequency,
         });
         return {
           ...prev,
@@ -2726,6 +3046,37 @@ export default function App() {
     });
   }, []);
 
+  const handleTrimCustomSlot = useCallback(
+    async (slotId: CustomVoiceSlotId) => {
+      setMicError(null);
+      await ensureCustomBuffersLoaded();
+      const buf = customVoiceBuffersRef.current[slotId];
+      if (!buf) return;
+      try {
+        const ctx = await djEngine.resume();
+        const trimmed = trimAndFadeVoiceBuffer(ctx, buf);
+        customVoiceBuffersRef.current[slotId] = trimmed;
+        const dur = await saveCustomVoiceBufferToIdb(slotId, trimmed);
+        setCustomVoiceDrops((prev) => {
+          const next = prev.map((m) => (m.id === slotId ? { ...m, durationSec: dur } : m));
+          saveCustomVoiceMetas(next);
+          return next;
+        });
+        const masterDeck = deckARef.current.isMaster ? deckARef.current : deckBRef.current;
+        const activeDeck = masterDeck.track ? masterDeck : deckARef.current.track ? deckARef.current : deckBRef.current;
+        const bpm = activeDeck.track ? activeDeck.baseBpm * activeDeck.playbackRate : 124;
+        await djEngine.playCustomVoiceBuffer(trimmed, bpm);
+        setAutopilotState((prev) => ({
+          ...prev,
+          currentActionLabel: `Trimmed & Normalized ${slotId.toUpperCase()} (${dur.toFixed(2)}s)`,
+        }));
+      } catch {
+        setMicError('Could not trim custom voice drop.');
+      }
+    },
+    [ensureCustomBuffersLoaded, setAutopilotState]
+  );
+
   const handleClearCustomSlot = useCallback(async (slotId: CustomVoiceSlotId) => {
     delete customVoiceBuffersRef.current[slotId];
     await deleteCustomVoiceBufferFromIdb(slotId);
@@ -2825,16 +3176,25 @@ export default function App() {
           artist: dA.track.artist,
           bpm: dA.baseBpm * dA.playbackRate,
           musicalKey: dA.track.musicalKey,
+          durationSec: dA.duration || dA.track.durationSec,
+          detectedVocalDensity: dA.track.detectedVocalDensity,
+          vocalPockets: dA.track.vocalPockets,
+          waveform: dA.waveform,
         },
         deckB: {
           title: dB.track.title,
           artist: dB.track.artist,
           bpm: dB.baseBpm * dB.playbackRate,
           musicalKey: dB.track.musicalKey,
+          durationSec: dB.duration || dB.track.durationSec,
+          detectedVocalDensity: dB.track.detectedVocalDensity,
+          vocalPockets: dB.track.vocalPockets,
+          waveform: dB.waveform,
         },
         direction: autopilotRef.current.lastDirection,
         aggressiveness: autopilotRef.current.aggressiveness,
         sessionSeed: (autopilotRef.current.sessionSeed ^ Date.now()) >>> 0,
+        template: autopilotRef.current.mashupTemplate,
       });
 
       if (!dA.isPlaying) await handleTogglePlay('A', true);
@@ -2847,6 +3207,8 @@ export default function App() {
       aiSessionRef.current.mashupSyncDeck = advice.syncDeck;
       aiSessionRef.current.lastMashupLabel = advice.harmonicSummary;
       aiSessionRef.current.lastMashupDoubleDropFired = false;
+      aiSessionRef.current.lastMashupPhaseIdx = -1;
+      aiSessionRef.current.lastMashupMicroTrickIdx = -1;
 
       setMixerState((m) => ({
         ...m,
@@ -2896,7 +3258,52 @@ export default function App() {
     }
   }, [handleSync, handleTogglePlay, setAutopilotState, setDeckState, setMixerState]);
 
-  // Real-time 25fps AI Auto-Pilot, Groove Bridge & 16-Bar Mashup Choreography Executor Loop
+  const handleMashupTemplateChange = useCallback(
+    (mashupTemplate: MashupTemplateId) => {
+      setAutopilotState((prev) => ({
+        ...prev,
+        mashupTemplate,
+        currentActionLabel: `Mashup Style · ${mashupTemplate.replace(/-/g, ' ').toUpperCase()}`,
+      }));
+      if (autopilotRef.current.mashupRoutineActive && deckARef.current.track && deckBRef.current.track) {
+        const dA = deckARef.current;
+        const dB = deckBRef.current;
+        const advice = computeOfflineMashupBlend({
+          deckA: {
+            title: dA.track!.title,
+            artist: dA.track!.artist,
+            bpm: dA.baseBpm * dA.playbackRate,
+            musicalKey: dA.track!.musicalKey,
+            durationSec: dA.duration || dA.track!.durationSec,
+            detectedVocalDensity: dA.track!.detectedVocalDensity,
+            vocalPockets: dA.track!.vocalPockets,
+            waveform: dA.waveform,
+          },
+          deckB: {
+            title: dB.track!.title,
+            artist: dB.track!.artist,
+            bpm: dB.baseBpm * dB.playbackRate,
+            musicalKey: dB.track!.musicalKey,
+            durationSec: dB.duration || dB.track!.durationSec,
+            detectedVocalDensity: dB.track!.detectedVocalDensity,
+            vocalPockets: dB.track!.vocalPockets,
+            waveform: dB.waveform,
+          },
+          direction: autopilotRef.current.lastDirection,
+          aggressiveness: autopilotRef.current.aggressiveness,
+          sessionSeed: (autopilotRef.current.sessionSeed ^ Date.now()) >>> 0,
+          template: mashupTemplate,
+        });
+        aiSessionRef.current.mashupPhases = advice.phases || null;
+        aiSessionRef.current.mashupTotalBars = advice.mashupTotalBars || 32;
+        aiSessionRef.current.lastMashupPhaseIdx = -1;
+        aiSessionRef.current.lastMashupMicroTrickIdx = -1;
+      }
+    },
+    [setAutopilotState]
+  );
+
+  // Real-time 25fps AI Auto-Pilot, Groove Bridge & 32-Bar Mashup Choreography Executor Loop
   useEffect(() => {
     if (!autopilot.enabled && !autopilot.mashupRoutineActive && autopilot.grooveBridgePattern === 'off') {
       return;
@@ -2920,7 +3327,7 @@ export default function App() {
         }
       }
 
-      // Upgrade #1: Continuous 32-Bar Live Bootleg Mashup Routine Stepper (3-Stem HPSS)
+      // Upgrade #1: Continuous 32-Bar Live Bootleg Mashup Routine Stepper (3-Stem HPSS + 4 Templates)
       if (state.mashupRoutineActive && sess.mashupPhases && sess.mashupPhases.length > 0 && state.phase !== 'transitioning') {
         const dA = deckARef.current;
         const dB = deckBRef.current;
@@ -2934,15 +3341,21 @@ export default function App() {
         const barSec = (60 / effBpm) * 4;
         const totalBars = sess.mashupTotalBars || 32;
         const barPos = ((nowMs - sess.mashupStartMs) / 1000 / barSec) % totalBars;
-        const activePh =
-          sess.mashupPhases.find((ph) => barPos >= ph.barStart && barPos < ph.barEnd) ||
-          sess.mashupPhases[0];
+        const foundIdx = sess.mashupPhases.findIndex((ph) => barPos >= ph.barStart && barPos < ph.barEnd);
+        const phaseIdx = foundIdx >= 0 ? foundIdx : 0;
+        const activePh = sess.mashupPhases[phaseIdx];
 
         let targetXf = activePh.crossfader;
         if (activePh.pingPongBars && activePh.pingPongBars > 0) {
           const tradeIdx = Math.floor((barPos - activePh.barStart) / activePh.pingPongBars);
           targetXf = tradeIdx % 2 === 0 ? -0.62 : 0.62;
         }
+
+        // Silence gap check (e.g. Festival Double-Drop 1-beat dead air before slam)
+        const gapBeats = activePh.silenceGapBeats || 0;
+        const remainingPhaseSec = (activePh.barEnd - barPos) * barSec;
+        const gapSec = (60 / effBpm) * gapBeats;
+        const inSilenceGap = gapBeats > 0 && remainingPhaseSec > 0 && remainingPhaseSec <= gapSec;
 
         if (activePh.isDoubleDrop) {
           if (!sess.lastMashupDoubleDropFired) {
@@ -2963,9 +3376,45 @@ export default function App() {
           sess.lastMashupDoubleDropFired = false;
         }
 
+        // Fire per-phase micro-tricks once upon entering a new phase
+        const enteringPhase = sess.lastMashupPhaseIdx !== phaseIdx;
+        if (enteringPhase) {
+          sess.lastMashupPhaseIdx = phaseIdx;
+          if (activePh.scratchDeck) {
+            const sd = getDeckRef(activePh.scratchDeck);
+            if (sd.playbackMode === 'webaudio') {
+              djEngine.triggerDeckTurntableScratch(activePh.scratchDeck, {
+                currentSec: getLiveTime(activePh.scratchDeck),
+                bpm: effBpm,
+                pattern: 'baby',
+                preferHarmonic: true,
+              });
+            }
+          }
+          if (activePh.tapeBrakeDeck) {
+            const tb = getDeckRef(activePh.tapeBrakeDeck);
+            if (tb.playbackMode === 'webaudio') {
+              djEngine.triggerDeckTapeBrake(activePh.tapeBrakeDeck, 0.55);
+            }
+          }
+          if (activePh.cueJuggleDeck) {
+            const cj = getDeckRef(activePh.cueJuggleDeck);
+            if (cj.playbackMode === 'webaudio') {
+              djEngine.triggerDeckBeatSlices(activePh.cueJuggleDeck, {
+                currentSec: getLiveTime(activePh.cueJuggleDeck),
+                bpm: effBpm,
+                dropCueSec: cj.track?.dropCueSec ?? cj.detectedDropSec,
+                pattern: [0, 0, 1, 0, 2, 1, 3, 0],
+                sliceBeats: 0.25,
+              });
+            }
+          }
+        }
+
         setMixerState((m) => ({ ...m, crossfader: targetXf }));
         setDeckState('A', (prev) => ({
           ...prev,
+          channelVolume: inSilenceGap ? 0.02 : 0.9,
           eqLow: activePh.deckAEqLow,
           eqMid: activePh.deckAEqMid,
           eqHigh: activePh.deckAEqHigh,
@@ -2974,9 +3423,11 @@ export default function App() {
             prev.playbackMode === 'webaudio' && activePh.deckAStemMode
               ? activePh.deckAStemMode
               : prev.stemMode,
+          fx: enteringPhase && activePh.deckAFx ? { ...prev.fx, ...activePh.deckAFx } : prev.fx,
         }));
         setDeckState('B', (prev) => ({
           ...prev,
+          channelVolume: inSilenceGap ? 0.02 : 0.9,
           eqLow: activePh.deckBEqLow,
           eqMid: activePh.deckBEqMid,
           eqHigh: activePh.deckBEqHigh,
@@ -2985,6 +3436,7 @@ export default function App() {
             prev.playbackMode === 'webaudio' && activePh.deckBStemMode
               ? activePh.deckBStemMode
               : prev.stemMode,
+          fx: enteringPhase && activePh.deckBFx ? { ...prev.fx, ...activePh.deckBFx } : prev.fx,
         }));
 
         // Upgrade #4: Live RMS Low-Band Sidechain during 32-Bar Mashup
@@ -3297,7 +3749,7 @@ export default function App() {
         }
 
         // Wave-3 #6: Automatic "Club VIP Edit" Arrangement Skipper for Long Tracks
-        const vipSkip = sess.plan.vipSkipEdit;
+        const vipSkip = state.features.vipSkip ? sess.plan.vipSkipEdit : null;
         if (
           vipSkip &&
           !sess.vipSkipFired &&
@@ -3408,6 +3860,7 @@ export default function App() {
             setMixerState((m) => ({ ...m, crossfader: outId === 'A' ? -1 : 1 }));
           }
         } else if (
+          state.features.breakdownTease &&
           sess.plan.teasePreview &&
           !sess.teaseFired &&
           inDeck.playbackMode === 'webaudio' &&
@@ -3449,7 +3902,7 @@ export default function App() {
         }
 
         // Upgrade #1: Beat-Quantized Per-Song Offline AI Live Remix Moments during Cruising
-        const moments = sess.plan.songMoments || [];
+        const moments = state.features.songMoments ? sess.plan.songMoments || [] : [];
         const mutedSet = new Set(state.mutedMomentIndices || []);
         if (sess.pendingMomentIdx === null) {
           for (let mIdx = 0; mIdx < moments.length; mIdx++) {
@@ -3457,6 +3910,7 @@ export default function App() {
             if (
               !mutedSet.has(mIdx) &&
               !sess.firedMomentIndices.has(mIdx) &&
+              !(moment.isVipDropFakeout && !state.features.dropFakeouts) &&
               pct >= moment.atPct &&
               pct <= moment.atPct + 0.08
             ) {
@@ -3526,7 +3980,8 @@ export default function App() {
             }
 
             // Upgrade #3: VIP Drop Fakeout Multi-Phrase Arc
-            if (moment.isVipDropFakeout) {
+            const runFakeout = Boolean(moment.isVipDropFakeout && state.features.dropFakeouts);
+            if (runFakeout) {
               sess.vipFakeoutDeck = outId;
               sess.vipFakeoutStartMs = nowMs;
               sess.vipFakeoutUntilMs = nowMs + moment.durationMs;
@@ -3543,6 +3998,7 @@ export default function App() {
               sess.ytPumpUntilMs = nowMs + moment.durationMs;
               sess.ytPumpDropSlammed = false;
               if (
+                state.features.autoGrooveBridge &&
                 moment.youtubePumpMode === 'drop-takeover' &&
                 !state.muteSoundTricks &&
                 state.grooveBridgePattern === 'off'
@@ -3559,11 +4015,16 @@ export default function App() {
               }
             }
 
-            if (moment.chopPattern && moment.chopPattern !== 'off') {
+            if (state.features.beatSliceStutter && moment.chopPattern && moment.chopPattern !== 'off') {
               sess.cruisingChopPattern = moment.chopPattern;
               sess.cruisingChopUntilMs = nowMs + moment.durationMs;
             }
-            if (moment.cueJuggleSeq && moment.cueJuggleSeq.length > 0 && !moment.loopBars) {
+            if (
+              state.features.beatSliceStutter &&
+              moment.cueJuggleSeq &&
+              moment.cueJuggleSeq.length > 0 &&
+              !moment.loopBars
+            ) {
               sess.cruisingCueSeq = moment.cueJuggleSeq;
               sess.cruisingCueStartMs = nowMs;
               sess.cruisingCueUntilMs = nowMs + Math.min(moment.durationMs, 1800);
@@ -3573,7 +4034,12 @@ export default function App() {
             if (moment.pitchBurst && outDeck.playbackMode === 'webaudio') {
               djEngine.setDeckRate(outId, moment.pitchBurst);
             }
-            if (!moment.isVipDropFakeout && moment.beatSlicePattern && outDeck.playbackMode === 'webaudio') {
+            if (
+              state.features.beatSliceStutter &&
+              !runFakeout &&
+              moment.beatSlicePattern &&
+              outDeck.playbackMode === 'webaudio'
+            ) {
               djEngine.triggerDeckBeatSlices(outId, {
                 currentSec: cur,
                 bpm,
@@ -3695,6 +4161,7 @@ export default function App() {
 
         // Advance #3 & Upgrade #6: Auto Groove Drum Bridge glue mid-transition (forced on Trap->House)
         const wantAutoBridge =
+          state.features.autoGrooveBridge &&
           (state.remixMode || physics === 'trap-to-house') &&
           !state.muteSoundTricks &&
           state.grooveBridgePattern === 'off';
@@ -3759,6 +4226,7 @@ export default function App() {
 
         // Wave-2 Advance #6: Quantized mid-transition Beat-Slice fill when enabled
         if (
+          state.features.beatSliceStutter &&
           sess.plan.useBeatSliceStutter &&
           p >= 0.45 &&
           p <= 0.54 &&
@@ -3887,7 +4355,7 @@ export default function App() {
           }
 
           // Feature #1B: YouTube-Native Quantized Hot-Cue Wordplay & Stutter Jumps
-          if (trick.action === 'cue-wordplay-juggle' && inWindow) {
+          if (state.features.beatSliceStutter && trick.action === 'cue-wordplay-juggle' && inWindow) {
             const seq = sess.plan?.cueJuggleSeq || [0, 0, 1, 2];
             const stepDurationMs = Math.max(240, beatMs * 0.5);
             const stepIdx = Math.floor((elapsed - trick.atProgress * sess.transitionDurationMs) / stepDurationMs);
@@ -4348,7 +4816,7 @@ export default function App() {
           djEngine.setDeckSidechainDuck('B', 1);
           handleExitLoop(outId);
 
-          const carryBars = sess.plan.vocalCarryoverBars || 0;
+          const carryBars = state.features.vocalCarryover ? sess.plan.vocalCarryoverBars || 0 : 0;
           const canVocalCarryover =
             carryBars > 0 &&
             outDeck.playbackMode === 'webaudio' &&
@@ -4480,6 +4948,7 @@ export default function App() {
           const tempoMap = buildElasticTempoMap(buf, detected.bpm, detected.firstBeatSec);
           const keyInfo = detectCamelotKey(buf);
           const loudness = estimateTrackLoudnessGain(buf);
+          const vocalInit = analyzeAudioVocalPockets(buf, detected.bpm);
           const id = `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
           localFileBuffersRef.current.set(id, arr);
 
@@ -4495,6 +4964,8 @@ export default function App() {
             firstBeatSec: detected.firstBeatSec,
             tempoMap,
             autoTrimGain: loudness.autoTrimGain,
+            detectedVocalDensity: vocalInit.density,
+            vocalPockets: vocalInit.pockets,
             addedAt: Date.now(),
           };
           library.addTrack(
@@ -4523,7 +4994,7 @@ export default function App() {
       const count = library.recordings.length + 1;
       library.addRecording({
         id: `rec-${Date.now()}`,
-        title: `DeckForge Set #${count}`,
+        title: `DJOne Set #${count}`,
         createdAt: Date.now(),
         durationSec: result.durationSec,
         format: 'wav',
@@ -4533,13 +5004,173 @@ export default function App() {
     }
   };
 
-  // Upgrade #7: Faster-Than-Real-Time OfflineAudioContext AI Mixtape & 32-Bar Bootleg WAV Renderer
+  // Upgrade #7: Faster-Than-Real-Time OfflineAudioContext AI Mixtape, Full-Playlist Set, 1-Deck Club Flip & Preview Renderer
   const handleRenderAiRemixWav = useCallback(
-    async (mode: 'mashup-32' | 'ai-transition', onProgress: (pct: number) => void) => {
+    async (
+      opts: OfflineRenderOptions,
+      onProgress: (pct: number) => void
+    ): Promise<OfflinePreviewResult | void> => {
+      await ensureCustomBuffersLoaded();
+
+      const resolveCueOverride = (d: DeckState, mode: CueStartMode): number | null => {
+        if (mode === 'auto') return null;
+        if (mode === 'playhead') return getLiveTime(d.deckId);
+        const idx = parseInt(mode.replace('cue-', ''), 10);
+        if (!Number.isNaN(idx)) {
+          const val = d.hotCues[idx]?.timeSec;
+          return typeof val === 'number' ? val : null;
+        }
+        return null;
+      };
+
+      const resolveTrackAudio = async (track: TrackItem) => {
+        if (deckARef.current.track?.id === track.id) {
+          const existing = djEngine.getDeckAudioBuffers('A');
+          if (existing.buffer) {
+            return {
+              track,
+              buffer: existing.buffer,
+              harmonicBuffer: existing.harmonicBuffer,
+              percussiveBuffer: existing.percussiveBuffer,
+              bassBuffer: existing.bassBuffer,
+            };
+          }
+        }
+        if (deckBRef.current.track?.id === track.id) {
+          const existing = djEngine.getDeckAudioBuffers('B');
+          if (existing.buffer) {
+            return {
+              track,
+              buffer: existing.buffer,
+              harmonicBuffer: existing.harmonicBuffer,
+              percussiveBuffer: existing.percussiveBuffer,
+              bassBuffer: existing.bassBuffer,
+            };
+          }
+        }
+        if (track.sourceType === 'local') {
+          const raw = localFileBuffersRef.current.get(track.id);
+          if (raw) {
+            const buf = await djEngine.decodeAudioData(raw.slice(0));
+            const enrichedTrack = track.autoTrimGain
+              ? track
+              : { ...track, autoTrimGain: estimateTrackLoudnessGain(buf).autoTrimGain };
+            return {
+              track: enrichedTrack,
+              buffer: buf,
+              harmonicBuffer: null,
+              percussiveBuffer: null,
+              bassBuffer: null,
+            };
+          }
+        }
+        if (track.youtubeId) {
+          const resp = await fetch(`/api/yt/stream/${encodeURIComponent(track.youtubeId)}`);
+          if (resp.ok && resp.headers.get('content-type')?.includes('audio')) {
+            const arr = await resp.arrayBuffer();
+            const buf = await djEngine.decodeAudioData(arr);
+            const enrichedTrack = track.autoTrimGain
+              ? track
+              : { ...track, autoTrimGain: estimateTrackLoudnessGain(buf).autoTrimGain };
+            return {
+              track: enrichedTrack,
+              buffer: buf,
+              harmonicBuffer: null,
+              percussiveBuffer: null,
+              bassBuffer: null,
+            };
+          }
+        }
+        return null;
+      };
+
       const dA = deckARef.current;
       const dB = deckBRef.current;
-      if (!dA.track || !dB.track) {
-        throw new Error('Load tracks on both Deck A and Deck B first.');
+      const cueASecOverride = resolveCueOverride(dA, opts.cueAMode);
+      const cueBSecOverride = resolveCueOverride(dB, opts.cueBMode);
+      const resolvedSeed = opts.sessionSeedOverride ?? autopilotRef.current.sessionSeed;
+
+      let customIntroVoiceBuffer: AudioBuffer | null = null;
+      if (opts.useGroqIntroDrop && opts.includeVoicesAndFx && opts.groqCalloutScript.trim()) {
+        onProgress(2);
+        customIntroVoiceBuffer = await fetchGroqTtsDropBuffer({
+          text: opts.groqCalloutScript,
+          voice: opts.groqVoicePersona,
+          audioCtx: new OfflineAudioContext(1, 1, 44100),
+        });
+      }
+
+      if (opts.mode === 'playlist-mix') {
+        const plTracks = getPlaylistTracks(autopilotRef.current.targetPlaylistId).slice(
+          0,
+          opts.preview8BarsOnly ? 2 : 20
+        );
+        if (plTracks.length < 2) {
+          throw new Error('Select a playlist with at least 2 tracks to render a continuous mix.');
+        }
+        onProgress(4);
+        const resolvedList: NonNullable<Awaited<ReturnType<typeof resolveTrackAudio>>>[] = [];
+        for (let i = 0; i < plTracks.length; i++) {
+          const item = await resolveTrackAudio(plTracks[i]);
+          if (item) resolvedList.push(item);
+          onProgress(Math.round(5 + ((i + 1) / plTracks.length) * 30));
+        }
+        if (resolvedList.length < 2) {
+          throw new Error(
+            'Could not decode at least 2 streamable/local tracks from this playlist for offline rendering.'
+          );
+        }
+
+        const res = await renderOfflineAiRemixWav({
+          mode: 'playlist-mix',
+          deckA: resolvedList[0],
+          deckB: resolvedList[1],
+          playlistTracks: resolvedList,
+          vibe: autopilotRef.current.vibe,
+          aggressiveness: autopilotRef.current.aggressiveness,
+          randomness: autopilotRef.current.randomness,
+          sessionSeed: resolvedSeed,
+          mashupTemplate: opts.mashupTemplate,
+          stemSwapMode: opts.stemSwapMode,
+          reharmonizeSynth: opts.reharmonizeSynth,
+          masteringProfile: opts.masteringProfile,
+          renderVariant: 'master',
+          customIntroVoiceBuffer,
+          customMixTitle: opts.customMixTitle,
+          mutedPhaseIndices: opts.mutedPhaseIndices,
+          playlistPacing: opts.playlistPacing,
+          cueASecOverride,
+          preview8BarsOnly: opts.preview8BarsOnly,
+          exportFormat: opts.exportFormat,
+          includeVoicesAndFx: opts.includeVoicesAndFx,
+          preservePitch: opts.preservePitch,
+          voiceFxEnabled: autopilotRef.current.voiceFxEnabled,
+          voiceVolume: autopilotRef.current.voiceVolume,
+          voiceFrequency: autopilotRef.current.voiceFrequency,
+          enabledVoiceIds: autopilotRef.current.enabledVoiceIds,
+          customVoiceDrops: customVoiceDropsRef.current,
+          customVoiceBuffers: customVoiceBuffersRef.current,
+          features: autopilotRef.current.features,
+          onProgress: (p) => onProgress(Math.max(36, p)),
+        });
+
+        const url = URL.createObjectURL(res.blob);
+        if (opts.preview8BarsOnly) {
+          return { previewUrl: url, previewTitle: res.title };
+        }
+        libraryRef.current.addRecording({
+          id: `render-${Date.now()}`,
+          title: res.title,
+          createdAt: Date.now(),
+          durationSec: res.durationSec,
+          format: res.format,
+          url,
+          sizeBytes: res.blob.size,
+          cueSheetText: res.cueSheetText,
+          tracklistCount: res.tracklistCount,
+          packRole: res.packRole,
+        });
+        return;
       }
 
       const resolveDeckAudio = async (id: DeckId, d: DeckState) => {
@@ -4558,43 +5189,165 @@ export default function App() {
         );
       };
 
-      onProgress(4);
-      const audioA = await resolveDeckAudio('A', dA);
-      const audioB = await resolveDeckAudio('B', dB);
+      const variantsToRender: OfflineRenderVariant[] =
+        !opts.preview8BarsOnly && opts.exportDjPack
+          ? ['master', 'dj-edit', 'instrumental', 'acapella']
+          : ['master'];
 
-      const res = await renderOfflineAiRemixWav({
-        mode,
-        deckA: {
+      if (opts.mode === 'single-flip') {
+        if (!dA.track) {
+          throw new Error('Load a track on Deck A first for a 1-Deck Club Flip.');
+        }
+        onProgress(4);
+        const audioA = await resolveDeckAudio('A', dA);
+        let deckAInput: OfflineRenderDeckInput = {
           track: dA.track,
           buffer: audioA.buffer!,
           harmonicBuffer: audioA.harmonicBuffer,
           percussiveBuffer: audioA.percussiveBuffer,
           bassBuffer: audioA.bassBuffer,
-        },
-        deckB: {
-          track: dB.track,
-          buffer: audioB.buffer!,
-          harmonicBuffer: audioB.harmonicBuffer,
-          percussiveBuffer: audioB.percussiveBuffer,
-          bassBuffer: audioB.bassBuffer,
-        },
-        vibe: autopilotRef.current.vibe,
-        aggressiveness: autopilotRef.current.aggressiveness,
-        onProgress,
-      });
+        };
 
-      const url = URL.createObjectURL(res.blob);
-      libraryRef.current.addRecording({
-        id: `render-${Date.now()}`,
-        title: res.title,
-        createdAt: Date.now(),
-        durationSec: res.durationSec,
-        format: 'wav',
-        url,
-        sizeBytes: res.blob.size,
-      });
+        for (let vIdx = 0; vIdx < variantsToRender.length; vIdx++) {
+          const variant = variantsToRender[vIdx];
+          const res = await renderOfflineAiRemixWav({
+            mode: 'single-flip',
+            deckA: deckAInput,
+            vibe: autopilotRef.current.vibe,
+            aggressiveness: autopilotRef.current.aggressiveness,
+            randomness: autopilotRef.current.randomness,
+            sessionSeed: resolvedSeed,
+            stemSwapMode: opts.stemSwapMode,
+            reharmonizeSynth: opts.reharmonizeSynth,
+            masteringProfile: opts.masteringProfile,
+            renderVariant: variant,
+            customIntroVoiceBuffer: variant === 'instrumental' ? null : customIntroVoiceBuffer,
+            customMixTitle: opts.customMixTitle,
+            mutedPhaseIndices: opts.mutedPhaseIndices,
+            flipBridgePattern: opts.flipBridgePattern,
+            cueASecOverride,
+            preview8BarsOnly: opts.preview8BarsOnly,
+            exportFormat: opts.exportFormat,
+            includeVoicesAndFx: opts.includeVoicesAndFx,
+            preservePitch: opts.preservePitch,
+            voiceFxEnabled: autopilotRef.current.voiceFxEnabled,
+            voiceVolume: autopilotRef.current.voiceVolume,
+            voiceFrequency: autopilotRef.current.voiceFrequency,
+            enabledVoiceIds: autopilotRef.current.enabledVoiceIds,
+            customVoiceDrops: customVoiceDropsRef.current,
+            customVoiceBuffers: customVoiceBuffersRef.current,
+            features: autopilotRef.current.features,
+            onProgress: (p) =>
+              onProgress(Math.min(99, Math.round(((vIdx + p / 100) / variantsToRender.length) * 100))),
+          });
+
+          if (res.stemmedA) {
+            deckAInput = res.stemmedA;
+          }
+
+          const url = URL.createObjectURL(res.blob);
+          if (opts.preview8BarsOnly) {
+            return { previewUrl: url, previewTitle: res.title };
+          }
+          libraryRef.current.addRecording({
+            id: `render-${Date.now()}-${variant}`,
+            title: res.title,
+            createdAt: Date.now() + vIdx,
+            durationSec: res.durationSec,
+            format: res.format,
+            url,
+            sizeBytes: res.blob.size,
+            cueSheetText: res.cueSheetText,
+            tracklistCount: res.tracklistCount,
+            packRole: res.packRole,
+          });
+        }
+        return;
+      }
+
+      if (!dA.track || !dB.track) {
+        throw new Error('Load tracks on both Deck A and Deck B first.');
+      }
+
+      onProgress(4);
+      const audioA = await resolveDeckAudio('A', dA);
+      const audioB = await resolveDeckAudio('B', dB);
+      let deckAInput: OfflineRenderDeckInput = {
+        track: dA.track,
+        buffer: audioA.buffer!,
+        harmonicBuffer: audioA.harmonicBuffer,
+        percussiveBuffer: audioA.percussiveBuffer,
+        bassBuffer: audioA.bassBuffer,
+      };
+      let deckBInput: OfflineRenderDeckInput = {
+        track: dB.track,
+        buffer: audioB.buffer!,
+        harmonicBuffer: audioB.harmonicBuffer,
+        percussiveBuffer: audioB.percussiveBuffer,
+        bassBuffer: audioB.bassBuffer,
+      };
+
+      for (let vIdx = 0; vIdx < variantsToRender.length; vIdx++) {
+        const variant = variantsToRender[vIdx];
+        const res = await renderOfflineAiRemixWav({
+          mode: opts.mode,
+          deckA: deckAInput,
+          deckB: deckBInput,
+          vibe: autopilotRef.current.vibe,
+          aggressiveness: autopilotRef.current.aggressiveness,
+          randomness: autopilotRef.current.randomness,
+          sessionSeed: resolvedSeed,
+          mashupTemplate: opts.mashupTemplate,
+          stemSwapMode: opts.stemSwapMode,
+          reharmonizeSynth: opts.reharmonizeSynth,
+          masteringProfile: opts.masteringProfile,
+          renderVariant: variant,
+          customIntroVoiceBuffer: variant === 'instrumental' ? null : customIntroVoiceBuffer,
+          customMixTitle: opts.customMixTitle,
+          mutedPhaseIndices: opts.mutedPhaseIndices,
+          cueASecOverride,
+          cueBSecOverride,
+          preview8BarsOnly: opts.preview8BarsOnly,
+          exportFormat: opts.exportFormat,
+          includeVoicesAndFx: opts.includeVoicesAndFx,
+          preservePitch: opts.preservePitch,
+          voiceFxEnabled: autopilotRef.current.voiceFxEnabled,
+          voiceVolume: autopilotRef.current.voiceVolume,
+          voiceFrequency: autopilotRef.current.voiceFrequency,
+          enabledVoiceIds: autopilotRef.current.enabledVoiceIds,
+          customVoiceDrops: customVoiceDropsRef.current,
+          customVoiceBuffers: customVoiceBuffersRef.current,
+          features: autopilotRef.current.features,
+          onProgress: (p) =>
+            onProgress(Math.min(99, Math.round(((vIdx + p / 100) / variantsToRender.length) * 100))),
+        });
+
+        if (res.stemmedA) {
+          deckAInput = res.stemmedA;
+        }
+        if (res.stemmedB) {
+          deckBInput = res.stemmedB;
+        }
+
+        const url = URL.createObjectURL(res.blob);
+        if (opts.preview8BarsOnly) {
+          return { previewUrl: url, previewTitle: res.title };
+        }
+        libraryRef.current.addRecording({
+          id: `render-${Date.now()}-${variant}`,
+          title: res.title,
+          createdAt: Date.now() + vIdx,
+          durationSec: res.durationSec,
+          format: res.format,
+          url,
+          sizeBytes: res.blob.size,
+          cueSheetText: res.cueSheetText,
+          tracklistCount: res.tracklistCount,
+          packRole: res.packRole,
+        });
+      }
     },
-    []
+    [ensureCustomBuffersLoaded, getLiveTime, getPlaylistTracks]
   );
 
   const handleTriggerSoundTrick = (trick: SoundTrickType) => {
@@ -4776,19 +5529,22 @@ export default function App() {
     const mutedSet = new Set(autopilot.mutedMomentIndices || []);
     const markers: WaveformAiMarker[] = [];
 
-    (plan.songMoments || []).forEach((m, idx) => {
-      markers.push({
-        id: `moment-${idx}`,
-        deckId: outId,
-        kind: m.isVipDropFakeout ? 'fakeout' : 'moment',
-        timeSec: Math.round(m.atPct * dur * 100) / 100,
-        label: m.label,
-        muted: mutedSet.has(idx),
-        momentIndex: idx,
+    if (autopilot.features.songMoments) {
+      (plan.songMoments || []).forEach((m, idx) => {
+        if (m.isVipDropFakeout && !autopilot.features.dropFakeouts) return;
+        markers.push({
+          id: `moment-${idx}`,
+          deckId: outId,
+          kind: m.isVipDropFakeout ? 'fakeout' : 'moment',
+          timeSec: Math.round(m.atPct * dur * 100) / 100,
+          label: m.label,
+          muted: mutedSet.has(idx),
+          momentIndex: idx,
+        });
       });
-    });
+    }
 
-    if (plan.vipSkipEdit) {
+    if (autopilot.features.vipSkip && plan.vipSkipEdit) {
       markers.push({
         id: 'vip-skip',
         deckId: outId,
@@ -4798,7 +5554,7 @@ export default function App() {
       });
     }
 
-    if (plan.teasePreview) {
+    if (autopilot.features.breakdownTease && plan.teasePreview) {
       markers.push({
         id: 'tease-preview',
         deckId: outId,
@@ -4830,6 +5586,7 @@ export default function App() {
     autopilot.quickMix,
     autopilot.remixMode,
     autopilot.holdExtraBars,
+    autopilot.features,
     deckA,
     deckB,
   ]);
@@ -4965,7 +5722,7 @@ export default function App() {
           onClick={(e) => e.preventDefault()}
           className="font-display text-base font-bold tracking-tight text-white whitespace-nowrap shrink-0"
         >
-          DeckForge
+          DJOne
         </a>
 
         <nav className="hidden lg:flex items-center gap-6 text-xs font-medium text-slate-300">
@@ -5112,6 +5869,7 @@ export default function App() {
             onTriggerWildTake={handleTriggerWildTake}
             onTargetPlaylistChange={handleTargetPlaylistChange}
             onVibeChange={(vibe) => setAutopilotState((p) => ({ ...p, vibe }))}
+            onMashupTemplateChange={handleMashupTemplateChange}
             onMixNow={() => beginAiTransitionNow(true)}
             onDirectAi={handleDirectAi}
             onMashupBlend={handleAiMashupBlend}
@@ -5120,6 +5878,8 @@ export default function App() {
             onSwapUpcomingStyle={handleSwapUpcomingStyle}
             onToggleMuteSfx={handleToggleMuteSfx}
             onToggleVoiceFx={handleToggleVoiceFx}
+            onVoiceVolumeChange={handleVoiceVolumeChange}
+            onVoiceFrequencyChange={handleVoiceFrequencyChange}
             onToggleVoiceItem={handleToggleVoiceItem}
             onSetVoiceCategoryEnabled={handleSetVoiceCategoryEnabled}
             onEnableAllVoices={handleEnableAllVoices}
@@ -5131,7 +5891,10 @@ export default function App() {
             onUploadCustomSlot={handleUploadCustomSlot}
             onTriggerCustomSlot={handleTriggerCustomSlot}
             onToggleCustomSlotEnabled={handleToggleCustomSlotEnabled}
+            onTrimCustomSlot={handleTrimCustomSlot}
             onClearCustomSlot={handleClearCustomSlot}
+            onToggleFeature={handleToggleAiFeature}
+            onApplyFeaturePreset={handleApplyFeaturePreset}
             onCycleGrooveBridge={handleCycleGrooveBridge}
             onOpenCrate={() => setIsCrateOpen(true)}
           />
@@ -5188,6 +5951,7 @@ export default function App() {
                 onTriggerWildTake={handleTriggerWildTake}
                 onTargetPlaylistChange={handleTargetPlaylistChange}
                 onVibeChange={(vibe) => setAutopilotState((p) => ({ ...p, vibe }))}
+                onMashupTemplateChange={handleMashupTemplateChange}
                 onMixNow={() => beginAiTransitionNow(true)}
                 onDirectAi={handleDirectAi}
                 onMashupBlend={handleAiMashupBlend}
@@ -5196,6 +5960,8 @@ export default function App() {
                 onSwapUpcomingStyle={handleSwapUpcomingStyle}
                 onToggleMuteSfx={handleToggleMuteSfx}
                 onToggleVoiceFx={handleToggleVoiceFx}
+                onVoiceVolumeChange={handleVoiceVolumeChange}
+                onVoiceFrequencyChange={handleVoiceFrequencyChange}
                 onToggleVoiceItem={handleToggleVoiceItem}
                 onSetVoiceCategoryEnabled={handleSetVoiceCategoryEnabled}
                 onEnableAllVoices={handleEnableAllVoices}
@@ -5207,7 +5973,10 @@ export default function App() {
                 onUploadCustomSlot={handleUploadCustomSlot}
                 onTriggerCustomSlot={handleTriggerCustomSlot}
                 onToggleCustomSlotEnabled={handleToggleCustomSlotEnabled}
+                onTrimCustomSlot={handleTrimCustomSlot}
                 onClearCustomSlot={handleClearCustomSlot}
+                onToggleFeature={handleToggleAiFeature}
+                onApplyFeaturePreset={handleApplyFeaturePreset}
                 onCycleGrooveBridge={handleCycleGrooveBridge}
                 onOpenCrate={() => setMobileTab('crate')}
               />
@@ -5348,18 +6117,41 @@ export default function App() {
           deckB.playbackMode === 'webaudio' &&
           Boolean(deckA.track && deckB.track)
         }
+        canRenderSingleFlip={deckA.playbackMode === 'webaudio' && Boolean(deckA.track)}
         offlineRemixPairLabel={
           deckA.track && deckB.track
             ? `${deckA.track.title.split('(')[0].trim()} × ${deckB.track.title.split('(')[0].trim()}`
             : ''
         }
+        singleFlipLabel={deckA.track ? deckA.track.title.split('(')[0].trim() : ''}
         offlineRenderDisabledReason={
           !deckA.track || !deckB.track
-            ? 'Load tracks on both Deck A and Deck B to enable faster-than-real-time WAV rendering.'
+            ? 'Load tracks on both Deck A and Deck B to enable faster-than-real-time rendering.'
             : deckA.playbackMode !== 'webaudio' || deckB.playbackMode !== 'webaudio'
-            ? 'Offline Fast-Render requires both decks to be Web Audio / local / streamed tracks (YouTube IFrame audio is cross-origin).'
+            ? 'Offline Fast-Render requires Web Audio / local / streamed tracks (YouTube IFrame audio is cross-origin).'
             : undefined
         }
+        deckATrack={deckA.track}
+        deckBTrack={deckB.track}
+        playlistTrackItems={getPlaylistTracks(autopilot.targetPlaylistId)}
+        currentVibe={autopilot.vibe}
+        currentAggressiveness={autopilot.aggressiveness}
+        initialSeed={autopilot.sessionSeed}
+        deckACues={deckA.hotCues}
+        deckBCues={deckB.hotCues}
+        deckACurrentTime={getLiveTime('A')}
+        deckBCurrentTime={getLiveTime('B')}
+        vipSkipEnabled={autopilot.features.vipSkip}
+        playlists={library.playlists}
+        targetPlaylistId={autopilot.targetPlaylistId}
+        onTargetPlaylistChange={handleTargetPlaylistChange}
+        canRenderPlaylistMix={getPlaylistTracks(autopilot.targetPlaylistId).length >= 2}
+        playlistMixLabel={(() => {
+          const pl = library.playlists.find((p) => p.id === autopilot.targetPlaylistId);
+          const count = Math.min(20, getPlaylistTracks(autopilot.targetPlaylistId).length);
+          return `${pl?.name || 'All Library Tracks'} · ${count} tracks`;
+        })()}
+        defaultMashupTemplate={autopilot.mashupTemplate}
         onRenderAiRemixWav={handleRenderAiRemixWav}
       />
     </div>
