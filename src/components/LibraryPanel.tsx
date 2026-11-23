@@ -51,6 +51,21 @@ interface LibraryPanelProps {
   onCloseDrawer?: () => void;
 }
 
+async function parseApiJson<T = any>(res: Response): Promise<T> {
+  const text = await res.text();
+  const trimmed = text.trim();
+  if (trimmed.startsWith('<')) {
+    throw new Error(
+      'YouTube API returned HTML instead of JSON. Ensure Cloudflare Pages Functions (/functions) are deployed or run the Node server.'
+    );
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Invalid JSON response from API (HTTP ${res.status}).`);
+  }
+}
+
 function formatDuration(sec: number): string {
   const s = Math.max(0, Math.round(sec));
   const m = Math.floor(s / 60);
@@ -140,7 +155,7 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
 
       if (ytListId && (q.includes('/playlist') || !directId)) {
         const res = await fetch(`/api/yt/playlist?list=${encodeURIComponent(ytListId)}`);
-        const data = await res.json();
+        const data = await parseApiJson<{ title?: string; tracks?: YouTubeSearchResult[]; error?: string }>(res);
         if (!res.ok) throw new Error(data.error || 'Could not import YouTube playlist');
 
         const rawTracks: YouTubeSearchResult[] = data.tracks || [];
@@ -159,9 +174,27 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
         setYtQuery('');
         setYtNotice(`Imported "${plName}" (${mapped.length} tracks) — ready for AI DJ.`);
       } else if (directId) {
-        const res = await fetch(`/api/yt/info?id=${encodeURIComponent(directId)}`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Could not load YouTube URL');
+        let data: {
+          title?: string;
+          author?: string;
+          durationSec?: number;
+          thumbnail?: string;
+          bpmHint?: number | null;
+          error?: string;
+        } = {};
+        try {
+          const res = await fetch(`/api/yt/info?id=${encodeURIComponent(directId)}`);
+          data = await parseApiJson(res);
+          if (!res.ok) throw new Error(data.error || 'Could not load YouTube URL');
+        } catch {
+          data = {
+            title: `YouTube Track (${directId})`,
+            author: 'YouTube',
+            durationSec: 210,
+            thumbnail: `https://i.ytimg.com/vi/${directId}/hqdefault.jpg`,
+            bpmHint: null,
+          };
+        }
 
         const newTrack: TrackItem = {
           id: `yt-${directId}`,
@@ -190,7 +223,7 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
         ]);
       } else {
         const res = await fetch(`/api/yt/search?q=${encodeURIComponent(q)}`);
-        const data = await res.json();
+        const data = await parseApiJson<{ results?: YouTubeSearchResult[]; error?: string }>(res);
         if (!res.ok) throw new Error(data.error || 'YouTube search failed');
         setYtResults(data.results || []);
         if (!data.results?.length) {

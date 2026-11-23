@@ -3,6 +3,12 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Innertube } from 'youtubei.js';
+import {
+  extractBpmHint,
+  fetchYouTubePlaylist,
+  parseDurationText,
+  searchYouTubeVideos,
+} from './shared/ytInnertube.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,24 +34,6 @@ async function getYouTubeClient(): Promise<Innertube> {
       });
   }
   return ytInitPromise;
-}
-
-function parseDurationText(text?: string): number {
-  if (!text) return 0;
-  const parts = text.split(':').map((p) => parseInt(p, 10));
-  if (parts.some(Number.isNaN)) return 0;
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return parts[0] || 0;
-}
-
-function extractBpmHint(title: string): number | null {
-  const match = title.match(/\b(7\d|8\d|9\d|1[0-7]\d|180)\s*bpm\b/i);
-  if (match) {
-    const val = parseInt(match[1], 10);
-    if (val >= 70 && val <= 185) return val;
-  }
-  return null;
 }
 
 async function startServer() {
@@ -95,71 +83,23 @@ async function startServer() {
           };
         });
 
-      // Fallback to direct YouTube Innertube JSON endpoint if parser returned 0
+      // Fallback to shared pure-fetch YouTube Innertube endpoint if parser returned 0
       if (videos.length === 0) {
-        const directRes = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            context: {
-              client: {
-                clientName: 'WEB',
-                clientVersion: '2.20241120.01.00',
-                hl: 'en',
-                gl: 'US',
-              },
-            },
-            query: q,
-          }),
-        });
-        if (directRes.ok) {
-          const json = (await directRes.json()) as any;
-          const sections =
-            json?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer
-              ?.contents || [];
-          const found: any[] = [];
-          for (const sec of sections) {
-            const items = sec?.itemSectionRenderer?.contents || [];
-            for (const item of items) {
-              const vr = item?.videoRenderer;
-              if (!vr?.videoId) continue;
-              const title =
-                vr.title?.runs?.map((r: any) => r.text).join('') ||
-                vr.title?.simpleText ||
-                'YouTube Track';
-              const author =
-                vr.ownerText?.runs?.[0]?.text ||
-                vr.longBylineText?.runs?.[0]?.text ||
-                'YouTube';
-              const durationText = vr.lengthText?.simpleText || '3:30';
-              const durationSec = parseDurationText(durationText) || 210;
-              const thumb =
-                vr.thumbnail?.thumbnails?.[0]?.url ||
-                `https://i.ytimg.com/vi/${vr.videoId}/hqdefault.jpg`;
-              found.push({
-                videoId: vr.videoId,
-                title,
-                author,
-                durationSec,
-                durationText,
-                thumbnail: thumb,
-                bpmHint: extractBpmHint(title),
-              });
-              if (found.length >= 16) break;
-            }
-            if (found.length >= 16) break;
-          }
-          videos = found;
-        }
+        videos = await searchYouTubeVideos(q, 16);
       }
 
       res.json({ results: videos });
     } catch (err: any) {
-      console.error('YouTube search error:', err?.message || err);
-      res.status(502).json({
-        error: 'Unable to reach YouTube search right now.',
-        results: [],
-      });
+      try {
+        const fallbackVideos = await searchYouTubeVideos(q, 16);
+        res.json({ results: fallbackVideos });
+      } catch (fallbackErr: any) {
+        console.error('YouTube search error:', err?.message || err, fallbackErr?.message || '');
+        res.status(502).json({
+          error: 'Unable to reach YouTube search right now.',
+          results: [],
+        });
+      }
     }
   });
 
@@ -222,13 +162,24 @@ async function startServer() {
         .filter(Boolean)
         .slice(0, 25);
 
+      if (items.length === 0) {
+        const fallback = await fetchYouTubePlaylist(listId, 25);
+        res.json({ title: fallback.title || playlistTitle, tracks: fallback.tracks });
+        return;
+      }
+
       res.json({ title: playlistTitle, tracks: items });
     } catch (err: any) {
-      console.error('YouTube playlist error:', err?.message || err);
-      res.status(502).json({
-        error: 'Unable to load that YouTube playlist.',
-        tracks: [],
-      });
+      try {
+        const fallback = await fetchYouTubePlaylist(listId, 25);
+        res.json(fallback);
+      } catch (fallbackErr: any) {
+        console.error('YouTube playlist error:', err?.message || err, fallbackErr?.message || '');
+        res.status(502).json({
+          error: 'Unable to load that YouTube playlist.',
+          tracks: [],
+        });
+      }
     }
   });
 
