@@ -1,0 +1,100 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Outfit', system-ui, sans-serif;
+    --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #090B0F;
+    color: #F1F5F9;
+    overflow-x: hidden;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom hardware fader styling */
+input[type="range"].dj-fader {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type="range"].dj-fader::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 3px;
+  background: #1C2331;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+input[type="range"].dj-fader::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 24px;
+  height: 36px;
+  margin-top: -16px;
+  border-radius: 4px;
+  background: linear-gradient(180deg, #334155 0%, #1E293B 48%, #0F172A 52%, #1E293B 100%);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+input[type="range"].dj-fader-vertical {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type="range"].dj-fader-vertical::-webkit-slider-runnable-track {
+  width: 6px;
+  border-radius: 3px;
+  background: #141923;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+input[type="range"].dj-fader-vertical::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 34px;
+  height: 18px;
+  margin-left: -15px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #334155 0%, #1E293B 46%, #E2E8F0 50%, #1E293B 54%, #334155 100%);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.7);
+}
+
+/* Custom sleek dark scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0B0E14;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #232B3A;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
