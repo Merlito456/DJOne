@@ -1,17 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Disc3, Sliders, Sparkles, Library, Circle, Square, ListMusic, FolderPlus } from 'lucide-react';
+import { Disc3, Sliders, Sparkles, Library, Circle, Square, ListMusic, FolderPlus, Tv } from 'lucide-react';
 import { djEngine } from './audio/djEngine';
 import { ALL_CAMELOT_KEYS, recordAiFeedbackEvent } from './audio/aiMemory';
 import { runHpssSeparation } from './audio/hpssWorker';
 import {
   ALL_ON_AI_FEATURE_TOGGLES,
   computeAutoHotCues,
+  computeFrequencyClashReport,
   computeOfflineMashupBlend,
   DEFAULT_AI_FEATURE_TOGGLES,
+  detectBestChopCueSec,
   generateOfflineWildTake,
   loadAiFeatureToggles,
   planOfflineTransition,
+  resolveSmartIncomingEntry,
   saveAiFeatureToggles,
+  isTimestampVocalBusy,
 } from './audio/offlineAiDj';
 import {
   buildElasticTempoMap,
@@ -28,9 +32,19 @@ import {
   analyzeWaveformVocalPockets,
 } from './audio/waveformAnalyzer';
 import { OfflineRenderDeckInput, renderOfflineAiRemixWav } from './audio/offlineMixRenderer';
-import { fetchGroqTtsDropBuffer } from './audio/groqDirector';
+import {
+  buildDynamicHostDropScript,
+  encodeAudioBufferTo16kMonoWavBase64,
+  fetchGroqTtsDropBuffer,
+  preloadReactiveAdLibs,
+  requestGroqCrateEnrich,
+  requestGroqLiveDirector,
+  requestGroqWhisperCues,
+  requestVocalChopSolo,
+} from './audio/groqDirector';
 import { YouTubeDeckPlayer } from './audio/youtubeBridge';
 import { AiAutopilotPanel } from './components/AiAutopilotPanel';
+import { ClubVisualizerOverlay } from './components/ClubVisualizerOverlay';
 import { DeckPanel } from './components/DeckPanel';
 import { DualWaveformDisplay } from './components/DualWaveformDisplay';
 import { LibraryPanel } from './components/LibraryPanel';
@@ -71,6 +85,8 @@ import {
   AiTransitionPlan,
   AnyVoiceDropId,
   AutopilotState,
+  BootlegFlipPreset,
+  CleanEditMaskMode,
   CueStartMode,
   CustomVoiceDropMeta,
   CustomVoiceSlotId,
@@ -79,13 +95,20 @@ import {
   DeckState,
   DjVoiceCategory,
   DjVoiceDropId,
+  FrequencyClashReport,
+  GoldenMashupPair,
   GrooveBridgePattern,
+  HarmonicSynthLayerMode,
   MashupTemplateId,
+  MicFxState,
   MixerState,
+  MixStoryExport,
   OfflineRenderVariant,
   Playlist,
+  ReactiveAdLibKind,
   SoundTrickType,
   StemIsolationMode,
+  StutterSubdiv,
   TrackItem,
   VoiceFrequencyMode,
   WaveformAiMarker,
@@ -137,6 +160,10 @@ function createInitialDeckState(deckId: DeckId): DeckState {
       beatDiv: 0.5,
     },
     stemMode: 'off',
+    bootlegFlip: 'off',
+    subSwapEnabled: false,
+    subSwapMode: 'sine',
+    cleanEditMask: 'off',
     waveform: [],
   };
 }
@@ -190,6 +217,7 @@ export default function App() {
       voiceFxEnabled: savedVoices.voiceFxEnabled,
       enabledVoiceIds: savedVoices.enabledVoiceIds,
       grooveBridgePattern: 'off',
+      harmonicLayer: 'off',
       nextTransitionEtaSec: null,
       holdExtraBars: 0,
       mashupRoutineActive: false,
@@ -201,6 +229,24 @@ export default function App() {
     };
   });
   const [mashupLoading, setMashupLoading] = useState(false);
+  const [scanningDeckCues, setScanningDeckCues] = useState<DeckId | null>(null);
+  const [enrichingCrate, setEnrichingCrate] = useState(false);
+  const [liveDirectorLoading, setLiveDirectorLoading] = useState(false);
+  const [generatingHostDrop, setGeneratingHostDrop] = useState(false);
+  const [visualizerOpen, setVisualizerOpen] = useState(false);
+  const [clashReport, setClashReport] = useState<FrequencyClashReport | null>(null);
+  const [reactiveAdLibsEnabled, setReactiveAdLibsEnabled] = useState(false);
+  const adLibsLoadedRef = useRef(false);
+  const [micFxState, setMicFxState] = useState<MicFxState>({
+    active: false,
+    radioEq: false,
+    dubWet: 0.28,
+    monitoring: false,
+    loopRecording: false,
+    loopPlaying: false,
+    loopHasAudio: false,
+  });
+  const lastCleanMaskWindowRef = useRef<Record<DeckId, string>>({ A: '', B: '' });
 
   const [customVoiceDrops, setCustomVoiceDrops] = useState<CustomVoiceDropMeta[]>(() =>
     loadCustomVoiceMetas()
@@ -315,6 +361,10 @@ export default function App() {
     teaseActive: boolean;
     teaseStartMs: number;
     teaseUntilMs: number;
+    outgoingStartSec: number;
+    pendingOutgoingStartSec: number;
+    swellFired: boolean;
+    isFirstTrack: boolean;
   }>({
     outgoingDeck: 'A',
     incomingDeck: 'B',
@@ -382,6 +432,10 @@ export default function App() {
     teaseActive: false,
     teaseStartMs: 0,
     teaseUntilMs: 0,
+    outgoingStartSec: 0,
+    pendingOutgoingStartSec: 0,
+    swellFired: false,
+    isFirstTrack: false,
   });
 
   const spectralDuckActiveRef = useRef(false);
@@ -571,9 +625,11 @@ export default function App() {
     }
   }, [deckB.playbackMode, deckB.stemMode]);
 
-  // Keep playing state synced & run Automatic Spectral Sidechain (Vocal-over-Beat Clarity)
+  // Keep playing state synced, compute live Clash Radar, Clean-Edit Explicit Masker & Automatic Spectral Sidechain
   useEffect(() => {
+    let clashTick = 0;
     const id = setInterval(() => {
+      clashTick++;
       (['A', 'B'] as DeckId[]).forEach((deckId) => {
         const d = getDeckRef(deckId);
         if (d.playbackMode === 'webaudio') {
@@ -587,10 +643,55 @@ export default function App() {
             ytPlayersRef.current[deckId]?.seekTo(d.loopStartSec);
           }
         }
+
+        // Whisper Clean / Radio Edit Explicit Masking
+        if (
+          d.isPlaying &&
+          d.cleanEditMask &&
+          d.cleanEditMask !== 'off' &&
+          d.track?.lyricCues?.cleanEditWindows?.length
+        ) {
+          const curT = getLiveTime(deckId);
+          const hitWin = d.track.lyricCues.cleanEditWindows.find(
+            (w) => curT >= w.startSec - 0.04 && curT <= w.endSec
+          );
+          if (hitWin) {
+            const winKey = `${d.track.id}:${hitWin.startSec.toFixed(2)}`;
+            if (lastCleanMaskWindowRef.current[deckId] !== winKey) {
+              lastCleanMaskWindowRef.current[deckId] = winKey;
+              const effBpm = Math.max(65, d.baseBpm * d.playbackRate);
+              djEngine.maskDeckForCleanEdit(
+                deckId,
+                d.cleanEditMask,
+                effBpm,
+                Math.max(0.18, hitWin.endSec - hitWin.startSec)
+              );
+            }
+          }
+        }
       });
 
       const dA = deckARef.current;
       const dB = deckBRef.current;
+
+      // Update live Frequency Clash Radar ~7Hz when both decks have waveforms
+      if (clashTick % 3 === 0) {
+        if (dA.track && dB.track && dA.waveform.length > 0 && dB.waveform.length > 0) {
+          setClashReport(
+            computeFrequencyClashReport({
+              wfA: dA.waveform,
+              wfB: dB.waveform,
+              timeA: getLiveTime('A'),
+              durA: dA.duration,
+              timeB: getLiveTime('B'),
+              durB: dB.duration,
+            })
+          );
+        } else {
+          setClashReport((prev) => (prev ? null : prev));
+        }
+      }
+
       if (
         autopilotRef.current.features.spectralSidechain &&
         dA.playbackMode === 'webaudio' &&
@@ -640,7 +741,7 @@ export default function App() {
       }
     }, 45);
     return () => clearInterval(id);
-  }, [setDeckState]);
+  }, [getLiveTime, setDeckState]);
 
   // Recording elapsed timer
   useEffect(() => {
@@ -664,6 +765,9 @@ export default function App() {
       djEngine.setDeckHpssBuffers(deckId, null, null);
       djEngine.setDeckSemitoneShift(deckId, 0);
       djEngine.setDeckKeyLock(deckId, getDeckRef(deckId).keyLock);
+      void djEngine.setDeckBootlegFlip(deckId, 'off');
+      djEngine.setDeckSubSwap(deckId, false);
+      lastCleanMaskWindowRef.current[deckId] = '';
       ytPlayersRef.current[deckId]?.stop();
 
       setDeckState(deckId, (prev) => ({
@@ -690,6 +794,8 @@ export default function App() {
         filter: 0,
         fx: { ...prev.fx, enabled: false },
         stemMode: 'off',
+        bootlegFlip: 'off',
+        subSwapEnabled: false,
         hotCues: [0, 1, 2, 3].map((index) => ({
           index,
           timeSec: null,
@@ -1455,6 +1561,8 @@ export default function App() {
         sections: t.sections,
         detectedVocalDensity: t.detectedVocalDensity,
         vocalPockets: t.vocalPockets,
+        lyricCues: t.lyricCues,
+        enrichment: t.enrichment,
       }));
 
       if (candidates.length === 0) {
@@ -1497,6 +1605,11 @@ export default function App() {
           if (attemptCandidates.length === 0) break;
 
           await ensureCustomBuffersLoaded();
+          const freshPlanSeed =
+            (sessionSeed ^
+              Math.imul(aiSessionRef.current.playedTrackIds.size + 1, 2654435761) ^
+              Math.floor(Math.random() * 0xffffffff)) >>>
+            0;
           const plan = planOfflineTransition({
             outgoingTrack: outDeck.track,
             currentBpm: outDeck.track ? outDeck.baseBpm * outDeck.playbackRate : 124,
@@ -1508,7 +1621,7 @@ export default function App() {
             energyMode: autopilotRef.current.energyMode,
             aggressiveness,
             randomness,
-            sessionSeed: (sessionSeed + attempt * 7919) >>> 0,
+            sessionSeed: (freshPlanSeed + attempt * 7919) >>> 0,
             quickMix: autopilotRef.current.quickMix,
             outWaveform: outDeck.waveform,
             currentTimeSec: getLiveTime(outgoingDeckId),
@@ -1547,9 +1660,41 @@ export default function App() {
             loadedInDeck.playbackMode !== 'none' &&
             !loadedInDeck.loadError
           ) {
-            // Wave-3 #4: Sliding-Window "Sparsest Pocket" Mashup Cue Finder once incoming waveform is decoded
+            const isOpener = aiSessionRef.current.isFirstTrack;
+            const smartEntryOn = autopilotRef.current.features.smartEntry !== false;
+            const curOutPct = outDeck.duration > 10 ? getLiveTime(outgoingDeckId) / outDeck.duration : 0.1;
+            const outStartPct =
+              outDeck.duration > 10
+                ? Math.min(0.68, Math.max(0, aiSessionRef.current.outgoingStartSec / outDeck.duration))
+                : 0;
+            const runwayPct = Math.max(0.18, 0.88 - outStartPct);
+            const runwayShare = isOpener
+              ? autopilotRef.current.quickMix
+                ? 0.62
+                : autopilotRef.current.remixMode
+                ? 0.74
+                : 0.82
+              : autopilotRef.current.quickMix
+              ? 0.36
+              : autopilotRef.current.remixMode
+              ? 0.48
+              : 0.62;
+            const adaptiveMinOut = Math.min(
+              0.84,
+              Math.max(
+                outStartPct + runwayPct * runwayShare,
+                curOutPct + (isOpener ? 0.32 : 0.05),
+                isOpener ? 0.70 : 0
+              )
+            );
+            const adaptiveMaxOut = Math.max(
+              adaptiveMinOut + 0.06,
+              Math.min(0.88, outStartPct + runwayPct * 0.90)
+            );
+
+            // Wave-3 #4: Sliding-Window "Sparsest Pocket" + Smart Entry (Chorus/Verse/Sync) once incoming waveform is decoded
+            let refinedOutStartPct = Math.min(0.85, adaptiveMinOut + 0.03);
             if (loadedInDeck.waveform.length >= 24 && outDeck.waveform.length >= 24) {
-              const curOutPct = outDeck.duration > 10 ? getLiveTime(outgoingDeckId) / outDeck.duration : 0.1;
               const pocket = findSparsestMashupPocket({
                 wfOut: outDeck.waveform,
                 wfIn: loadedInDeck.waveform,
@@ -1557,15 +1702,19 @@ export default function App() {
                 outDurationSec: outDeck.duration,
                 inBpm: loadedInDeck.baseBpm,
                 inDurationSec: loadedInDeck.duration,
-                minOutPct: Math.max(autopilotRef.current.quickMix ? 0.3 : 0.42, curOutPct + 0.04),
-                maxOutPct: autopilotRef.current.quickMix ? 0.56 : 0.78,
+                minOutPct: Math.min(0.82, adaptiveMinOut),
+                maxOutPct: adaptiveMaxOut,
+                minInPct: smartEntryOn ? 0.02 : 0.0,
+                maxInPct: smartEntryOn ? 0.64 : 0.04,
                 preferredBars: plan.transitionBars,
               });
               plan.clashProfile = pocket.clashProfile;
               plan.pocketSummary = pocket.pocketSummary;
-              if (typeof plan.doubleDropCueSec !== 'number' && !plan.isBreatherMix) {
-                plan.incomingStartPct = pocket.inStartPct;
-                plan.recommendedOutStartPct = pocket.outStartPct;
+              refinedOutStartPct = isOpener
+                ? Math.max(adaptiveMinOut, pocket.outStartPct)
+                : pocket.outStartPct;
+              if (!plan.isBreatherMix) {
+                plan.recommendedOutStartPct = refinedOutStartPct;
                 if (
                   plan.genrePhysicsMode !== 'chill-velvet' &&
                   plan.genrePhysicsMode !== 'dnb-chop'
@@ -1573,7 +1722,56 @@ export default function App() {
                   plan.transitionBars = pocket.recommendedBars;
                 }
               }
+            } else if (isOpener) {
+              plan.recommendedOutStartPct = Math.max(
+                adaptiveMinOut,
+                plan.recommendedOutStartPct ?? adaptiveMinOut
+              );
             }
+            if (isOpener) {
+              // Keep the opening track long and uninterrupted before mixing into song #2
+              plan.vipSkipEdit = undefined;
+            }
+
+            if (!smartEntryOn) {
+              plan.incomingStartPct = 0;
+              plan.incomingEntrySec = 0;
+              plan.incomingEntryKind = 'intro';
+              plan.incomingEntryLabel = 'Intro (0:00)';
+              plan.doubleDropCueSec = undefined;
+            } else {
+              const entry = resolveSmartIncomingEntry({
+                incomingTrack: {
+                  ...loadedInDeck.track,
+                  durationSec: loadedInDeck.duration || loadedInDeck.track.durationSec,
+                  bpm: loadedInDeck.baseBpm || loadedInDeck.track.bpm,
+                  sections: loadedInDeck.sections ?? loadedInDeck.track.sections,
+                  detectedDropSec:
+                    loadedInDeck.detectedDropSec ?? loadedInDeck.track.detectedDropSec,
+                  waveform: loadedInDeck.waveform,
+                },
+                outgoingTrack: outDeck.track,
+                outWaveform: outDeck.waveform,
+                inWaveform: loadedInDeck.waveform,
+                outStartPct: refinedOutStartPct,
+                transitionBars: plan.transitionBars,
+                vibe: autopilotRef.current.vibe,
+                energyMode: autopilotRef.current.energyMode,
+                aggressiveness: autopilotRef.current.aggressiveness,
+                randomness: autopilotRef.current.randomness,
+                remixMode: autopilotRef.current.remixMode,
+                quickMix: autopilotRef.current.quickMix,
+                isBreatherMix: plan.isBreatherMix,
+                doubleDropCueSec: plan.doubleDropCueSec,
+                smartEntry: true,
+                seed: autopilotRef.current.sessionSeed + attempt * 7919,
+              });
+              plan.incomingStartPct = entry.startPct;
+              plan.incomingEntrySec = entry.entrySec;
+              plan.incomingEntryKind = entry.kind;
+              plan.incomingEntryLabel = entry.label;
+            }
+
             loadedPlan = plan;
             break;
           }
@@ -1606,6 +1804,7 @@ export default function App() {
         aiSessionRef.current.teaseActive = false;
         aiSessionRef.current.teaseStartMs = 0;
         aiSessionRef.current.teaseUntilMs = 0;
+        aiSessionRef.current.swellFired = false;
         aiSessionRef.current.firedSoundIndices.clear();
         aiSessionRef.current.firedVoiceIndices.clear();
         aiSessionRef.current.firedMomentIndices.clear();
@@ -1623,7 +1822,11 @@ export default function App() {
             holdExtraBars: 0,
             nextTransitionEtaSec: null,
             mutedMomentIndices: [],
-            currentActionLabel: `${loadedPlan.sessionSignature} · Next: "${chosenTrack?.title || 'Track'}"`,
+            currentActionLabel: `${loadedPlan.sessionSignature} · Next: "${chosenTrack?.title || 'Track'}"${
+              loadedPlan.incomingEntryLabel && loadedPlan.incomingEntryKind !== 'intro'
+                ? ` @ ${loadedPlan.incomingEntryLabel}`
+                : ''
+            }`,
           };
         });
       } catch (err: any) {
@@ -1749,6 +1952,7 @@ export default function App() {
         sess.lowEnergySinceMs = 0;
         sess.widthSlamUntilMs = 0;
         sess.tapeBrakeFired = false;
+        sess.swellFired = false;
         sess.lastScratchAtMs = 0;
         djEngine.setDeckStereoWidth('A', 1);
         djEngine.setDeckStereoWidth('B', 1);
@@ -1775,9 +1979,10 @@ export default function App() {
         }
 
         const effBpm = Math.max(80, outDeck.baseBpm * outDeck.playbackRate);
-        const bars = sess.plan.transitionBars || 8;
+        const bars = Math.max(sess.plan.transitionBars || 8, sess.plan.tempoMorphBars || 0);
         const beatSec = 60 / effBpm;
-        sess.transitionDurationMs = Math.max(8000, Math.min(24000, bars * 4 * beatSec * 1000));
+        const maxTransMs = sess.plan.tempoMorphBars ? 34000 : 24000;
+        sess.transitionDurationMs = Math.max(8000, Math.min(maxTransMs, bars * 4 * beatSec * 1000));
         sess.transitionStartMs = performance.now();
         sess.firedSoundIndices.clear();
         sess.firedVoiceIndices.clear();
@@ -1798,11 +2003,20 @@ export default function App() {
           currentActionLabel: sess.plan ? sess.plan.aiNotes : prev.currentActionLabel,
         }));
 
-        // Upgrade #2: Apply Semitone Snap pitch shift independently of BPM via Pitch Worklet
+        // Upgrade #2: Apply Semitone Snap + Breakdown Key-Glide Correction via Pitch Worklet
         const snapSt = sess.plan.semitoneShiftIn || 0;
         if (inDeck.playbackMode === 'webaudio') {
           djEngine.setDeckKeyLock(inId, true);
-          djEngine.setDeckSemitoneShift(inId, snapSt);
+          if (sess.plan.keyGlideSemitones && sess.plan.keyGlideSemitones.from !== sess.plan.keyGlideSemitones.to) {
+            djEngine.glideDeckSemitones(
+              inId,
+              sess.plan.keyGlideSemitones.from,
+              sess.plan.keyGlideSemitones.to,
+              Math.max(2.5, (sess.transitionDurationMs / 1000) * 0.55)
+            );
+          } else {
+            djEngine.setDeckSemitoneShift(inId, snapSt);
+          }
         }
 
         setDeckState(inId, (prev) => ({
@@ -1835,39 +2049,56 @@ export default function App() {
         const outBarPhase =
           (((outLive - outFirst) % outBarSec) + outBarSec) % outBarSec / outBarSec;
 
+        const smartEntryOn = autopilotRef.current.features.smartEntry !== false;
         const customDrop = inDeck.track.dropCueSec;
         const doubleDropCue = sess.plan.doubleDropCueSec;
-        let baseCueSec = 0;
-        if (
-          typeof doubleDropCue === 'number' &&
-          doubleDropCue > 0.5 &&
-          doubleDropCue < Math.max(12, inDeck.duration - 6)
-        ) {
-          baseCueSec = doubleDropCue;
-        } else if (
-          typeof customDrop === 'number' &&
-          customDrop > 4 &&
-          customDrop < Math.max(12, inDeck.duration - 4)
-        ) {
-          const leadInBars = Math.max(1, Math.min(4, Math.round(bars / 2)));
-          baseCueSec = Math.max(0, customDrop - leadInBars * inBarSec);
-        } else if (sess.plan.incomingStartPct > 0.02 && inDeck.duration > 20) {
-          const rawOffset = inDeck.duration * sess.plan.incomingStartPct;
-          const quantizedBars = Math.round(rawOffset / inBarSec);
-          baseCueSec = Math.min(inDeck.duration * 0.35, quantizedBars * inBarSec);
+        let phaseAlignedCue = 0;
+
+        if (smartEntryOn) {
+          let baseCueSec = 0;
+          if (
+            typeof doubleDropCue === 'number' &&
+            doubleDropCue > 0.5 &&
+            doubleDropCue < Math.max(12, inDeck.duration - 6)
+          ) {
+            baseCueSec = doubleDropCue;
+          } else if (
+            typeof sess.plan.incomingEntrySec === 'number' &&
+            sess.plan.incomingEntrySec > 0.5 &&
+            sess.plan.incomingEntrySec < Math.max(12, inDeck.duration - 18)
+          ) {
+            baseCueSec = sess.plan.incomingEntrySec;
+          } else if (
+            typeof customDrop === 'number' &&
+            customDrop > 4 &&
+            customDrop < Math.max(12, inDeck.duration - 4)
+          ) {
+            const leadInBars = Math.max(1, Math.min(4, Math.round(bars / 2)));
+            baseCueSec = Math.max(0, customDrop - leadInBars * inBarSec);
+          } else if (sess.plan.incomingStartPct > 0.02 && inDeck.duration > 20) {
+            const rawOffset = inDeck.duration * sess.plan.incomingStartPct;
+            const quantizedBars = Math.round(rawOffset / inBarSec);
+            baseCueSec = Math.min(inDeck.duration * 0.68, quantizedBars * inBarSec);
+          }
+
+          if (baseCueSec > 0.5) {
+            // Snap baseCueSec to Bar 1 + exact fractional phase of outgoing bar so Beat 1s align!
+            const nearestBarIdx = Math.max(0, Math.round((baseCueSec - inFirst) / inBarSec));
+            phaseAlignedCue = Math.max(
+              0,
+              Math.min(
+                Math.max(4, inDeck.duration - 16),
+                inFirst + nearestBarIdx * inBarSec + outBarPhase * inBarSec
+              )
+            );
+          }
         }
 
-        // Snap baseCueSec to Bar 1 + exact fractional phase of outgoing bar so Beat 1s align!
-        const nearestBarIdx = Math.max(0, Math.round((baseCueSec - inFirst) / inBarSec));
-        const phaseAlignedCue = Math.max(
-          0,
-          Math.min(
-            Math.max(4, inDeck.duration - 6),
-            inFirst + nearestBarIdx * inBarSec + outBarPhase * inBarSec
-          )
-        );
+        sess.pendingOutgoingStartSec = phaseAlignedCue;
         if (phaseAlignedCue > 0.05) {
           handleSeek(inId, phaseAlignedCue);
+        } else if (getLiveTime(inId) > 0.25) {
+          handleSeek(inId, 0);
         }
 
         if (!getDeckRef(inId).isPlaying) {
@@ -1934,6 +2165,10 @@ export default function App() {
     aiSessionRef.current.tapeBrakeFired = false;
     aiSessionRef.current.setTensionScore = 45;
     aiSessionRef.current.peakMixStreak = 0;
+    aiSessionRef.current.outgoingStartSec = 0;
+    aiSessionRef.current.pendingOutgoingStartSec = 0;
+    aiSessionRef.current.swellFired = false;
+    aiSessionRef.current.isFirstTrack = false;
     djEngine.clearDeckCHook();
     djEngine.setDeckStereoWidth('A', 1);
     djEngine.setDeckStereoWidth('B', 1);
@@ -2043,8 +2278,15 @@ export default function App() {
         return;
       }
 
+      const shuffledPlTracks = [...plTracks];
+      for (let i = shuffledPlTracks.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffledPlTracks[i], shuffledPlTracks[j]] = [shuffledPlTracks[j], shuffledPlTracks[i]];
+      }
+
       const myStartSeq = ++aiSessionRef.current.planSeq;
       aiSessionRef.current.isStartingTransition = false;
+      aiSessionRef.current.isFirstTrack = true;
       aiSessionRef.current.playedTrackIds.clear();
       aiSessionRef.current.plan = null;
       aiSessionRef.current.firedMomentIndices.clear();
@@ -2065,7 +2307,7 @@ export default function App() {
         phase: 'planning',
         errorMessage: null,
         transitionProgress: 0,
-        currentActionLabel: `Starting Offline AI on "${plTracks[0].title}"...`,
+        currentActionLabel: `Shuffling & starting AI on "${shuffledPlTracks[0].title}"...`,
       }));
 
       await djEngine.resume();
@@ -2090,6 +2332,7 @@ export default function App() {
         await handleTogglePlay('A', false);
         handleExitLoop('B');
         leadDeck = 'B';
+        aiSessionRef.current.outgoingStartSec = getLiveTime('B');
         if (deckBRef.current.track) {
           aiSessionRef.current.playedTrackIds.add(deckBRef.current.track.id);
         }
@@ -2097,6 +2340,7 @@ export default function App() {
         await handleTogglePlay('B', false);
         handleExitLoop('A');
         leadDeck = 'A';
+        aiSessionRef.current.outgoingStartSec = getLiveTime('A');
         if (deckARef.current.track) {
           aiSessionRef.current.playedTrackIds.add(deckARef.current.track.id);
         }
@@ -2109,10 +2353,10 @@ export default function App() {
           return;
         }
 
-        // Try playlist tracks cleanly in order until an opening track loads & plays
+        // Try shuffled playlist tracks cleanly until a random opening track loads & plays
         let startedTrack: TrackItem | null = null;
         let lastErr = '';
-        for (const candidate of plTracks) {
+        for (const candidate of shuffledPlTracks) {
           if (myStartSeq !== aiSessionRef.current.planSeq || !autopilotRef.current.enabled) {
             return;
           }
@@ -2175,6 +2419,43 @@ export default function App() {
         if (getDeckRef('A').playbackMode === 'webaudio') {
           djEngine.setDeckRate('A', 1);
         }
+
+        const loadedOpener = getDeckRef('A');
+        let openerStartSec = 0;
+        const openerDur = loadedOpener.duration || loadedOpener.track?.durationSec || 180;
+        if (autopilotRef.current.features.smartEntry !== false && loadedOpener.track && openerDur >= 75) {
+          const openerEntry = resolveSmartIncomingEntry({
+            incomingTrack: {
+              ...loadedOpener.track,
+              durationSec: openerDur,
+              bpm: loadedOpener.baseBpm || loadedOpener.track.bpm,
+              sections: loadedOpener.sections ?? loadedOpener.track.sections,
+              detectedDropSec:
+                loadedOpener.detectedDropSec ?? loadedOpener.track.detectedDropSec,
+              waveform: loadedOpener.waveform,
+            },
+            inWaveform: loadedOpener.waveform,
+            vibe: nextVibe,
+            energyMode: autopilotRef.current.energyMode,
+            aggressiveness: nextAggressiveness,
+            randomness: autopilotRef.current.randomness,
+            remixMode: nextRemixMode,
+            quickMix: autopilotRef.current.quickMix,
+            smartEntry: true,
+            seed: freshSessionSeed,
+          });
+          // Cap opening cue to early intro/first verse so the first song plays a full, longer stretch
+          const maxOpenerStart = Math.min(16, openerDur * 0.10);
+          if (openerEntry.entrySec > 1 && openerEntry.entrySec <= maxOpenerStart) {
+            openerStartSec = openerEntry.entrySec;
+            handleSeek('A', openerStartSec);
+          } else if (getLiveTime('A') > 0.5) {
+            handleSeek('A', 0);
+          }
+        } else if (getLiveTime('A') > 0.5) {
+          handleSeek('A', 0);
+        }
+        aiSessionRef.current.outgoingStartSec = openerStartSec;
 
         await handleTogglePlay('A', true);
         if (myStartSeq !== aiSessionRef.current.planSeq || !autopilotRef.current.enabled) {
@@ -2380,6 +2661,9 @@ export default function App() {
 
     const bpm = Math.max(80, targetDeck.baseBpm * targetDeck.playbackRate);
     const activePitch = targetDeck.playbackMode === 'webaudio' ? targetDeck.playbackRate : 1;
+    if (reactiveAdLibsEnabled) {
+      djEngine.triggerReactiveAdLib('wild-take', bpm);
+    }
     if (moment.soundTrick) {
       djEngine.playSoundTrick(moment.soundTrick, bpm, targetDeck.track.musicalKey, activePitch);
     }
@@ -2590,8 +2874,10 @@ export default function App() {
 
   const handleDirectAi = useCallback(
     async (direction: string) => {
+      const clean = direction.trim();
+      if (!clean) return;
       await djEngine.resume();
-      setAutopilotState((prev) => ({ ...prev, lastDirection: direction }));
+      setAutopilotState((prev) => ({ ...prev, lastDirection: clean }));
 
       const aPlaying = deckARef.current.isPlaying;
       const bPlaying = deckBRef.current.isPlaying;
@@ -2602,8 +2888,8 @@ export default function App() {
           ? 'B'
           : 'A';
 
+      const plTracks = getPlaylistTracks(autopilotRef.current.targetPlaylistId);
       if (!getDeckRef(leadDeck).isPlaying) {
-        const plTracks = getPlaylistTracks(autopilotRef.current.targetPlaylistId);
         if (!getDeckRef(leadDeck).track || getDeckRef(leadDeck).playbackMode === 'none') {
           const fallbackTrack = plTracks[0] || libraryRef.current.tracks[0];
           if (fallbackTrack) await loadTrackToDeck(leadDeck, fallbackTrack);
@@ -2616,7 +2902,108 @@ export default function App() {
         setAutopilotState((prev) => ({ ...prev, enabled: true, errorMessage: null }));
       }
 
-      await requestNextAiPlan(leadDeck, autopilotRef.current.vibe, direction);
+      const words = clean.split(/\s+/).filter(Boolean);
+      const isNaturalSetPrompt =
+        words.length >= 4 ||
+        /\b(set|into|reorder|playlist|sunset|peak|afro|techno|house|hiphop|bass|drops|energy)\b/i.test(
+          clean
+        );
+
+      if (isNaturalSetPrompt && plTracks.length >= 2) {
+        setLiveDirectorLoading(true);
+        try {
+          const activeD = getDeckRef(leadDeck);
+          const dirRes = await requestGroqLiveDirector({
+            prompt: clean,
+            stationName: 'DJOne',
+            currentTrackId: activeD.track?.id,
+            tracks: plTracks.slice(0, 24).map((t) => ({
+              id: t.id,
+              title: t.title,
+              artist: t.artist,
+              bpm: t.bpm,
+              musicalKey: t.musicalKey,
+              detectedVocalDensity: t.detectedVocalDensity,
+              enrichment: t.enrichment,
+            })),
+          });
+
+          if (
+            autopilotRef.current.targetPlaylistId !== 'all' &&
+            dirRes.orderedTrackIds.length >= 2
+          ) {
+            const orderedSet = new Set(dirRes.orderedTrackIds);
+            const mergedOrder = [
+              ...dirRes.orderedTrackIds,
+              ...plTracks.map((t) => t.id).filter((id) => !orderedSet.has(id)),
+            ];
+            libraryRef.current.updatePlaylist(autopilotRef.current.targetPlaylistId, {
+              trackIds: mergedOrder,
+              preferredVibe: dirRes.vibe,
+              aggressiveness: dirRes.aggressiveness,
+            });
+          }
+
+          const effBpm = activeD.track ? activeD.baseBpm * activeD.playbackRate : 124;
+          const effKey = activeD.track?.musicalKey || '8A';
+          const effPitch = activeD.playbackMode === 'webaudio' ? activeD.playbackRate : 1;
+
+          if (dirRes.grooveBridge !== 'off') {
+            await djEngine.startGrooveBridge(dirRes.grooveBridge, effBpm, effKey, effPitch);
+          } else if (autopilotRef.current.grooveBridgePattern !== 'off') {
+            djEngine.stopGrooveBridge();
+          }
+
+          if (dirRes.harmonicLayer !== 'off') {
+            await djEngine.setHarmonicSynthLayer(dirRes.harmonicLayer, effBpm, effKey, effPitch);
+          } else {
+            await djEngine.setHarmonicSynthLayer('off');
+          }
+
+          setAutopilotState((prev) => ({
+            ...prev,
+            vibe: dirRes.vibe,
+            energyMode: dirRes.energyMode,
+            aggressiveness: dirRes.aggressiveness,
+            grooveBridgePattern: dirRes.grooveBridge,
+            harmonicLayer: dirRes.harmonicLayer,
+            currentActionLabel: `${dirRes.summary || 'AI Director Set Updated'}`,
+          }));
+
+          if (dirRes.hostDropScript && autopilotRef.current.voiceFxEnabled) {
+            void djEngine.resume().then(async (ctx) => {
+              const ttsBuf = await fetchGroqTtsDropBuffer({
+                text: dirRes.hostDropScript,
+                voice: dirRes.hostVoice || 'troy',
+                audioCtx: ctx,
+              });
+              if (ttsBuf) {
+                await djEngine.playCustomVoiceBuffer(ttsBuf, effBpm);
+              }
+            });
+          }
+
+          await requestNextAiPlan(
+            leadDeck,
+            dirRes.vibe,
+            dirRes.transitionStylePrompt || clean,
+            autopilotRef.current.targetPlaylistId,
+            autopilotRef.current.remixMode,
+            dirRes.orderedTrackIds.length >= 2 ? dirRes.orderedTrackIds : undefined,
+            dirRes.aggressiveness
+          );
+          if (/\b(mix now|drop now|slam now|cut now)\b/i.test(clean) && aiSessionRef.current.plan) {
+            await beginAiTransitionNow(true);
+          }
+          return;
+        } catch {
+          // fall back cleanly to offline tactical AI command below
+        } finally {
+          setLiveDirectorLoading(false);
+        }
+      }
+
+      await requestNextAiPlan(leadDeck, autopilotRef.current.vibe, clean);
       if (aiSessionRef.current.plan) {
         await beginAiTransitionNow();
       }
@@ -2735,7 +3122,7 @@ export default function App() {
                 : { ...m, beatSlicePattern: undefined, chopPattern: undefined, cueJuggleSeq: undefined }
             )
         : [];
-      return {
+      const baseSanitized: AiTransitionPlan = {
         ...plan,
         vipSkipEdit: next.vipSkip ? plan.vipSkipEdit : undefined,
         teasePreview: next.breakdownTease ? plan.teasePreview : undefined,
@@ -2744,6 +3131,54 @@ export default function App() {
         recommendedBridge: next.autoGrooveBridge ? plan.recommendedBridge : 'off',
         useBeatSliceStutter: next.beatSliceStutter ? plan.useBeatSliceStutter : false,
       };
+      if (!next.smartEntry) {
+        return {
+          ...baseSanitized,
+          incomingStartPct: 0,
+          incomingEntrySec: 0,
+          incomingEntryKind: 'intro',
+          incomingEntryLabel: 'Intro (0:00)',
+          doubleDropCueSec: undefined,
+        };
+      }
+      if (baseSanitized.incomingEntrySec === 0 && baseSanitized.incomingEntryKind === 'intro') {
+        const inDeck = getDeckRef(aiSessionRef.current.incomingDeck);
+        const outDeck = getDeckRef(aiSessionRef.current.outgoingDeck);
+        if (inDeck.track && inDeck.playbackMode !== 'none') {
+          const entry = resolveSmartIncomingEntry({
+            incomingTrack: {
+              ...inDeck.track,
+              durationSec: inDeck.duration || inDeck.track.durationSec,
+              bpm: inDeck.baseBpm || inDeck.track.bpm,
+              sections: inDeck.sections ?? inDeck.track.sections,
+              detectedDropSec: inDeck.detectedDropSec ?? inDeck.track.detectedDropSec,
+              waveform: inDeck.waveform,
+            },
+            outgoingTrack: outDeck.track,
+            outWaveform: outDeck.waveform,
+            inWaveform: inDeck.waveform,
+            outStartPct: baseSanitized.recommendedOutStartPct ?? 0.52,
+            transitionBars: baseSanitized.transitionBars,
+            vibe: autopilotRef.current.vibe,
+            energyMode: autopilotRef.current.energyMode,
+            aggressiveness: autopilotRef.current.aggressiveness,
+            randomness: autopilotRef.current.randomness,
+            remixMode: autopilotRef.current.remixMode,
+            quickMix: autopilotRef.current.quickMix,
+            isBreatherMix: baseSanitized.isBreatherMix,
+            smartEntry: true,
+            seed: autopilotRef.current.sessionSeed,
+          });
+          return {
+            ...baseSanitized,
+            incomingStartPct: entry.startPct,
+            incomingEntrySec: entry.entrySec,
+            incomingEntryKind: entry.kind,
+            incomingEntryLabel: entry.label,
+          };
+        }
+      }
+      return baseSanitized;
     },
     []
   );
@@ -2751,6 +3186,7 @@ export default function App() {
   const handleToggleAiFeature = useCallback(
     (key: AiFeatureKey) => {
       const featureLabels: Record<AiFeatureKey, string> = {
+        smartEntry: 'Smart Entry (chorus/verse/sync cue)',
         vipSkip: 'VIP Skip (full song mode when OFF)',
         breakdownTease: 'Next Track Breakdown Tease',
         vocalCarryover: 'Vocal Carryover',
@@ -2771,7 +3207,12 @@ export default function App() {
           ...prev,
           features: next,
           activePlan: sanitized ?? prev.activePlan,
-          currentActionLabel: `${featureLabels[key]}: ${next[key] ? 'ON' : 'OFF'}`,
+          currentActionLabel:
+            key === 'smartEntry'
+              ? next.smartEntry
+                ? `Smart Entry ON${sanitized?.incomingEntryLabel ? ` · Next @ ${sanitized.incomingEntryLabel}` : ' · Chorus/Verse/Sync start'}`
+                : 'From Intro ON · Incoming songs start at 0:00'
+              : `${featureLabels[key]}: ${next[key] ? 'ON' : 'OFF'}`,
         };
       });
     },
@@ -2783,7 +3224,7 @@ export default function App() {
       const next: AiFeatureToggles =
         preset === 'all-on'
           ? { ...ALL_ON_AI_FEATURE_TOGGLES }
-          : { ...DEFAULT_AI_FEATURE_TOGGLES };
+          : { ...DEFAULT_AI_FEATURE_TOGGLES, smartEntry: false };
       saveAiFeatureToggles(next);
       applyAiFeatureSideEffects(next);
       const sanitized = sanitizePlanForFeatures(aiSessionRef.current.plan, next);
@@ -2794,8 +3235,8 @@ export default function App() {
         activePlan: sanitized ?? prev.activePlan,
         currentActionLabel:
           preset === 'all-on'
-            ? 'All 8 AI Automation features enabled'
-            : 'Clean Mix preset: Full songs (VIP Skip OFF, smooth blends)',
+            ? 'All 9 AI Automation features enabled'
+            : 'Clean Mix preset: Full songs from 0:00 (smooth blends)',
       }));
     },
     [applyAiFeatureSideEffects, sanitizePlanForFeatures, setAutopilotState]
@@ -3124,6 +3565,498 @@ export default function App() {
     }));
   }, [setAutopilotState]);
 
+  const handleCycleDeckBootleg = useCallback(
+    async (deckId: DeckId) => {
+      const order: BootlegFlipPreset[] = [
+        'off',
+        'jersey-club',
+        'amapiano',
+        'phonk',
+        'slowed-reverb',
+        'nightcore',
+      ];
+      const d = getDeckRef(deckId);
+      if (!d.track) return;
+      const cur = d.bootlegFlip || 'off';
+      const next = order[(order.indexOf(cur) + 1) % order.length];
+      const bpm = d.baseBpm || 124;
+      const key = d.track.musicalKey || '8A';
+
+      let targetRate = 1;
+      let targetKeyLock = true;
+      let targetEqLow = 0;
+      let targetEqHigh = 0;
+      let targetFilter = 0;
+      let targetFx: DeckFxState = { ...d.fx, enabled: false };
+
+      if (next === 'slowed-reverb') {
+        targetRate = 0.82;
+        targetKeyLock = false;
+        targetFilter = -0.22;
+        targetFx = { enabled: true, type: 'reverb', wet: 0.5, beatDiv: 0.5 };
+      } else if (next === 'nightcore') {
+        targetRate = 1.22;
+        targetKeyLock = false;
+        targetEqHigh = 0.16;
+      } else if (next === 'jersey-club' || next === 'amapiano' || next === 'phonk') {
+        targetEqLow = -0.58;
+      }
+
+      if (d.playbackMode === 'webaudio') {
+        djEngine.setDeckKeyLock(deckId, targetKeyLock);
+        djEngine.setDeckRate(deckId, targetRate);
+      } else if (d.playbackMode === 'youtube-iframe') {
+        ytPlayersRef.current[deckId]?.setPlaybackRate(targetRate);
+      }
+
+      await djEngine.setDeckBootlegFlip(
+        deckId,
+        next,
+        bpm,
+        key,
+        d.playbackMode === 'webaudio' ? targetRate : 1
+      );
+
+      setDeckState(deckId, (prev) => ({
+        ...prev,
+        bootlegFlip: next,
+        playbackRate: targetRate,
+        keyLock: targetKeyLock,
+        eqLow: targetEqLow,
+        eqHigh: targetEqHigh,
+        filter: targetFilter,
+        fx: targetFx,
+      }));
+      setAutopilotState((prev) => ({
+        ...prev,
+        currentActionLabel:
+          next === 'off'
+            ? `Deck ${deckId}: Bootleg Flip OFF`
+            : `Deck ${deckId} Flip: ${next.toUpperCase()} (${key} @ ${(bpm * targetRate).toFixed(0)} BPM)`,
+      }));
+    },
+    [setAutopilotState, setDeckState]
+  );
+
+  const handleCycleHarmonicLayer = useCallback(async () => {
+    const order: HarmonicSynthLayerMode[] = ['off', 'supersaw-pad', 'acid-303', 'sidechain-arp'];
+    const cur = autopilotRef.current.harmonicLayer || 'off';
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    const masterDeck = deckARef.current.isMaster ? deckARef.current : deckBRef.current;
+    const activeDeck = masterDeck.track ? masterDeck : deckARef.current.track ? deckARef.current : deckBRef.current;
+    const bpm = activeDeck.track ? activeDeck.baseBpm * activeDeck.playbackRate : 124;
+    const key = activeDeck.track?.musicalKey || '8A';
+    const pitchRate = activeDeck.playbackMode === 'webaudio' ? activeDeck.playbackRate : 1;
+    await djEngine.setHarmonicSynthLayer(next, bpm, key, pitchRate);
+    setAutopilotState((prev) => ({
+      ...prev,
+      harmonicLayer: next,
+      currentActionLabel:
+        next === 'off'
+          ? 'Harmonic Synth Layer OFF'
+          : `Synth Layer: ${next.toUpperCase()} tuned to ${key}`,
+    }));
+  }, [setAutopilotState]);
+
+  const handleToggleReactiveAdLibs = useCallback(async () => {
+    const next = !reactiveAdLibsEnabled;
+    setReactiveAdLibsEnabled(next);
+    if (next && !adLibsLoadedRef.current) {
+      adLibsLoadedRef.current = true;
+      const ctx = await djEngine.resume();
+      const map = await preloadReactiveAdLibs(ctx);
+      djEngine.setReactiveAdLibBuffers(map);
+    }
+    setAutopilotState((prev) => ({
+      ...prev,
+      currentActionLabel: next
+        ? 'Reactive MC Ad-Libs ARMED (Backspin · Wild Take · Drop Slam)'
+        : 'Reactive MC Ad-Libs OFF',
+    }));
+  }, [reactiveAdLibsEnabled, setAutopilotState]);
+
+  const handleToggleSubSwap = useCallback(
+    async (deckId: DeckId) => {
+      const d = getDeckRef(deckId);
+      if (!d.track || d.playbackMode !== 'webaudio') return;
+      const next = !d.subSwapEnabled;
+      await djEngine.setDeckSubSwap(deckId, next, d.subSwapMode || 'sine', d.track.musicalKey || '8A');
+      setDeckState(deckId, (prev) => ({ ...prev, subSwapEnabled: next }));
+      setAutopilotState((prev) => ({
+        ...prev,
+        currentActionLabel: next
+          ? `Deck ${deckId}: In-Key 808 Sub-Bass Swap ON (${d.track?.musicalKey || '8A'})`
+          : `Deck ${deckId}: 808 Sub-Bass Swap OFF`,
+      }));
+    },
+    [setAutopilotState, setDeckState]
+  );
+
+  const handleTriggerPitchRoll = useCallback(
+    (deckId: DeckId, mode: 'escalate-roll' | 'poly-3-8' | 'poly-3-16') => {
+      const d = getDeckRef(deckId);
+      if (!d.track || d.playbackMode !== 'webaudio') return;
+      const bpm = Math.max(65, d.baseBpm * d.playbackRate);
+      djEngine.triggerDeckPitchLoopRoll(deckId, {
+        currentSec: getLiveTime(deckId),
+        bpm,
+        mode,
+        baseSemitones: d.semitoneShift || 0,
+      });
+      setAutopilotState((prev) => ({
+        ...prev,
+        currentActionLabel:
+          mode === 'escalate-roll'
+            ? `Deck ${deckId}: Pitch-Escalating Roll (1 → 1/16 +4st)`
+            : `Deck ${deckId}: Polyrhythmic ${mode === 'poly-3-8' ? '3/8' : '3/16'} Beat-Repeat`,
+      }));
+    },
+    [getLiveTime, setAutopilotState]
+  );
+
+  const handleTriggerEchoFreeze = useCallback(
+    async (deckId: DeckId) => {
+      const d = getDeckRef(deckId);
+      if (!d.track || d.playbackMode !== 'webaudio') return;
+      const bpm = Math.max(65, d.baseBpm * d.playbackRate);
+      await djEngine.triggerVocalEchoFreeze(deckId, {
+        currentSec: getLiveTime(deckId),
+        bpm,
+      });
+      setAutopilotState((prev) => ({
+        ...prev,
+        currentActionLabel: `Deck ${deckId}: Vocal-Hook Echo Freeze Tail Running in Tempo`,
+      }));
+    },
+    [getLiveTime, setAutopilotState]
+  );
+
+  const handleCycleCleanEditMask = useCallback(
+    (deckId: DeckId) => {
+      const order: CleanEditMaskMode[] = ['off', 'mute', 'reverse', 'chirp'];
+      setDeckState(deckId, (prev) => {
+        const cur = prev.cleanEditMask || 'off';
+        const next = order[(order.indexOf(cur) + 1) % order.length];
+        setAutopilotState((a) => ({
+          ...a,
+          currentActionLabel: `Deck ${deckId}: Clean/Radio Edit Mask → ${next.toUpperCase()}`,
+        }));
+        return { ...prev, cleanEditMask: next };
+      });
+    },
+    [setAutopilotState, setDeckState]
+  );
+
+  const handleTriggerChopSolo = useCallback(
+    async (deckId: DeckId) => {
+      const d = getDeckRef(deckId);
+      if (!d.track || d.playbackMode !== 'webaudio') return;
+      const bpm = Math.max(65, d.baseBpm * d.playbackRate);
+      const aiPlan = await requestVocalChopSolo({
+        title: d.track.title,
+        musicalKey: d.track.musicalKey || '8A',
+        durationSec: d.duration || d.track.durationSec || 180,
+        words: d.track.lyricCues?.words,
+      });
+      const cueSec = aiPlan.cueSec > 1 ? aiPlan.cueSec : detectBestChopCueSec(d.track);
+      await djEngine.triggerVocalChopSolo(deckId, {
+        cueSec,
+        bpm,
+        musicalKey: d.track.musicalKey || '8A',
+        semitonesSeq: aiPlan.pentatonicSemitones,
+      });
+      setAutopilotState((prev) => ({
+        ...prev,
+        currentActionLabel: `Deck ${deckId}: Fred again..-Style Vocal-Chop Solo ("${aiPlan.word}")`,
+      }));
+    },
+    [setAutopilotState]
+  );
+
+  const handleAutoCarveClash = useCallback(() => {
+    const dA = deckARef.current;
+    const dB = deckBRef.current;
+    if (!dA.track || !dB.track) return;
+    const vA = dA.track.detectedVocalDensity === 'vocal-dense' || dA.track.detectedVocalDensity === 'acapella';
+    const vocalDeck: DeckId = vA ? 'A' : dB.track.detectedVocalDensity === 'vocal-dense' ? 'B' : 'A';
+    const grooveDeck: DeckId = vocalDeck === 'A' ? 'B' : 'A';
+    setDeckState(vocalDeck, (prev) => ({ ...prev, stemMode: 'vocal-focus', eqLow: -0.82 }));
+    setDeckState(grooveDeck, (prev) => ({ ...prev, stemMode: 'instrumental', eqMid: -0.45 }));
+    setAutopilotState((prev) => ({
+      ...prev,
+      currentActionLabel: `Auto-Carved Clash: Deck ${vocalDeck} Vocals × Deck ${grooveDeck} Sub Groove`,
+    }));
+  }, [setAutopilotState, setDeckState]);
+
+  const handleToggleMicRack = useCallback(async () => {
+    setMicError(null);
+    if (micFxState.active) {
+      const next = djEngine.stopMicFxRack();
+      setMicFxState(next);
+      return;
+    }
+    try {
+      const masterD = deckARef.current.isMaster ? deckARef.current : deckBRef.current;
+      const bpm = masterD.track ? masterD.baseBpm * masterD.playbackRate : 124;
+      const next = await djEngine.startMicFxRack(bpm);
+      setMicFxState(next);
+    } catch (err: any) {
+      setMicError(err?.message || 'Mic FX Rack access denied.');
+    }
+  }, [micFxState.active]);
+
+  const handleToggleMicRadioEq = useCallback(() => {
+    const nextRadio = !micFxState.radioEq;
+    const masterD = deckARef.current.isMaster ? deckARef.current : deckBRef.current;
+    const bpm = masterD.track ? masterD.baseBpm * masterD.playbackRate : 124;
+    const st = djEngine.updateMicFxParams({ radioEq: nextRadio, dubWet: micFxState.dubWet, bpm });
+    setMicFxState(st);
+  }, [micFxState.radioEq, micFxState.dubWet]);
+
+  const handleMicDubWetChange = useCallback(
+    (wet: number) => {
+      const masterD = deckARef.current.isMaster ? deckARef.current : deckBRef.current;
+      const bpm = masterD.track ? masterD.baseBpm * masterD.playbackRate : 124;
+      const st = djEngine.updateMicFxParams({ radioEq: micFxState.radioEq, dubWet: wet, bpm });
+      setMicFxState(st);
+    },
+    [micFxState.radioEq]
+  );
+
+  const handleToggleMicLoop = useCallback(async () => {
+    const masterD = deckARef.current.isMaster ? deckARef.current : deckBRef.current;
+    const bpm = masterD.track ? masterD.baseBpm * masterD.playbackRate : 124;
+    const st = await djEngine.toggleMicLooper(bpm);
+    setMicFxState(st);
+  }, []);
+
+  const handleClearMicLoop = useCallback(() => {
+    const st = djEngine.clearMicLoop();
+    setMicFxState(st);
+  }, []);
+
+  const handleLoadMashupPair = useCallback(
+    async (vocalTrack: TrackItem, instTrack: TrackItem, pair: GoldenMashupPair) => {
+      await Promise.all([loadTrackToDeck('A', vocalTrack), loadTrackToDeck('B', instTrack)]);
+      setDeckState('A', (p) => ({ ...p, stemMode: 'vocal-focus', eqLow: -0.78 }));
+      setDeckState('B', (p) => ({ ...p, stemMode: 'instrumental', eqMid: -0.42 }));
+      setAutopilotState((prev) => ({
+        ...prev,
+        mashupTemplate: pair.template,
+        currentActionLabel: `Golden Mashup Loaded (${Math.round(pair.compatibilityScore)}%): ${vocalTrack.title.split('(')[0].trim()} × ${instTrack.title.split('(')[0].trim()}`,
+      }));
+      setIsCrateOpen(false);
+    },
+    [loadTrackToDeck, setAutopilotState, setDeckState]
+  );
+
+  const handleTriggerStutterRoll = useCallback(
+    (deckId: DeckId, subdiv: StutterSubdiv) => {
+      const d = getDeckRef(deckId);
+      if (d.playbackMode !== 'webaudio' || !d.track) return;
+      const bpm = Math.max(65, d.baseBpm * d.playbackRate);
+      void djEngine.triggerDeckStutterRoll(deckId, {
+        currentSec: getLiveTime(deckId),
+        bpm,
+        subdiv,
+        steps: subdiv === '1/32' ? 8 : subdiv === '1/16' ? 8 : 4,
+      });
+      setAutopilotState((prev) => ({
+        ...prev,
+        currentActionLabel: `Deck ${deckId}: ${subdiv} Quantized Stutter Roll`,
+      }));
+    },
+    [getLiveTime, setAutopilotState]
+  );
+
+  const handleTriggerTonePlay = useCallback(
+    (deckId: DeckId, semitoneOffset: number) => {
+      const d = getDeckRef(deckId);
+      if (!d.track) return;
+      const bpm = Math.max(65, d.baseBpm * d.playbackRate);
+      void djEngine.triggerTonePlayNote(deckId, {
+        semitoneOffset,
+        currentSec: getLiveTime(deckId),
+        bpm,
+        dropCueSec: d.track.dropCueSec ?? d.detectedDropSec,
+        musicalKey: d.track.musicalKey,
+      });
+    },
+    [getLiveTime]
+  );
+
+  const handleTriggerSwellDrop = useCallback(async () => {
+    const masterDeck = deckARef.current.isMaster ? deckARef.current : deckBRef.current;
+    const target =
+      masterDeck.playbackMode === 'webaudio'
+        ? masterDeck
+        : deckARef.current.playbackMode === 'webaudio'
+        ? deckARef.current
+        : deckBRef.current;
+    if (!target.track || target.playbackMode !== 'webaudio') {
+      setAutopilotState((prev) => ({
+        ...prev,
+        currentActionLabel: 'Swell + Tape Drop requires a loaded Web Audio deck',
+      }));
+      return;
+    }
+    const bpm = Math.max(65, target.baseBpm * target.playbackRate);
+    const cueSec =
+      target.track.dropCueSec ?? target.detectedDropSec ?? Math.max(2, getLiveTime(target.deckId));
+    await djEngine.triggerReverseReverbSwell(target.deckId, {
+      cueSec,
+      bpm,
+      beats: 1.5,
+      withTapeStopOnOther: true,
+    });
+    setAutopilotState((prev) => ({
+      ...prev,
+      currentActionLabel: `Reverse-Reverb Vocal Swell + Tape Drop fired on Deck ${target.deckId}`,
+    }));
+  }, [getLiveTime, setAutopilotState]);
+
+  const handleScanWhisperCues = useCallback(
+    async (deckId: DeckId) => {
+      const d = getDeckRef(deckId);
+      if (!d.track || scanningDeckCues) return;
+      setScanningDeckCues(deckId);
+      try {
+        const audioBuf = d.playbackMode === 'webaudio' ? djEngine.getDeckAudioBuffers(deckId).buffer : null;
+        const lyricCues = await requestGroqWhisperCues({
+          buffer: audioBuf,
+          title: d.track.title,
+          durationSec: d.duration || d.track.durationSec,
+        });
+        libraryRef.current.updateTrackMeta(d.track.id, { lyricCues });
+
+        const mappedCues = d.hotCues.map((hc, idx) => {
+          const phrase = lyricCues.hookPhrases[idx];
+          if (phrase) {
+            return {
+              ...hc,
+              timeSec: Math.round(phrase.startSec * 100) / 100,
+              label: phrase.text.slice(0, 12) || `Hook ${idx + 1}`,
+            };
+          }
+          return hc;
+        });
+
+        setDeckState(deckId, (prev) => ({
+          ...prev,
+          track: prev.track ? { ...prev.track, lyricCues } : null,
+          hotCues: mappedCues,
+        }));
+        setAutopilotState((prev) => ({
+          ...prev,
+          currentActionLabel:
+            lyricCues.source === 'groq-whisper'
+              ? `Whisper Scanned ${lyricCues.hookPhrases.length} Hooks + ${lyricCues.anchorWords.length} Anchor Cues`
+              : `Heuristic Lyric Map: ${lyricCues.hookPhrases.length} Hook Cues mapped`,
+        }));
+      } catch (err: any) {
+        setAutopilotState((prev) => ({
+          ...prev,
+          currentActionLabel: err?.message || 'Lyric cue scan unavailable',
+        }));
+      } finally {
+        setScanningDeckCues(null);
+      }
+    },
+    [scanningDeckCues, setAutopilotState, setDeckState]
+  );
+
+  const handleEnrichCrate = useCallback(async () => {
+    if (enrichingCrate) return;
+    const targetTracks = getPlaylistTracks(libraryRef.current.activePlaylistId).slice(0, 24);
+    if (targetTracks.length === 0) return;
+    setEnrichingCrate(true);
+    try {
+      const res = await requestGroqCrateEnrich({
+        tracks: targetTracks.map((t) => ({
+          id: t.id,
+          title: t.title,
+          artist: t.artist,
+          bpm: t.bpm,
+          musicalKey: t.musicalKey,
+          detectedVocalDensity: t.detectedVocalDensity,
+        })),
+      });
+      let updatedCount = 0;
+      for (const [trackId, enrichment] of Object.entries(res.enrichments || {})) {
+        libraryRef.current.updateTrackMeta(trackId, { enrichment });
+        updatedCount++;
+      }
+      setAutopilotState((prev) => ({
+        ...prev,
+        currentActionLabel: `AI Enrich (${res.source}): tagged ${updatedCount} tracks with mood, moment & chemistry`,
+      }));
+    } catch (err: any) {
+      setAutopilotState((prev) => ({
+        ...prev,
+        currentActionLabel: err?.message || 'Crate AI enrich failed',
+      }));
+    } finally {
+      setEnrichingCrate(false);
+    }
+  }, [enrichingCrate, getPlaylistTracks, setAutopilotState]);
+
+  const handleGenerateHostDrop = useCallback(
+    async (stationName: string, slotId: CustomVoiceSlotId) => {
+      if (generatingHostDrop) return;
+      setGeneratingHostDrop(true);
+      setMicError(null);
+      try {
+        await ensureCustomBuffersLoaded();
+        const outD = getDeckRef(aiSessionRef.current.outgoingDeck);
+        const inD = getDeckRef(aiSessionRef.current.incomingDeck);
+        const fromTrack = outD.track || deckARef.current.track;
+        const toTrack =
+          inD.track ||
+          libraryRef.current.tracks.find((t) => t.id === autopilotRef.current.activePlan?.nextTrackId) ||
+          deckBRef.current.track;
+        const script = buildDynamicHostDropScript({
+          stationName,
+          fromTrack,
+          toTrack,
+          vibe: autopilotRef.current.vibe,
+        });
+        const ctx = await djEngine.resume();
+        const buf = await fetchGroqTtsDropBuffer({
+          text: script,
+          voice: 'troy',
+          audioCtx: ctx,
+        });
+        if (!buf) {
+          setMicError('Orpheus TTS unavailable (configure GROQ_API_KEY in Secrets).');
+          return;
+        }
+        customVoiceBuffersRef.current[slotId] = buf;
+        const dur = await saveCustomVoiceBufferToIdb(slotId, buf);
+        const cleanStation = (stationName || 'DJOne').trim().slice(0, 12) || 'DJOne';
+        setCustomVoiceDrops((prev) => {
+          const next = prev.map((m) =>
+            m.id === slotId
+              ? { ...m, label: `${cleanStation} Host`, durationSec: dur, hasAudio: true, enabled: true }
+              : m
+          );
+          saveCustomVoiceMetas(next);
+          return next;
+        });
+        const bpm = fromTrack ? (outD.baseBpm || fromTrack.bpm) * (outD.playbackRate || 1) : 124;
+        await djEngine.playCustomVoiceBuffer(buf, bpm);
+        setAutopilotState((prev) => ({
+          ...prev,
+          currentActionLabel: `Generated Host Drop → Slot ${slotId.slice(-1)}: "${script.slice(0, 48)}..."`,
+        }));
+      } catch (err: any) {
+        setMicError(err?.message || 'Unable to generate Orpheus TTS drop.');
+      } finally {
+        setGeneratingHostDrop(false);
+      }
+    },
+    [ensureCustomBuffersLoaded, generatingHostDrop, setAutopilotState]
+  );
+
   const handleAiMashupBlend = useCallback(async () => {
     if (autopilotRef.current.mashupRoutineActive) {
       aiSessionRef.current.mashupPhases = null;
@@ -3303,9 +4236,25 @@ export default function App() {
     [setAutopilotState]
   );
 
-  // Real-time 25fps AI Auto-Pilot, Groove Bridge & 32-Bar Mashup Choreography Executor Loop
+  const anyBootlegDrum =
+    (deckA.bootlegFlip &&
+      deckA.bootlegFlip !== 'off' &&
+      deckA.bootlegFlip !== 'slowed-reverb' &&
+      deckA.bootlegFlip !== 'nightcore') ||
+    (deckB.bootlegFlip &&
+      deckB.bootlegFlip !== 'off' &&
+      deckB.bootlegFlip !== 'slowed-reverb' &&
+      deckB.bootlegFlip !== 'nightcore');
+
+  // Real-time 25fps AI Auto-Pilot, Groove Bridge, Bootleg Synth Clock & 32-Bar Mashup Choreography Executor Loop
   useEffect(() => {
-    if (!autopilot.enabled && !autopilot.mashupRoutineActive && autopilot.grooveBridgePattern === 'off') {
+    if (
+      !autopilot.enabled &&
+      !autopilot.mashupRoutineActive &&
+      autopilot.grooveBridgePattern === 'off' &&
+      autopilot.harmonicLayer === 'off' &&
+      !anyBootlegDrum
+    ) {
       return;
     }
 
@@ -3314,17 +4263,16 @@ export default function App() {
       const sess = aiSessionRef.current;
       const nowMs = performance.now();
 
-      // Keep active Groove Drum Bridge quantized to active master deck tempo & Camelot key (+ live pitch rate)
-      if (state.grooveBridgePattern !== 'off' || sess.aiAutoBridgeActive) {
-        const masterD = deckARef.current.isMaster ? deckARef.current : deckBRef.current;
-        const activeD = masterD.track ? masterD : deckARef.current.track ? deckARef.current : deckBRef.current;
-        if (activeD.track) {
-          djEngine.updateGrooveBridge(
-            activeD.baseBpm * activeD.playbackRate,
-            activeD.track.musicalKey,
-            activeD.playbackMode === 'webaudio' ? activeD.playbackRate : 1
-          );
+      // Keep active Groove Drum Bridge + Bootleg Flips + Harmonic Synth Layer quantized to master deck tempo & Camelot key
+      const masterD = deckARef.current.isMaster ? deckARef.current : deckBRef.current;
+      const activeD = masterD.track ? masterD : deckARef.current.track ? deckARef.current : deckBRef.current;
+      if (activeD.track) {
+        const effBpm = activeD.baseBpm * activeD.playbackRate;
+        const effPitch = activeD.playbackMode === 'webaudio' ? activeD.playbackRate : 1;
+        if (state.grooveBridgePattern !== 'off' || sess.aiAutoBridgeActive) {
+          djEngine.updateGrooveBridge(effBpm, activeD.track.musicalKey, effPitch);
         }
+        djEngine.updateLayerClock(effBpm, activeD.track.musicalKey, effPitch);
       }
 
       // Upgrade #1: Continuous 32-Bar Live Bootleg Mashup Routine Stepper (3-Stem HPSS + 4 Templates)
@@ -3690,12 +4638,14 @@ export default function App() {
         const nearBar1Boundary = barPhase <= 0.11 || barPhase >= 0.89;
 
         // Upgrade #5: Real-Time Energy & Outro Rescue Guard
+        const isOpener = sess.isFirstTrack;
+        const quietGuardMinPct = isOpener ? 0.68 : 0.45;
         const inOutroSection = Boolean(
           outDeck.sections?.some(
             (s) => s.label === 'outro' && cur >= s.startSec && cur <= s.endSec
           )
         );
-        if (outDeck.playbackMode === 'webaudio' && pct > 0.32) {
+        if (outDeck.playbackMode === 'webaudio' && pct > quietGuardMinPct) {
           const liveRms = djEngine.getDeckLevel(outId);
           if (liveRms < 0.08) {
             if (sess.lowEnergySinceMs === 0) sess.lowEnergySinceMs = nowMs;
@@ -3706,7 +4656,7 @@ export default function App() {
           sess.lowEnergySinceMs = 0;
         }
         const sustainedQuietOutro =
-          sess.lowEnergySinceMs > 0 && nowMs - sess.lowEnergySinceMs >= 2200;
+          sess.lowEnergySinceMs > 0 && nowMs - sess.lowEnergySinceMs >= 2600;
 
         // Upgrade #5: Auto-Loop Safety Net if track nears outro before transition finishes (or while buffering)
         const neededMixSec = (sess.plan.transitionBars || 8) * barSec;
@@ -3727,18 +4677,41 @@ export default function App() {
           }));
         }
 
-        // Advance #7 + Sparsest Pocket Finder: Live countdown ETA accounting for +8 Bars hold & Early Outro Guard
-        const baseThreshold = state.quickMix ? 0.34 : state.remixMode ? 0.48 : 0.62;
+        // Advance #7 + Sparsest Pocket Finder: Live countdown ETA accounting for +8 Bars hold & Smart Entry start offset
+        const outEntryPct = Math.min(0.68, Math.max(0, sess.outgoingStartSec / dur));
+        const runwayPct = Math.max(0.18, 0.88 - outEntryPct);
+        const runwayFraction = isOpener
+          ? state.quickMix
+            ? 0.62
+            : state.remixMode
+            ? 0.74
+            : 0.82
+          : state.quickMix
+          ? 0.42
+          : state.remixMode
+          ? 0.56
+          : 0.72;
+        const baseThreshold = Math.min(0.86, outEntryPct + runwayPct * runwayFraction);
         const pocketTargetPct = sess.plan.recommendedOutStartPct
-          ? Math.max(baseThreshold * 0.92, Math.min(0.8, sess.plan.recommendedOutStartPct))
+          ? Math.max(
+              isOpener ? baseThreshold : baseThreshold * 0.92,
+              Math.min(0.86, sess.plan.recommendedOutStartPct)
+            )
           : baseThreshold;
         const transitionThreshold = Math.min(
-          0.88,
+          0.90,
           pocketTargetPct + (state.holdExtraBars * barSec) / dur
         );
-        const minRemainTrigger = Math.min(22, dur * 0.35);
+        const minRemainTrigger = Math.min(isOpener ? 18 : 22, dur * (isOpener ? 0.25 : 0.35));
         let triggerAtSec = Math.min(dur - minRemainTrigger, dur * transitionThreshold);
-        if ((inOutroSection || sustainedQuietOutro) && pct > 0.3) {
+        if (isOpener) {
+          const minOpenerPlaySec = Math.min(dur * 0.68, state.quickMix ? 55 : 85);
+          triggerAtSec = Math.max(
+            triggerAtSec,
+            Math.min(dur - minRemainTrigger, sess.outgoingStartSec + minOpenerPlaySec)
+          );
+        }
+        if ((inOutroSection || sustainedQuietOutro) && pct > quietGuardMinPct) {
           triggerAtSec = Math.min(triggerAtSec, cur + barSec * 1.5);
         }
         const etaSec = Math.max(0, Math.round(triggerAtSec - cur));
@@ -3967,7 +4940,8 @@ export default function App() {
                 moment.voiceDropId &&
                 !state.muteSoundTricks &&
                 state.voiceFxEnabled &&
-                isAnyVoiceEnabled(moment.voiceDropId)
+                isAnyVoiceEnabled(moment.voiceDropId) &&
+                !isTimestampVocalBusy(outDeck.track, cur)
               ) {
                 void playAnyVoiceDrop(moment.voiceDropId, bpm, outDeck.track?.musicalKey, outPitchRate);
               }
@@ -4092,8 +5066,9 @@ export default function App() {
         }
 
         const endedEarly = !outDeck.isPlaying && !outDeck.isLoading && cur >= Math.max(2, dur - 2.0);
-        const shouldMixSoon =
-          cur >= triggerAtSec || pct >= transitionThreshold || remaining <= minRemainTrigger || endedEarly;
+        const shouldMixSoon = isOpener
+          ? cur >= triggerAtSec || endedEarly
+          : cur >= triggerAtSec || pct >= transitionThreshold || remaining <= minRemainTrigger || endedEarly;
         if (shouldMixSoon && !sess.pendingTransitionQuantize) {
           sess.pendingTransitionQuantize = true;
           sess.pendingTransitionQueuedAtMs = nowMs;
@@ -4244,15 +5219,38 @@ export default function App() {
           activeLabel = 'Beat-Slice Transient Fill';
         }
 
-        // Offline AI DJ Voice, Shout & Countdown Triggering (strictly respects voiceFxEnabled & enabledVoiceIds/custom drops)
+        // Reverse-Reverb Vocal Swell + Tape-Stop Drop Prep right before mid-transition drop slam
+        if (
+          p >= 0.34 &&
+          p <= 0.44 &&
+          !sess.swellFired &&
+          !state.muteSoundTricks &&
+          (state.remixMode || state.features.dropFakeouts) &&
+          inDeck.playbackMode === 'webaudio'
+        ) {
+          sess.swellFired = true;
+          void djEngine.triggerReverseReverbSwell(inId, {
+            cueSec: getLiveTime(inId) + Math.max(0.5, (beatMs / 1000) * 1.5),
+            bpm: currentTargetBpm,
+            beats: 1.5,
+            withTapeStopOnOther:
+              state.aggressiveness >= 65 && outDeck.playbackMode === 'webaudio',
+          });
+        }
+
+        // Offline AI DJ Voice, Shout & Countdown Triggering (with Anti-Vocal-Clash Guard)
         if (sess.plan.voiceDrops && sess.plan.voiceDrops.length > 0) {
+          const outLiveSec = getLiveTime(outId);
+          const inLiveSec = getLiveTime(inId);
           sess.plan.voiceDrops.forEach((vCue, vIdx) => {
             if (p >= vCue.atProgress && !sess.firedVoiceIndices.has(vIdx)) {
               sess.firedVoiceIndices.add(vIdx);
               if (
                 !state.muteSoundTricks &&
                 state.voiceFxEnabled &&
-                isAnyVoiceEnabled(vCue.voiceId)
+                isAnyVoiceEnabled(vCue.voiceId) &&
+                !isTimestampVocalBusy(outDeck.track, outLiveSec) &&
+                !isTimestampVocalBusy(inDeck.track, inLiveSec)
               ) {
                 const vPitch = inDeck.track?.musicalKey
                   ? inDeck.playbackMode === 'webaudio'
@@ -4424,6 +5422,9 @@ export default function App() {
                 if (inDeck.playbackMode === 'webaudio') {
                   djEngine.setDeckStereoWidth(inId, 1.25);
                   sess.widthSlamUntilMs = nowMs + 1800;
+                }
+                if (reactiveAdLibsEnabled) {
+                  djEngine.triggerReactiveAdLib('drop-slam', currentTargetBpm);
                 }
               }
               outChannelVolume = 0;
@@ -4891,6 +5892,8 @@ export default function App() {
           sess.plan = null;
           sess.staircaseStage = 0;
           sess.pllNudgedDeck = null;
+          sess.outgoingStartSec = sess.pendingOutgoingStartSec;
+          sess.isFirstTrack = false;
 
           if (canVocalCarryover) {
             sess.outgoingDeck = inId;
@@ -4923,6 +5926,8 @@ export default function App() {
     autopilot.enabled,
     autopilot.mashupRoutineActive,
     autopilot.grooveBridgePattern,
+    autopilot.harmonicLayer,
+    anyBootlegDrum,
     beginAiTransitionNow,
     getLiveTime,
     handleBeatJump,
@@ -5101,10 +6106,16 @@ export default function App() {
       }
 
       if (opts.mode === 'playlist-mix') {
-        const plTracks = getPlaylistTracks(autopilotRef.current.targetPlaylistId).slice(
-          0,
-          opts.preview8BarsOnly ? 2 : 20
-        );
+        const allPlTracks = [...getPlaylistTracks(autopilotRef.current.targetPlaylistId)];
+        if (!opts.preview8BarsOnly && allPlTracks.length > 1) {
+          let s = (resolvedSeed ^ Math.floor(Math.random() * 0xffffffff)) >>> 0;
+          for (let i = allPlTracks.length - 1; i > 0; i--) {
+            s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+            const j = s % (i + 1);
+            [allPlTracks[i], allPlTracks[j]] = [allPlTracks[j], allPlTracks[i]];
+          }
+        }
+        const plTracks = allPlTracks.slice(0, opts.preview8BarsOnly ? 2 : 20);
         if (plTracks.length < 2) {
           throw new Error('Select a playlist with at least 2 tracks to render a continuous mix.');
         }
@@ -5151,6 +6162,15 @@ export default function App() {
           customVoiceDrops: customVoiceDropsRef.current,
           customVoiceBuffers: customVoiceBuffersRef.current,
           features: autopilotRef.current.features,
+          bootlegFlip: opts.bootlegFlip,
+          harmonicSynthLayer: opts.harmonicSynthLayer,
+          reverseVocalSwell: opts.reverseVocalSwell,
+          tapeStopDropPrep: opts.tapeStopDropPrep,
+          filterEnvelope: opts.filterEnvelope,
+          subSwapEnabled: opts.subSwapEnabled,
+          cleanEditMask: opts.cleanEditMask,
+          vocalChopSolo: opts.vocalChopSolo,
+          keyGlideCorrection: opts.keyGlideCorrection,
           onProgress: (p) => onProgress(Math.max(36, p)),
         });
 
@@ -5237,6 +6257,15 @@ export default function App() {
             customVoiceDrops: customVoiceDropsRef.current,
             customVoiceBuffers: customVoiceBuffersRef.current,
             features: autopilotRef.current.features,
+            bootlegFlip: opts.bootlegFlip,
+            harmonicSynthLayer: opts.harmonicSynthLayer,
+            reverseVocalSwell: opts.reverseVocalSwell,
+            tapeStopDropPrep: opts.tapeStopDropPrep,
+            filterEnvelope: opts.filterEnvelope,
+            subSwapEnabled: opts.subSwapEnabled,
+            cleanEditMask: opts.cleanEditMask,
+            vocalChopSolo: opts.vocalChopSolo,
+            keyGlideCorrection: opts.keyGlideCorrection,
             onProgress: (p) =>
               onProgress(Math.min(99, Math.round(((vIdx + p / 100) / variantsToRender.length) * 100))),
           });
@@ -5318,6 +6347,15 @@ export default function App() {
           customVoiceDrops: customVoiceDropsRef.current,
           customVoiceBuffers: customVoiceBuffersRef.current,
           features: autopilotRef.current.features,
+          bootlegFlip: opts.bootlegFlip,
+          harmonicSynthLayer: opts.harmonicSynthLayer,
+          reverseVocalSwell: opts.reverseVocalSwell,
+          tapeStopDropPrep: opts.tapeStopDropPrep,
+          filterEnvelope: opts.filterEnvelope,
+          subSwapEnabled: opts.subSwapEnabled,
+          cleanEditMask: opts.cleanEditMask,
+          vocalChopSolo: opts.vocalChopSolo,
+          keyGlideCorrection: opts.keyGlideCorrection,
           onProgress: (p) =>
             onProgress(Math.min(99, Math.round(((vIdx + p / 100) / variantsToRender.length) * 100))),
         });
@@ -5356,6 +6394,9 @@ export default function App() {
     const bpm = activeDeck.track ? activeDeck.baseBpm * activeDeck.playbackRate : 124;
     const pitchRate = activeDeck.playbackMode === 'webaudio' ? activeDeck.playbackRate : 1;
     djEngine.playSoundTrick(trick, bpm, activeDeck.track?.musicalKey, pitchRate);
+    if (trick === 'backspin' && reactiveAdLibsEnabled) {
+      djEngine.triggerReactiveAdLib('backspin', bpm);
+    }
     if (trick === 'scratch-chirp' && activeDeck.playbackMode === 'webaudio') {
       djEngine.triggerDeckTurntableScratch(activeDeck.deckId, {
         currentSec: getLiveTime(activeDeck.deckId),
@@ -5514,6 +6555,17 @@ export default function App() {
         return { ...prev, stemMode: next };
       });
     },
+    onCycleBootlegFlip: () => handleCycleDeckBootleg(deck.deckId),
+    onTriggerStutterRoll: (subdiv: StutterSubdiv) => handleTriggerStutterRoll(deck.deckId, subdiv),
+    onTriggerTonePlay: (semitone: number) => handleTriggerTonePlay(deck.deckId, semitone),
+    onScanWhisperCues: () => handleScanWhisperCues(deck.deckId),
+    scanningCues: scanningDeckCues === deck.deckId,
+    onToggleSubSwap: () => handleToggleSubSwap(deck.deckId),
+    onTriggerPitchRoll: (mode: 'escalate-roll' | 'poly-3-8' | 'poly-3-16') =>
+      handleTriggerPitchRoll(deck.deckId, mode),
+    onTriggerEchoFreeze: () => handleTriggerEchoFreeze(deck.deckId),
+    onCycleCleanEditMask: () => handleCycleCleanEditMask(deck.deckId),
+    onTriggerChopSolo: () => handleTriggerChopSolo(deck.deckId),
   });
 
   // Upgrade #7: Interactive AI Remix Markers projected onto DualWaveformDisplay
@@ -5564,9 +6616,14 @@ export default function App() {
       });
     }
 
-    const baseThreshold = autopilot.quickMix ? 0.34 : autopilot.remixMode ? 0.48 : 0.62;
+    const outEntryPct = Math.min(0.68, Math.max(0, aiSessionRef.current.outgoingStartSec / dur));
+    const runwayPct = Math.max(0.18, 0.88 - outEntryPct);
+    const baseThreshold = Math.min(
+      0.84,
+      outEntryPct + runwayPct * (autopilot.quickMix ? 0.42 : autopilot.remixMode ? 0.56 : 0.72)
+    );
     const pocketTargetPct = plan.recommendedOutStartPct
-      ? Math.max(baseThreshold * 0.92, Math.min(0.8, plan.recommendedOutStartPct))
+      ? Math.max(baseThreshold * 0.92, Math.min(0.84, plan.recommendedOutStartPct))
       : baseThreshold;
     const mixOutPct = Math.min(0.88, pocketTargetPct + (autopilot.holdExtraBars * barSec) / dur);
     markers.push({
@@ -5762,6 +6819,20 @@ export default function App() {
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
+            onClick={() => setVisualizerOpen((v) => !v)}
+            className={`h-8 px-2.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors whitespace-nowrap shrink-0 ${
+              visualizerOpen
+                ? 'bg-cyan-500 text-[#090B0F] border-cyan-400'
+                : 'bg-[#151A24] border-white/15 text-slate-200 hover:text-white hover:border-cyan-400/50'
+            }`}
+            title="Full-Screen Beat & Lyric Synced Club Visualizer Mode"
+          >
+            <Tv className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Club Mode</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => {
               if (isRecording) {
                 handleStopRecording();
@@ -5804,6 +6875,8 @@ export default function App() {
             onTriggerAiMarker={handleTriggerAiMarker}
             onToggleMuteAiMarker={handleToggleMuteAiMarker}
             onMoveAiMarker={handleMoveAiMarker}
+            clashReport={clashReport}
+            onAutoCarveClash={handleAutoCarveClash}
           />
         </div>
 
@@ -5896,6 +6969,19 @@ export default function App() {
             onToggleFeature={handleToggleAiFeature}
             onApplyFeaturePreset={handleApplyFeaturePreset}
             onCycleGrooveBridge={handleCycleGrooveBridge}
+            onCycleHarmonicLayer={handleCycleHarmonicLayer}
+            onTriggerSwellDrop={handleTriggerSwellDrop}
+            onGenerateHostDrop={handleGenerateHostDrop}
+            generatingHostDrop={generatingHostDrop}
+            liveDirectorLoading={liveDirectorLoading}
+            micFxState={micFxState}
+            onToggleMicRack={handleToggleMicRack}
+            onToggleMicRadioEq={handleToggleMicRadioEq}
+            onMicDubWetChange={handleMicDubWetChange}
+            onToggleMicLoop={handleToggleMicLoop}
+            onClearMicLoop={handleClearMicLoop}
+            reactiveAdLibsEnabled={reactiveAdLibsEnabled}
+            onToggleReactiveAdLibs={handleToggleReactiveAdLibs}
             onOpenCrate={() => setIsCrateOpen(true)}
           />
         </div>
@@ -5978,6 +7064,19 @@ export default function App() {
                 onToggleFeature={handleToggleAiFeature}
                 onApplyFeaturePreset={handleApplyFeaturePreset}
                 onCycleGrooveBridge={handleCycleGrooveBridge}
+                onCycleHarmonicLayer={handleCycleHarmonicLayer}
+                onTriggerSwellDrop={handleTriggerSwellDrop}
+                onGenerateHostDrop={handleGenerateHostDrop}
+                generatingHostDrop={generatingHostDrop}
+                liveDirectorLoading={liveDirectorLoading}
+                micFxState={micFxState}
+                onToggleMicRack={handleToggleMicRack}
+                onToggleMicRadioEq={handleToggleMicRadioEq}
+                onMicDubWetChange={handleMicDubWetChange}
+                onToggleMicLoop={handleToggleMicLoop}
+                onClearMicLoop={handleClearMicLoop}
+                reactiveAdLibsEnabled={reactiveAdLibsEnabled}
+                onToggleReactiveAdLibs={handleToggleReactiveAdLibs}
                 onOpenCrate={() => setMobileTab('crate')}
               />
               <DeckPanel
@@ -6012,6 +7111,9 @@ export default function App() {
               autopilotRemixMode={autopilot.remixMode}
               deckATrackId={deckA.track?.id}
               deckBTrackId={deckB.track?.id}
+              onEnrichCrate={handleEnrichCrate}
+              enrichingCrate={enrichingCrate}
+              onLoadMashupPair={handleLoadMashupPair}
             />
           )}
         </div>
@@ -6056,6 +7158,9 @@ export default function App() {
               deckBTrackId={deckB.track?.id}
               sidebarMode
               onCloseDrawer={() => setIsCrateOpen(false)}
+              onEnrichCrate={handleEnrichCrate}
+              enrichingCrate={enrichingCrate}
+              onLoadMashupPair={handleLoadMashupPair}
             />
           </aside>
         </>
@@ -6152,7 +7257,17 @@ export default function App() {
           return `${pl?.name || 'All Library Tracks'} · ${count} tracks`;
         })()}
         defaultMashupTemplate={autopilot.mashupTemplate}
+        onSaveRecordingStory={library.updateRecordingStory}
         onRenderAiRemixWav={handleRenderAiRemixWav}
+      />
+
+      {/* Beat- & Lyric-Synced Club Visualizer Mode */}
+      <ClubVisualizerOverlay
+        isOpen={visualizerOpen}
+        onClose={() => setVisualizerOpen(false)}
+        deckA={deckA}
+        deckB={deckB}
+        getLiveTime={getLiveTime}
       />
     </div>
   );

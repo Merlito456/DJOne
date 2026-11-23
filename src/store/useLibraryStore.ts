@@ -3,6 +3,7 @@ import { mergeTrackWithCalibration, saveTrackCalibration } from '../audio/aiMemo
 import {
   AiDjVibe,
   CarloPlaylistFile,
+  MixStoryExport,
   Playlist,
   RecordingItem,
   TrackItem,
@@ -442,6 +443,10 @@ export function useLibraryStore() {
     setRecordings((prev) => [rec, ...prev]);
   }, []);
 
+  const updateRecordingStory = useCallback((id: string, mixStory: MixStoryExport) => {
+    setRecordings((prev) => prev.map((r) => (r.id === id ? { ...r, mixStory } : r)));
+  }, []);
+
   const removeRecording = useCallback((id: string) => {
     setRecordings((prev) => {
       const target = prev.find((r) => r.id === id);
@@ -580,6 +585,7 @@ export function useLibraryStore() {
     exportPlaylistToCarlo,
     importCarloPlaylist,
     addRecording,
+    updateRecordingStory,
     removeRecording,
   };
 }

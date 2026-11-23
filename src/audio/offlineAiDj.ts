@@ -16,6 +16,7 @@ import {
   CustomVoiceDropMeta,
   DjVoiceCategory,
   DjVoiceDropId,
+  FrequencyClashReport,
   FxType,
   GenrePhysicsMode,
   GrooveBridgePattern,
@@ -28,7 +29,9 @@ import {
   SoundTrickType,
   StemIsolationMode,
   StemSwapMode,
+  TrackEnrichment,
   TrackItem,
+  TrackLyricCues,
   TrackSectionSegment,
   VocalDensityTag,
   VocalPhrasePocket,
@@ -38,7 +41,11 @@ import {
 } from '../types/dj';
 import { loadTasteProfile, shiftCamelotKey } from './aiMemory';
 import { DJ_VOICE_LIBRARY, isCustomVoiceDropId, VOICE_PRESET_MAP } from './djVoices';
-import { analyzeOverlapClash, analyzeWaveformVocalPockets } from './waveformAnalyzer';
+import {
+  analyzeOverlapClash,
+  analyzeWaveformVocalPockets,
+  findSparsestMashupPocket,
+} from './waveformAnalyzer';
 
 export interface CandidateTrackInput {
   id: string;
@@ -54,6 +61,63 @@ export interface CandidateTrackInput {
   detectedVocalDensity?: VocalDensityTag;
   vocalPockets?: VocalPhrasePocket[];
   waveform?: WaveformBandSample[];
+  lyricCues?: TrackLyricCues;
+  enrichment?: TrackEnrichment;
+}
+
+/**
+ * Anti-Vocal-Clash Guard:
+ * Checks Groq Whisper exact lyric busy windows first, falling back to spectral vocalPockets.
+ */
+export function isTimestampVocalBusy(
+  track: CandidateTrackInput | TrackItem | null | undefined,
+  timeSec: number
+): boolean {
+  if (!track || !Number.isFinite(timeSec) || timeSec < 0) return false;
+  const busy = track.lyricCues?.busyWindows;
+  if (busy && busy.length > 0) {
+    return busy.some((w) => timeSec >= w.startSec - 0.15 && timeSec <= w.endSec + 0.15);
+  }
+  const pockets = track.vocalPockets;
+  if (pockets && pockets.length > 0) {
+    const p = pockets.find((pk) => timeSec >= pk.startSec && timeSec <= pk.endSec);
+    return Boolean(p && p.vocalScore >= 0.6);
+  }
+  return false;
+}
+
+/**
+ * Wordplay Transition Detector:
+ * Finds shared lyrical anchor words (e.g. "tonight", "fire", "drop") across two tracks.
+ */
+export function findAnchorWordplayMatch(
+  outTrack: CandidateTrackInput | TrackItem | null | undefined,
+  inTrack: CandidateTrackInput | TrackItem | null | undefined
+): { word: string; outSec: number; inSec: number } | undefined {
+  const outAnchors = outTrack?.lyricCues?.anchorWords;
+  const inAnchors = inTrack?.lyricCues?.anchorWords;
+  if (!outAnchors || !inAnchors || outAnchors.length === 0 || inAnchors.length === 0) {
+    return undefined;
+  }
+  const outDur = Math.max(20, outTrack?.durationSec || 180);
+  const inDur = Math.max(20, inTrack?.durationSec || 180);
+  for (const oa of outAnchors) {
+    if (oa.timeSec < outDur * 0.15 || oa.timeSec > outDur * 0.88) continue;
+    const match = inAnchors.find(
+      (ia) =>
+        ia.word.toLowerCase() === oa.word.toLowerCase() &&
+        ia.timeSec >= 2 &&
+        ia.timeSec <= inDur * 0.72
+    );
+    if (match) {
+      return {
+        word: oa.word,
+        outSec: Math.round(oa.timeSec * 100) / 100,
+        inSec: Math.round(match.timeSec * 100) / 100,
+      };
+    }
+  }
+  return undefined;
 }
 
 interface CamelotKey {
@@ -66,6 +130,7 @@ const HOT_CUE_COLORS = ['#22D3EE', '#10B981', '#F59E0B', '#EC4899'];
 const AI_FEATURES_STORAGE_KEY = 'djone_ai_feature_toggles_v1';
 
 export const ALL_ON_AI_FEATURE_TOGGLES: AiFeatureToggles = {
+  smartEntry: true,
   vipSkip: true,
   breakdownTease: true,
   vocalCarryover: true,
@@ -77,6 +142,7 @@ export const ALL_ON_AI_FEATURE_TOGGLES: AiFeatureToggles = {
 };
 
 export const CLEAN_MIX_AI_FEATURE_TOGGLES: AiFeatureToggles = {
+  smartEntry: false,
   vipSkip: false,
   breakdownTease: false,
   vocalCarryover: true,
@@ -87,7 +153,10 @@ export const CLEAN_MIX_AI_FEATURE_TOGGLES: AiFeatureToggles = {
   spectralSidechain: true,
 };
 
-export const DEFAULT_AI_FEATURE_TOGGLES: AiFeatureToggles = CLEAN_MIX_AI_FEATURE_TOGGLES;
+export const DEFAULT_AI_FEATURE_TOGGLES: AiFeatureToggles = {
+  ...CLEAN_MIX_AI_FEATURE_TOGGLES,
+  smartEntry: true,
+};
 
 export function loadAiFeatureToggles(): AiFeatureToggles {
   try {
@@ -95,6 +164,10 @@ export function loadAiFeatureToggles(): AiFeatureToggles {
     if (!raw) return { ...DEFAULT_AI_FEATURE_TOGGLES };
     const parsed = JSON.parse(raw) as Partial<AiFeatureToggles>;
     return {
+      smartEntry:
+        typeof parsed.smartEntry === 'boolean'
+          ? parsed.smartEntry
+          : DEFAULT_AI_FEATURE_TOGGLES.smartEntry,
       vipSkip: typeof parsed.vipSkip === 'boolean' ? parsed.vipSkip : DEFAULT_AI_FEATURE_TOGGLES.vipSkip,
       breakdownTease:
         typeof parsed.breakdownTease === 'boolean'
@@ -662,11 +735,24 @@ function scoreCandidate(
     dirBonus += (refBpm - candidate.bpm) * 0.85;
   }
 
-  // Offline Taste Learning Q-score bias for proven pairs
+  // Offline Taste Learning Q-score bias + Crate Enrichment + Wordplay chemistry
   const taste = tasteCache ?? loadTasteProfile();
   const pairQ = outgoing ? taste.pairScores[`${outgoing.id}->${candidate.id}`] ?? 0 : 0;
 
-  const randSpread = 4 + (Math.max(0, Math.min(100, randomness)) / 100) * 24;
+  let enrichmentBonus = 0;
+  if (candidate.enrichment) {
+    const eScore = candidate.enrichment.energyScore;
+    if (energyMode === 'build') {
+      enrichmentBonus += stepIndex >= 2 && candidate.enrichment.crowdMoment === 'Peak' ? 8 : (eScore - 5) * 1.1;
+    } else if (energyMode === 'chill') {
+      enrichmentBonus += candidate.enrichment.crowdMoment === 'Cooldown' ? 8 : (6 - eScore) * 0.9;
+    } else if (stepIndex === 0 && candidate.enrichment.crowdMoment === 'Opener') {
+      enrichmentBonus += 7;
+    }
+  }
+  const wordplayBonus = outgoing && findAnchorWordplayMatch(outgoing, candidate) ? 10 : 0;
+
+  const randSpread = 12 + (Math.max(0, Math.min(100, randomness)) / 100) * 52;
   const sessionJitter = rng ? (rng() - 0.5) * randSpread : 0;
 
   return (
@@ -676,6 +762,8 @@ function scoreCandidate(
     vocalScore +
     energyScore +
     dirBonus +
+    enrichmentBonus +
+    wordplayBonus +
     pairQ * 2.2 +
     sessionJitter
   );
@@ -809,13 +897,12 @@ export function optimizePlaylistSetlist<T extends CandidateTrackInput>(params: {
       score: s.score,
     }));
   } else {
-    const openers = [...pool]
-      .sort((a, b) => {
-        if (energyMode === 'build') return a.bpm - b.bpm;
-        if (energyMode === 'chill') return b.bpm - a.bpm;
-        return (hashString(a.id) % 97) - (hashString(b.id) % 97);
-      })
-      .slice(0, BEAM_WIDTH);
+    const shuffledPool = [...pool];
+    for (let i = shuffledPool.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [shuffledPool[i], shuffledPool[j]] = [shuffledPool[j], shuffledPool[i]];
+    }
+    const openers = shuffledPool.slice(0, BEAM_WIDTH);
 
     beams = openers.map((item) => ({
       path: [item],
@@ -846,7 +933,7 @@ export function optimizePlaylistSetlist<T extends CandidateTrackInput>(params: {
             energyMode,
             step,
             rng,
-            randomness * 0.65,
+            randomness,
             taste,
             parsedKeys,
             vocalDensities
@@ -885,7 +972,11 @@ export function optimizePlaylistSetlist<T extends CandidateTrackInput>(params: {
     beams = deduped;
   }
 
-  const bestOrder = beams[0]?.path || [...pool];
+  const beamPickIdx =
+    beams.length > 1 && randomness >= 15
+      ? Math.min(beams.length - 1, Math.floor(Math.pow(rng(), 1.35) * Math.min(beams.length, 4)))
+      : 0;
+  const bestOrder = beams[beamPickIdx]?.path || [...pool];
   if (tracks.length > bestOrder.length) {
     const used = new Set(bestOrder.map((t) => t.id));
     for (const t of tracks) {
@@ -1014,6 +1105,7 @@ function buildSongEffectMoments(params: {
   enabledVoiceIds?: DjVoiceDropId[];
   enabledCustomDrops?: CustomVoiceDropMeta[];
   features?: Partial<AiFeatureToggles>;
+  minPctOverride?: number;
   rng: () => number;
 }): AiSongEffectMoment[] {
   const {
@@ -1034,6 +1126,7 @@ function buildSongEffectMoments(params: {
     enabledVoiceIds = [],
     enabledCustomDrops = [],
     features = DEFAULT_AI_FEATURE_TOGGLES,
+    minPctOverride,
     rng,
   } = params;
   if (features.songMoments === false) return [];
@@ -1124,8 +1217,8 @@ function buildSongEffectMoments(params: {
   if (quickMix && momentCount > 2) momentCount = 2;
   if (momentCount === 0) return [];
 
-  const minPct = 0.08;
-  const maxPct = quickMix ? 0.28 : 0.52;
+  const minPct = Math.max(0.08, Math.min(0.68, minPctOverride ?? 0.08));
+  const maxPct = Math.max(minPct + 0.08, quickMix && minPct <= 0.14 ? 0.28 : Math.min(0.8, minPct + 0.36));
   const span = maxPct - minPct;
 
   const barSec = (60 / Math.max(65, bpm)) * 4;
@@ -2222,6 +2315,318 @@ function computeClubVipSkipEdit(params: {
   };
 }
 
+function formatEntryClock(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, '0')}`;
+}
+
+export interface SmartIncomingEntryResult {
+  startPct: number;
+  entrySec: number;
+  kind: 'intro' | 'verse' | 'build' | 'chorus' | 'sync-pocket';
+  label: string;
+}
+
+/**
+ * Smart Entry Resolver:
+ * When `smartEntry` is OFF, always starts from the beginning (Intro 0:00).
+ * When `smartEntry` is ON, the incoming track does NOT have to start at 0:00 —
+ * it evaluates Intro, Verses, Builds, Chorus/Drops, and high-energy/in-sync overlap pockets
+ * against the outgoing track and chooses a musically strong, phrase-locked entry point.
+ */
+export function resolveSmartIncomingEntry(params: {
+  incomingTrack: CandidateTrackInput;
+  outgoingTrack?: TrackItem | CandidateTrackInput | null;
+  outWaveform?: WaveformBandSample[];
+  inWaveform?: WaveformBandSample[];
+  outStartPct?: number;
+  transitionBars?: number;
+  vibe?: AiDjVibe;
+  energyMode?: AiEnergyMode;
+  aggressiveness?: number;
+  randomness?: number;
+  remixMode?: boolean;
+  quickMix?: boolean;
+  isBreatherMix?: boolean;
+  doubleDropCueSec?: number;
+  smartEntry?: boolean;
+  seed?: number;
+}): SmartIncomingEntryResult {
+  const {
+    incomingTrack,
+    outgoingTrack = null,
+    outWaveform,
+    inWaveform,
+    outStartPct = 0.52,
+    transitionBars = 8,
+    vibe = 'club-blend',
+    energyMode = 'wave',
+    aggressiveness = 55,
+    randomness = 65,
+    remixMode = false,
+    quickMix = false,
+    isBreatherMix = false,
+    doubleDropCueSec,
+    smartEntry = true,
+    seed = 1337,
+  } = params;
+
+  if (!smartEntry) {
+    return {
+      startPct: 0,
+      entrySec: 0,
+      kind: 'intro',
+      label: 'Intro (0:00)',
+    };
+  }
+
+  const dur = Math.max(20, incomingTrack.durationSec || 180);
+  const bpm = Math.max(60, incomingTrack.bpm || 124);
+  const barSec = (60 / bpm) * 4;
+  const firstBeat = incomingTrack.firstBeatSec || 0;
+  const minRemainSec = Math.max(28, transitionBars * barSec + 16);
+  const maxEntrySec = Math.max(4, Math.min(dur * 0.68, dur - minRemainSec));
+  const maxEntryPct = Math.min(0.68, maxEntrySec / dur);
+
+  const quantizeSec = (sec: number): number => {
+    const barsFromBeat1 = Math.max(0, Math.round((sec - firstBeat) / barSec));
+    const q = firstBeat + barsFromBeat1 * barSec;
+    return Math.round(Math.max(0, Math.min(maxEntrySec, q)) * 100) / 100;
+  };
+
+  const wfIn = inWaveform && inWaveform.length >= 24 ? inWaveform : incomingTrack.waveform;
+  const rng = createRng((seed ^ hashString(incomingTrack.id) ^ 0x6c8e9cf5) >>> 0);
+  const aggr = Math.max(0, Math.min(1, aggressiveness / 100));
+  const rand = Math.max(0, Math.min(1, randomness / 100));
+
+  const sampleInEnergy = (sec: number): number => {
+    if (!wfIn || wfIn.length < 16) return 0.55;
+    const sIdx = Math.max(0, Math.min(wfIn.length - 1, Math.floor((sec / dur) * wfIn.length)));
+    const spanBins = Math.max(2, Math.floor(((barSec * 4) / dur) * wfIn.length));
+    const eIdx = Math.min(wfIn.length, sIdx + spanBins);
+    let sum = 0;
+    let count = 0;
+    for (let i = sIdx; i < eIdx; i++) {
+      const w = wfIn[i];
+      sum += w.low * 0.45 + w.mid * 0.35 + w.high * 0.2;
+      count++;
+    }
+    return count > 0 ? sum / count : 0.55;
+  };
+
+  const sampleOutExitEnergy = (): number => {
+    if (!outWaveform || outWaveform.length < 16) return 0.58;
+    const sIdx = Math.max(0, Math.min(outWaveform.length - 1, Math.floor(outStartPct * outWaveform.length)));
+    const eIdx = Math.min(outWaveform.length, sIdx + Math.max(4, Math.floor(outWaveform.length * 0.08)));
+    let sum = 0;
+    let count = 0;
+    for (let i = sIdx; i < eIdx; i++) {
+      const w = outWaveform[i];
+      sum += w.low * 0.45 + w.mid * 0.35 + w.high * 0.2;
+      count++;
+    }
+    return count > 0 ? sum / count : 0.58;
+  };
+
+  const outEnergy = sampleOutExitEnergy();
+  const inPockets = incomingTrack.vocalPockets || [];
+  const outPockets = outgoingTrack?.vocalPockets || [];
+  const outDur = Math.max(20, outgoingTrack?.durationSec || 180);
+  const outExitSec = outStartPct * outDur;
+  const outExitPocket = outPockets.find((p) => outExitSec >= p.startSec && outExitSec <= p.endSec);
+  const outHasHeavyVocals = Boolean(outExitPocket && outExitPocket.vocalScore >= 0.58);
+
+  const overlapClashScore = (inPct: number): number => {
+    if (!outWaveform || outWaveform.length < 24 || !wfIn || wfIn.length < 24) return 0.28;
+    const clash = analyzeOverlapClash(outWaveform, wfIn, outStartPct, inPct, 0.1);
+    return clash.bassClash * 0.55 + clash.midClash * 0.45;
+  };
+
+  interface EntryCandidate {
+    sec: number;
+    pct: number;
+    kind: SmartIncomingEntryResult['kind'];
+    label: string;
+    score: number;
+  }
+
+  const candidates: EntryCandidate[] = [];
+  const pushCandidate = (
+    rawSec: number,
+    kind: SmartIncomingEntryResult['kind'],
+    baseLabel: string,
+    roleBonus: number
+  ) => {
+    const qSec = kind === 'intro' ? 0 : quantizeSec(rawSec);
+    if (qSec > maxEntrySec) return;
+    const pct = Math.max(0, Math.min(maxEntryPct, qSec / dur));
+    if (candidates.some((c) => Math.abs(c.sec - qSec) < Math.max(6, barSec * 2))) {
+      return;
+    }
+
+    const inEnergy = sampleInEnergy(qSec);
+    const clash = overlapClashScore(pct);
+    const syncFit = Math.max(0, 1 - clash * 1.35);
+
+    // Energy fit: build/festival prefers high energy; chill prefers smoother continuity
+    const energyTarget =
+      energyMode === 'build'
+        ? Math.min(0.95, outEnergy + 0.16)
+        : energyMode === 'chill'
+        ? Math.min(0.68, outEnergy * 0.95)
+        : Math.max(0.5, outEnergy);
+    const energyLift =
+      energyMode === 'chill'
+        ? 1 - Math.abs(inEnergy - energyTarget)
+        : inEnergy * 0.65 + (1 - Math.abs(inEnergy - energyTarget)) * 0.35;
+
+    // Vocal pocket awareness during overlap
+    let pocketBonus = 0;
+    const inPocket = inPockets.find((p) => qSec >= p.startSec && qSec <= p.endSec);
+    if (inPocket) {
+      if (outHasHeavyVocals && inPocket.instrumentalScore >= 0.55) {
+        pocketBonus += 0.16;
+      } else if (!outHasHeavyVocals && inPocket.vocalScore >= 0.52) {
+        pocketBonus += 0.12;
+      } else if (outHasHeavyVocals && inPocket.vocalScore >= 0.62) {
+        pocketBonus -= 0.14;
+      }
+    }
+
+    // Avoid starting in dead quiet regions unless it's a deliberate intro
+    const silencePenalty = kind !== 'intro' && inEnergy < 0.16 ? -0.35 : 0;
+
+    const score =
+      roleBonus +
+      energyLift * (0.34 + aggr * 0.22) +
+      syncFit * 0.42 +
+      pocketBonus +
+      silencePenalty +
+      (rng() - 0.5) * (0.14 + rand * 0.34);
+
+    candidates.push({
+      sec: qSec,
+      pct: Math.round(pct * 1000) / 1000,
+      kind,
+      label: qSec <= 1 ? 'Intro (0:00)' : `${baseLabel} (${formatEntryClock(qSec)})`,
+      score,
+    });
+  };
+
+  // 1. Intro / Beginning (0:00) — always considered so sometimes it still starts from the start
+  const introEnergy = sampleInEnergy(0);
+  const introBias =
+    isBreatherMix || energyMode === 'chill' || vibe === 'chill-sunset'
+      ? 0.28
+      : introEnergy >= 0.45
+      ? 0.12
+      : -0.08 - (remixMode ? 0.08 : 0) - (quickMix ? 0.1 : 0);
+  pushCandidate(0, 'intro', 'Intro', introBias);
+
+  // 2. Structure Sections: Verses, Builds, Chorus/Drops
+  const sections = incomingTrack.sections || [];
+  for (const seg of sections) {
+    if (seg.startSec > maxEntrySec) continue;
+    if (seg.label === 'verse' && seg.startSec >= 6) {
+      const verseBias =
+        (seg.energy >= 0.52 ? 0.22 : 0.08) +
+        (vibe === 'club-blend' || vibe === 'mashup-live' ? 0.08 : 0);
+      pushCandidate(seg.startSec, 'verse', 'Verse', verseBias);
+    } else if (seg.label === 'build' && seg.startSec >= 6) {
+      const buildBias =
+        0.16 + (energyMode === 'build' || vibe === 'festival-drop' ? 0.14 : 0);
+      pushCandidate(seg.startSec, 'build', 'Build', buildBias);
+    } else if (seg.label === 'drop' && seg.startSec >= 8) {
+      const chorusBias =
+        0.24 +
+        (aggr >= 0.55 || energyMode === 'build' || vibe === 'festival-drop' || quickMix ? 0.14 : 0);
+      pushCandidate(seg.startSec, 'chorus', 'Chorus / Drop', chorusBias);
+
+      // Also offer a 4-bar pre-chorus lead-in so crossfade lands right on the chorus impact
+      const leadSec = seg.startSec - Math.min(4, Math.max(2, Math.floor(transitionBars / 2))) * barSec;
+      if (leadSec >= 6 && leadSec <= maxEntrySec) {
+        pushCandidate(leadSec, 'build', 'Pre-Chorus', 0.18);
+      }
+    }
+  }
+
+  // 3. Explicit / Auto-Detected Drop Cue & Double-Drop Alignment
+  const dropAnchor = incomingTrack.dropCueSec ?? incomingTrack.detectedDropSec;
+  if (typeof dropAnchor === 'number' && dropAnchor >= 8 && dropAnchor <= maxEntrySec) {
+    pushCandidate(dropAnchor, 'chorus', 'Chorus / Drop', 0.26 + aggr * 0.1);
+  }
+  if (
+    typeof doubleDropCueSec === 'number' &&
+    doubleDropCueSec >= 4 &&
+    doubleDropCueSec <= maxEntrySec
+  ) {
+    pushCandidate(doubleDropCueSec, 'chorus', '2xDrop Sync', 0.42);
+  }
+
+  // 4. Fallback Verse / Chorus anchors when sections metadata isn't populated yet
+  if (sections.length === 0 && dur >= 40) {
+    pushCandidate(dur * 0.18, 'verse', 'Verse', 0.14);
+    pushCandidate(dur * 0.36, 'chorus', 'Chorus', 0.16);
+  }
+
+  // 5. Waveform Sync-Pocket Scan (finds high-energy + low-clash pocket synchronized with previous song)
+  if (wfIn && wfIn.length >= 24 && outWaveform && outWaveform.length >= 24) {
+    const pocket = findSparsestMashupPocket({
+      wfOut: outWaveform,
+      wfIn,
+      outBpm: outgoingTrack?.bpm || bpm,
+      outDurationSec: outDur,
+      inBpm: bpm,
+      inDurationSec: dur,
+      minOutPct: Math.max(0.28, outStartPct - 0.04),
+      maxOutPct: Math.min(0.84, outStartPct + 0.08),
+      minInPct: 0.06,
+      maxInPct: Math.max(0.18, maxEntryPct),
+      preferredBars: transitionBars,
+    });
+    const pocketSec = pocket.inStartPct * dur;
+    if (pocketSec >= 6 && pocketSec <= maxEntrySec) {
+      pushCandidate(pocketSec, 'sync-pocket', 'In-Sync Pocket', 0.25);
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  const top = candidates.slice(0, Math.min(3, candidates.length));
+  if (top.length === 0) {
+    return {
+      startPct: 0,
+      entrySec: 0,
+      kind: 'intro',
+      label: 'Intro (0:00)',
+    };
+  }
+
+  // Weighted pick across top 3 when randomness >= 25 so mixes feel natural ("sometimes")
+  let chosen = top[0];
+  if (top.length > 1 && rand >= 0.25) {
+    const temp = 0.12 + rand * 0.22;
+    const weights = top.map((c) => Math.exp((c.score - top[0].score) / temp));
+    const totalW = weights.reduce((a, b) => a + b, 0);
+    let r = rng() * totalW;
+    for (let i = 0; i < top.length; i++) {
+      r -= weights[i];
+      if (r <= 0) {
+        chosen = top[i];
+        break;
+      }
+    }
+  }
+
+  return {
+    startPct: chosen.pct,
+    entrySec: chosen.sec,
+    kind: chosen.kind,
+    label: chosen.label,
+  };
+}
+
 export function planOfflineTransition(params: {
   outgoingTrack: TrackItem | null;
   currentBpm: number;
@@ -2293,7 +2698,11 @@ export function planOfflineTransition(params: {
     maxLength: Math.min(optimizerPool.length, 24),
   });
 
-  const chosen = beamOrdered[0] || candidates[0];
+  const beamPool = beamOrdered.length > 0 ? beamOrdered : optimizerPool;
+  const pickPoolSize = Math.min(beamPool.length, randomness >= 40 ? 4 : randomness >= 15 ? 2 : 1);
+  const pickIdx =
+    pickPoolSize > 1 ? Math.floor(Math.pow(rng(), 1.4) * pickPoolSize) : 0;
+  const chosen = beamPool[pickIdx] || candidates[0];
   const refBpm = currentBpm || outgoingTrack?.bpm || chosen.bpm;
 
   // Wave-2 Advance #5: Semitone Snap Key-Shift Resolver for dissonant pairings
@@ -2336,24 +2745,57 @@ export function planOfflineTransition(params: {
       : built.recommendedBridge;
 
   // Wave-2 Advance #2: Overlap Window RGB Clash Matrix
+  const smartEntryEnabled = features.smartEntry !== false;
+  const estOutStartPct = quickMix ? 0.34 : remixMode ? 0.48 : 0.62;
+  const doubleDropCueSec = smartEntryEnabled
+    ? computeDoubleDropCueSec({
+        outgoingTrack,
+        incomingTrack: chosen,
+        currentTimeSec,
+        outBpm: refBpm,
+        transitionBars: built.transitionBars,
+      })
+    : undefined;
+
+  const isBreatherCandidate =
+    !direction.trim() &&
+    vibe !== 'techno-hypnotic' &&
+    ((peakMixStreak >= 2 && setTensionScore >= 72) ||
+      (energyMode === 'wave' && peakMixStreak >= 3));
+
+  const smartEntry = resolveSmartIncomingEntry({
+    incomingTrack: chosen,
+    outgoingTrack,
+    outWaveform,
+    inWaveform: inWaveform ?? chosen.waveform,
+    outStartPct: estOutStartPct,
+    transitionBars: built.transitionBars,
+    vibe,
+    energyMode,
+    aggressiveness,
+    randomness,
+    remixMode,
+    quickMix,
+    isBreatherMix: isBreatherCandidate,
+    doubleDropCueSec,
+    smartEntry: smartEntryEnabled,
+    seed: trackMixSeed,
+  });
+
   const clashProfile = analyzeOverlapClash(
     outWaveform,
-    inWaveform,
-    quickMix ? 0.34 : remixMode ? 0.48 : 0.62,
-    built.incomingStartPct,
+    inWaveform ?? chosen.waveform,
+    estOutStartPct,
+    smartEntry.startPct,
     0.12
   );
 
-  // Wave-2 Advance #3: True Double-Drop Phrasing Alignment
-  const doubleDropCueSec = computeDoubleDropCueSec({
-    outgoingTrack,
-    incomingTrack: chosen,
-    currentTimeSec,
-    outBpm: refBpm,
-    transitionBars: built.transitionBars,
-  });
-
   const genrePhysicsMode = resolveGenrePhysicsMode(vibe, outGroove, inGroove);
+
+  const curOutPct =
+    outgoingTrack && outgoingTrack.durationSec > 10
+      ? Math.max(0.08, currentTimeSec / outgoingTrack.durationSec + 0.04)
+      : undefined;
 
   const songMoments = buildSongEffectMoments({
     vibe,
@@ -2373,6 +2815,7 @@ export function planOfflineTransition(params: {
     enabledVoiceIds,
     enabledCustomDrops,
     features,
+    minPctOverride: curOutPct,
     rng,
   });
 
@@ -2380,7 +2823,7 @@ export function planOfflineTransition(params: {
   const sessionSignature = `Take #${takeHex} · ${built.signatureTag}`;
   const mixStyle = remixMode ? `Live Remix · ${built.mixStyle}` : built.mixStyle;
   const transitionBars = remixMode ? Math.max(8, built.transitionBars) : built.transitionBars;
-  const incomingStartPct = remixMode ? Math.max(0.1, built.incomingStartPct) : built.incomingStartPct;
+  const incomingStartPct = smartEntryEnabled ? smartEntry.startPct : 0;
 
   const upcomingQueue: AiSetlistItem[] = beamOrdered.slice(0, 4).map((t, idx) => ({
     trackId: t.id,
@@ -2448,9 +2891,20 @@ export function planOfflineTransition(params: {
         : 'top-hats'
       : resolvedBridge;
 
-  const finalTransitionBars = isBreatherMix
+  // Auto-BPM Tempo Morph Bridge for large (>10 BPM) native tempo spreads
+  const rawTempoSpread = Math.abs(refBpm - effectiveChosenBpm);
+  const tempoMorphBars =
+    rawTempoSpread > 10 && bpmMatch.foldFactor === 1
+      ? Math.max(12, Math.min(16, transitionBars + 4))
+      : undefined;
+
+  const finalTransitionBars = tempoMorphBars
+    ? Math.max(tempoMorphBars, transitionBars)
+    : isBreatherMix
     ? Math.max(12, transitionBars)
     : transitionBars;
+
+  const wordplayMatch = outgoingTrack ? findAnchorWordplayMatch(outgoingTrack, chosen) : undefined;
 
   const useBeatSliceStutter =
     features.beatSliceStutter !== false &&
@@ -2618,6 +3072,26 @@ export function planOfflineTransition(params: {
     }
   }
 
+  // Anti-Vocal-Clash Guard: nudge transition voice cues away from dense sung lyric timestamps
+  if (outgoingTrack && voiceDrops.length > 0) {
+    const outDur = Math.max(20, outgoingTrack.durationSec || 180);
+    const transStartSec = estOutStartPct * outDur;
+    const transWindowSec = finalTransitionBars * ((60 / Math.max(65, refBpm)) * 4);
+    for (const vd of voiceDrops) {
+      const estSec = transStartSec + vd.atProgress * transWindowSec;
+      if (isTimestampVocalBusy(outgoingTrack, estSec)) {
+        for (const offset of [-0.08, 0.08, -0.14, 0.14]) {
+          const candProg = Math.max(0.05, Math.min(0.88, vd.atProgress + offset));
+          const candSec = transStartSec + candProg * transWindowSec;
+          if (!isTimestampVocalBusy(outgoingTrack, candSec)) {
+            vd.atProgress = Math.round(candProg * 100) / 100;
+            break;
+          }
+        }
+      }
+    }
+  }
+
   return {
     nextTrackId: chosen.id,
     mixStyle: isBreatherMix ? `Breather Reset · ${mixStyle}` : mixStyle,
@@ -2625,8 +3099,17 @@ export function planOfflineTransition(params: {
     sessionSignature,
     transitionBars: finalTransitionBars,
     incomingStartPct,
+    incomingEntrySec: smartEntryEnabled ? smartEntry.entrySec : 0,
+    incomingEntryKind: smartEntryEnabled ? smartEntry.kind : 'intro',
+    incomingEntryLabel: wordplayMatch
+      ? `Wordplay "${wordplayMatch.word}" (${formatEntryClock(wordplayMatch.inSec)})`
+      : smartEntryEnabled
+      ? smartEntry.label
+      : 'Intro (0:00)',
     tempoTargetBpm: Math.max(70, Math.min(185, tempoTargetBpm)),
     tempoFoldFactor: bpmMatch.foldFactor,
+    tempoMorphBars,
+    wordplayMatch,
     grooveRecipeLabel: isBreatherMix ? 'Breather Arc · Tension Reset' : built.grooveRecipeLabel,
     outGroove,
     inGroove,
@@ -2635,6 +3118,9 @@ export function planOfflineTransition(params: {
     bpmDeltaLabel,
     keyTransitionLabel,
     semitoneShiftIn: snap.semitones,
+    keyGlideSemitones: snap.snapped && snap.semitones !== 0
+      ? { from: snap.semitones, to: 0 }
+      : undefined,
     doubleDropCueSec,
     clashProfile,
     useBeatSliceStutter,
@@ -2647,6 +3133,8 @@ export function planOfflineTransition(params: {
     aiNotes: `${sessionSignature} · ${
       isBreatherMix ? 'Breather Arc Reset' : built.grooveRecipeLabel
     } · ${keyRel} · ${clashProfile.summary}${
+      tempoMorphBars ? ` · ${tempoMorphBars}-Bar Tempo Morph` : ''
+    }${snap.snapped && snap.semitones !== 0 ? ` · Key-Glide ${snap.semitones > 0 ? '+' : ''}${snap.semitones}→0st` : ''}${wordplayMatch ? ` · Wordplay "${wordplayMatch.word}"` : ''}${
       typeof doubleDropCueSec === 'number' ? ' · Double-Drop Aligned' : ''
     }${vocalCarryoverBars > 0 ? ` · +${vocalCarryoverBars}b Vocal Carry` : ''}${
       vipSkipEdit ? ` · -${vipSkipEdit.barsSkipped}b VIP Skip` : ''
@@ -3305,4 +3793,52 @@ export function buildOfflineRemixBlueprint(params: {
       : 'vocal-ride',
     detail: `${ph.barStart + 1}–${ph.barEnd}`,
   }));
+}
+
+export function detectBestChopCueSec(track: CandidateTrackInput, waveform?: WaveformBandSample[]): number {
+  const dur = Math.max(10, track.durationSec || 180);
+  if (track.lyricCues?.hookPhrases?.length) {
+    const midHook = track.lyricCues.hookPhrases.find((h) => h.startSec >= 6 && h.startSec <= dur - 6);
+    if (midHook) return midHook.startSec;
+  }
+  const wf = waveform || track.waveform;
+  if (wf && wf.length >= 24) {
+    const lo = Math.floor(wf.length * 0.22);
+    const hi = Math.floor(wf.length * 0.68);
+    let bestIdx = lo;
+    let bestVal = -1;
+    for (let i = lo; i < hi; i++) {
+      const score = wf[i].mid * 1.4 - wf[i].low * 0.35;
+      if (score > bestVal) {
+        bestVal = score;
+        bestIdx = i;
+      }
+    }
+    return Math.round(((bestIdx / wf.length) * dur) * 100) / 100;
+  }
+  return Math.round((track.dropCueSec ?? track.detectedDropSec ?? dur * 0.32) * 100) / 100;
+}
+
+export function computeFrequencyClashReport(params: {
+  wfA: WaveformBandSample[];
+  wfB: WaveformBandSample[];
+  timeA: number;
+  durA: number;
+  timeB: number;
+  durB: number;
+  carveActive?: boolean;
+}): FrequencyClashReport {
+  const { wfA, wfB, timeA, durA, timeB, durB, carveActive = false } = params;
+  if (!wfA.length || !wfB.length || durA <= 1 || durB <= 1) {
+    return { bassClash: 0, midClash: 0, carveActive, summary: 'No overlap' };
+  }
+  const pctA = Math.max(0, Math.min(0.95, timeA / durA));
+  const pctB = Math.max(0, Math.min(0.95, timeB / durB));
+  const profile = analyzeOverlapClash(wfA, wfB, pctA, pctB, 0.08);
+  return {
+    bassClash: profile.bassClash,
+    midClash: profile.midClash,
+    carveActive,
+    summary: profile.summary,
+  };
 }

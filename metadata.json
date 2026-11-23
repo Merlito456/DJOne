@@ -1,5 +1,5 @@
 {
-  "name": "Remix Remix DeckForge — Pro DJ Mixer",
+  "name": "Remix Remix Remix DeckForge — Pro DJ Mixer",
   "description": "Low-latency dual-deck DJ mixing console with YouTube source integration, real-time Web Audio effects, visual beat-grid waveforms, auto beat-sync, playlist management, and local set recording.",
   "requestFramePermissions": [
     "microphone"

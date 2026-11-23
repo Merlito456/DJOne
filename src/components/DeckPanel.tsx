@@ -10,7 +10,15 @@ import {
   Repeat,
   Lock,
 } from 'lucide-react';
-import { DeckFxState, DeckId, DeckState, FxType } from '../types/dj';
+import {
+  BootlegFlipPreset,
+  CleanEditMaskMode,
+  DeckFxState,
+  DeckId,
+  DeckState,
+  FxType,
+  StutterSubdiv,
+} from '../types/dj';
 import { JogWheel } from './JogWheel';
 import { RotaryKnob } from './RotaryKnob';
 
@@ -36,6 +44,16 @@ interface DeckPanelProps {
   onMarkDropCue?: () => void;
   onCycleMusicalKey?: () => void;
   onCycleStemMode?: () => void;
+  onCycleBootlegFlip?: () => void;
+  onTriggerStutterRoll?: (subdiv: StutterSubdiv) => void;
+  onTriggerTonePlay?: (semitoneOffset: number) => void;
+  onScanWhisperCues?: () => void;
+  scanningCues?: boolean;
+  onToggleSubSwap?: () => void;
+  onTriggerPitchRoll?: (mode: 'escalate-roll' | 'poly-3-8' | 'poly-3-16') => void;
+  onTriggerEchoFreeze?: () => void;
+  onCycleCleanEditMask?: () => void;
+  onTriggerChopSolo?: () => void;
   compactMobileSection?: 'all' | 'transport' | 'fx';
   allowYoutubeMount?: boolean;
 }
@@ -70,6 +88,16 @@ export const DeckPanel: React.FC<DeckPanelProps> = ({
   onMarkDropCue,
   onCycleMusicalKey,
   onCycleStemMode,
+  onCycleBootlegFlip,
+  onTriggerStutterRoll,
+  onTriggerTonePlay,
+  onScanWhisperCues,
+  scanningCues = false,
+  onToggleSubSwap,
+  onTriggerPitchRoll,
+  onTriggerEchoFreeze,
+  onCycleCleanEditMask,
+  onTriggerChopSolo,
   compactMobileSection = 'all',
   allowYoutubeMount = false,
 }) => {
@@ -80,6 +108,7 @@ export const DeckPanel: React.FC<DeckPanelProps> = ({
   const accentBg = isDeckA ? 'bg-cyan-500' : 'bg-orange-500';
 
   const [liveTime, setLiveTime] = useState(deck.currentTime);
+  const [showTonePlay, setShowTonePlay] = useState(false);
   const tapTimesRef = useRef<number[]>([]);
   const overviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -569,123 +598,341 @@ export const DeckPanel: React.FC<DeckPanelProps> = ({
         </div>
       )}
 
-      {/* Real-Time FX Rack (16 Studio DSP Effects) */}
+      {/* Real-Time FX Rack (16 Studio DSP Effects + Live Remix Tools) */}
       {showFx && (
-        <div className="bg-[#0D1016] border border-white/[0.06] rounded-lg px-2.5 py-2 flex items-center justify-between gap-2">
-          <div className="flex flex-col gap-1 min-w-0 flex-1">
-            <div className="flex items-start gap-1">
-              <Sparkles className={`w-3 h-3 mt-1 shrink-0 ${deck.fx.enabled ? accentText : 'text-slate-500'}`} />
-              <div className="grid grid-cols-4 sm:grid-cols-8 gap-0.5 flex-1">
-                {(
-                  [
-                    { id: 'echo', label: 'Echo' },
-                    { id: 'reverb', label: 'Verb' },
-                    { id: 'flanger', label: 'Flng' },
-                    { id: 'phaser', label: 'Phas' },
-                    { id: 'chorus', label: 'Chor' },
-                    { id: 'tremolo', label: 'Gate' },
-                    { id: 'bitcrush', label: 'Crsh' },
-                    { id: 'drive', label: 'Driv' },
-                    { id: 'ringmod', label: 'Ring' },
-                    { id: 'autopan', label: 'Pan' },
-                    { id: 'comb', label: 'Comb' },
-                    { id: 'stutter', label: 'Stut' },
-                    { id: 'subharm', label: 'Sub+' },
-                    { id: 'shimmer', label: 'Shim' },
-                    { id: 'lofi', label: 'LoFi' },
-                    { id: 'dubdelay', label: 'Dub' },
-                  ] as { id: FxType; label: string }[]
-                ).map((fxItem) => (
-                  <button
-                    key={fxItem.id}
-                    type="button"
-                    onClick={() => onFxChange({ type: fxItem.id })}
-                    className={`px-1 py-0.5 rounded text-[9px] font-medium transition-colors truncate ${
-                      deck.fx.type === fxItem.id
-                        ? 'bg-white/15 text-white'
-                        : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.04]'
-                    }`}
-                  >
-                    {fxItem.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => onFxChange({ enabled: !deck.fx.enabled })}
-                disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
-                className={`h-6 px-2 rounded text-[10px] font-semibold border transition-colors disabled:opacity-40 ${
-                  deck.fx.enabled
-                    ? `${accentBg} text-[#090B0F] border-transparent`
-                    : 'bg-[#171C26] border-white/10 text-slate-300 hover:text-white'
-                }`}
-              >
-                {deck.fx.enabled ? 'FX ON' : 'FX OFF'}
-              </button>
-
-              <div className="flex items-center gap-0.5">
-                {[0.25, 0.5, 0.75, 1].map((div) => (
-                  <button
-                    key={div}
-                    type="button"
-                    onClick={() => onFxChange({ beatDiv: div })}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono border transition-colors ${
-                      deck.fx.beatDiv === div
-                        ? `${accentBorder} ${accentText} bg-white/5`
-                        : 'border-white/[0.06] text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    {div === 0.25 ? '1/4' : div === 0.5 ? '1/2' : div === 0.75 ? '3/4' : '1/1'}
-                  </button>
-                ))}
+        <div className="bg-[#0D1016] border border-white/[0.06] rounded-lg px-2.5 py-2 flex flex-col gap-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-col gap-1 min-w-0 flex-1">
+              <div className="flex items-start gap-1">
+                <Sparkles className={`w-3 h-3 mt-1 shrink-0 ${deck.fx.enabled ? accentText : 'text-slate-500'}`} />
+                <div className="grid grid-cols-4 sm:grid-cols-8 gap-0.5 flex-1">
+                  {(
+                    [
+                      { id: 'echo', label: 'Echo' },
+                      { id: 'reverb', label: 'Verb' },
+                      { id: 'flanger', label: 'Flng' },
+                      { id: 'phaser', label: 'Phas' },
+                      { id: 'chorus', label: 'Chor' },
+                      { id: 'tremolo', label: 'Gate' },
+                      { id: 'bitcrush', label: 'Crsh' },
+                      { id: 'drive', label: 'Driv' },
+                      { id: 'ringmod', label: 'Ring' },
+                      { id: 'autopan', label: 'Pan' },
+                      { id: 'comb', label: 'Comb' },
+                      { id: 'stutter', label: 'Stut' },
+                      { id: 'subharm', label: 'Sub+' },
+                      { id: 'shimmer', label: 'Shim' },
+                      { id: 'lofi', label: 'LoFi' },
+                      { id: 'dubdelay', label: 'Dub' },
+                    ] as { id: FxType; label: string }[]
+                  ).map((fxItem) => (
+                    <button
+                      key={fxItem.id}
+                      type="button"
+                      onClick={() => onFxChange({ type: fxItem.id })}
+                      className={`px-1 py-0.5 rounded text-[9px] font-medium transition-colors truncate ${
+                        deck.fx.type === fxItem.id
+                          ? 'bg-white/15 text-white'
+                          : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.04]'
+                      }`}
+                    >
+                      {fxItem.label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
-              {onCycleStemMode && (
+              <div className="flex items-center gap-1.5 flex-wrap">
                 <button
                   type="button"
-                  onClick={onCycleStemMode}
+                  onClick={() => onFxChange({ enabled: !deck.fx.enabled })}
                   disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
-                  className={`h-6 px-2 rounded text-[10px] font-semibold border transition-colors whitespace-nowrap shrink-0 disabled:opacity-40 ${
-                    deck.stemMode === 'vocal-focus'
-                      ? 'bg-purple-500/25 border-purple-400/60 text-purple-200'
-                      : deck.stemMode === 'instrumental'
-                      ? 'bg-cyan-500/25 border-cyan-400/60 text-cyan-200'
-                      : deck.stemMode === 'drums-only'
-                      ? 'bg-amber-500/25 border-amber-400/60 text-amber-200'
+                  className={`h-6 px-2 rounded text-[10px] font-semibold border transition-colors disabled:opacity-40 ${
+                    deck.fx.enabled
+                      ? `${accentBg} text-[#090B0F] border-transparent`
                       : 'bg-[#171C26] border-white/10 text-slate-300 hover:text-white'
                   }`}
-                  title={
-                    deck.playbackMode === 'youtube-iframe'
-                      ? '3-Stem HPSS / Mid-Side Isolator requires Web Audio decoded audio'
-                      : 'Cycle 3-Stem Isolator (Off -> Vocal Focus -> Instrumental -> Drums Only)'
-                  }
                 >
-                  {deck.stemMode === 'vocal-focus'
-                    ? 'Stem: Voc'
-                    : deck.stemMode === 'instrumental'
-                    ? 'Stem: Inst'
-                    : deck.stemMode === 'drums-only'
-                    ? 'Stem: Drums'
-                    : 'Stem: Off'}
+                  {deck.fx.enabled ? 'FX ON' : 'FX OFF'}
                 </button>
-              )}
+
+                <div className="flex items-center gap-0.5">
+                  {[0.25, 0.5, 0.75, 1].map((div) => (
+                    <button
+                      key={div}
+                      type="button"
+                      onClick={() => onFxChange({ beatDiv: div })}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                        deck.fx.beatDiv === div
+                          ? `${accentBorder} ${accentText} bg-white/5`
+                          : 'border-white/[0.06] text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {div === 0.25 ? '1/4' : div === 0.5 ? '1/2' : div === 0.75 ? '3/4' : '1/1'}
+                    </button>
+                  ))}
+                </div>
+
+                {onCycleStemMode && (
+                  <button
+                    type="button"
+                    onClick={onCycleStemMode}
+                    disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                    className={`h-6 px-2 rounded text-[10px] font-semibold border transition-colors whitespace-nowrap shrink-0 disabled:opacity-40 ${
+                      deck.stemMode === 'vocal-focus'
+                        ? 'bg-purple-500/25 border-purple-400/60 text-purple-200'
+                        : deck.stemMode === 'instrumental'
+                        ? 'bg-cyan-500/25 border-cyan-400/60 text-cyan-200'
+                        : deck.stemMode === 'drums-only'
+                        ? 'bg-amber-500/25 border-amber-400/60 text-amber-200'
+                        : 'bg-[#171C26] border-white/10 text-slate-300 hover:text-white'
+                    }`}
+                    title={
+                      deck.playbackMode === 'youtube-iframe'
+                        ? '3-Stem HPSS / Mid-Side Isolator requires Web Audio decoded audio'
+                        : 'Cycle 3-Stem Isolator (Off -> Vocal Focus -> Instrumental -> Drums Only)'
+                    }
+                  >
+                    {deck.stemMode === 'vocal-focus'
+                      ? 'Stem: Voc'
+                      : deck.stemMode === 'instrumental'
+                      ? 'Stem: Inst'
+                      : deck.stemMode === 'drums-only'
+                      ? 'Stem: Drums'
+                      : 'Stem: Off'}
+                  </button>
+                )}
+              </div>
             </div>
+
+            <RotaryKnob
+              label="Wet"
+              value={deck.fx.wet}
+              min={0}
+              max={1}
+              defaultValue={0.35}
+              accentColor={accentHex}
+              size={36}
+              disabled={deck.playbackMode === 'youtube-iframe'}
+              onChange={(wet) => onFxChange({ wet })}
+            />
           </div>
 
-          <RotaryKnob
-            label="Wet"
-            value={deck.fx.wet}
-            min={0}
-            max={1}
-            defaultValue={0.35}
-            accentColor={accentHex}
-            size={36}
-            disabled={deck.playbackMode === 'youtube-iframe'}
-            onChange={(wet) => onFxChange({ wet })}
-          />
+          {/* Bootleg Flip, Stutter Slicer, Pitch Roll, Sub Swap, Echo Freeze & Clean Edit Bar */}
+          {(onCycleBootlegFlip ||
+            onTriggerStutterRoll ||
+            onTriggerTonePlay ||
+            onScanWhisperCues ||
+            onToggleSubSwap ||
+            onTriggerPitchRoll ||
+            onTriggerEchoFreeze ||
+            onCycleCleanEditMask ||
+            onTriggerChopSolo) && (
+            <div className="flex flex-col gap-1 pt-1 border-t border-white/[0.05]">
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <div className="flex items-center gap-1 flex-wrap">
+                  {onCycleBootlegFlip && (
+                    <button
+                      type="button"
+                      onClick={onCycleBootlegFlip}
+                      disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                      className={`h-6 px-2 rounded text-[10px] font-semibold border transition-colors whitespace-nowrap disabled:opacity-40 ${
+                        deck.bootlegFlip && deck.bootlegFlip !== 'off'
+                          ? 'bg-emerald-500/20 border-emerald-400/55 text-emerald-200'
+                          : 'bg-[#171C26] border-white/10 text-slate-300 hover:text-white'
+                      }`}
+                      title="Cycle Live Genre Bootleg Flip (Off -> Jersey Club -> Amapiano -> Phonk -> Slowed+Verb -> Nightcore)"
+                    >
+                      {
+                        (
+                          {
+                            off: 'Flip: Off',
+                            'jersey-club': 'Flip: Jersey',
+                            amapiano: 'Flip: Amapiano',
+                            phonk: 'Flip: Phonk',
+                            'slowed-reverb': 'Flip: Slowed',
+                            nightcore: 'Flip: Nightcore',
+                          } as Record<BootlegFlipPreset, string>
+                        )[deck.bootlegFlip || 'off']
+                      }
+                    </button>
+                  )}
+
+                  {onTriggerStutterRoll && (
+                    <div className="flex items-center gap-0.5" title="16-Step Quantized Rhythmic Stutter Roll">
+                      <span className="text-[9px] font-mono text-slate-500 mr-0.5">ROLL</span>
+                      {(['1/4', '1/8', '1/16', '1/32'] as StutterSubdiv[]).map((sub) => (
+                        <button
+                          key={sub}
+                          type="button"
+                          onClick={() => onTriggerStutterRoll(sub)}
+                          disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                          className="h-6 px-1.5 rounded bg-[#171C26] hover:bg-cyan-500/20 hover:text-cyan-200 border border-white/10 text-[9.5px] font-mono text-slate-300 transition-colors disabled:opacity-40"
+                        >
+                          {sub}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-1">
+                  {onTriggerTonePlay && (
+                    <button
+                      type="button"
+                      onClick={() => setShowTonePlay((s) => !s)}
+                      disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                      className={`h-6 px-2 rounded text-[10px] font-semibold border transition-colors disabled:opacity-40 ${
+                        showTonePlay
+                          ? 'bg-purple-500/25 border-purple-400/60 text-purple-200'
+                          : 'bg-[#171C26] border-white/10 text-slate-300 hover:text-white'
+                      }`}
+                      title="Toggle in-key Camelot Tone-Play sampler pads"
+                    >
+                      Tone
+                    </button>
+                  )}
+                  {onScanWhisperCues && (
+                    <button
+                      type="button"
+                      onClick={onScanWhisperCues}
+                      disabled={!deck.track || scanningCues}
+                      className={`h-6 px-2 rounded text-[10px] font-semibold border transition-colors whitespace-nowrap disabled:opacity-40 ${
+                        deck.track?.lyricCues?.words?.length
+                          ? 'bg-cyan-500/15 border-cyan-500/45 text-cyan-200'
+                          : 'bg-[#171C26] border-white/10 text-slate-300 hover:text-white'
+                      }`}
+                      title="Scan audio with Groq Whisper to detect wordplay anchors, explicit words, anti-vocal-clash windows & map chorus hooks to Hot Cues 1-4"
+                    >
+                      {scanningCues
+                        ? 'Scanning...'
+                        : deck.track?.lyricCues?.words?.length
+                        ? 'Lyrics ✓'
+                        : 'Scan Lyrics'}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Studio DSP Performance Strip: 808 Sub Swap, Pitch Escalate Roll, Poly Repeat, Echo Freeze, Clean Mask & Chop Solo */}
+              <div className="flex flex-wrap items-center gap-1">
+                {onToggleSubSwap && (
+                  <button
+                    type="button"
+                    onClick={onToggleSubSwap}
+                    disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                    className={`h-5 px-1.5 rounded text-[9.5px] font-semibold border transition-colors disabled:opacity-40 ${
+                      deck.subSwapEnabled
+                        ? 'bg-amber-500/25 border-amber-400/60 text-amber-200'
+                        : 'bg-[#131720] border-white/10 text-slate-300 hover:text-white'
+                    }`}
+                    title={`In-Key 808 Sub-Bass Re-Synthesizer (${deck.track?.musicalKey || '8A'}) — HPF 85Hz + phase-locked pure sub`}
+                  >
+                    808 Sub
+                  </button>
+                )}
+
+                {onTriggerPitchRoll && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => onTriggerPitchRoll('escalate-roll')}
+                      disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                      className="h-5 px-1.5 rounded bg-[#131720] hover:bg-cyan-500/20 hover:text-cyan-200 border border-white/10 text-[9.5px] font-mono text-slate-300 transition-colors disabled:opacity-40"
+                      title="Pitch-Escalating Loop Roll (1 → 1/2 → 1/4 → 1/8 → 1/16 rising +1st per step)"
+                    >
+                      Roll↑
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onTriggerPitchRoll('poly-3-8')}
+                      disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                      className="h-5 px-1.5 rounded bg-[#131720] hover:bg-cyan-500/20 hover:text-cyan-200 border border-white/10 text-[9.5px] font-mono text-slate-300 transition-colors disabled:opacity-40"
+                      title="Dotted 3/8 Polyrhythmic Beat-Repeat"
+                    >
+                      3/8
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onTriggerPitchRoll('poly-3-16')}
+                      disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                      className="h-5 px-1.5 rounded bg-[#131720] hover:bg-cyan-500/20 hover:text-cyan-200 border border-white/10 text-[9.5px] font-mono text-slate-300 transition-colors disabled:opacity-40"
+                      title="Dotted 3/16 Polyrhythmic Beat-Repeat"
+                    >
+                      3/16
+                    </button>
+                  </>
+                )}
+
+                {onTriggerEchoFreeze && (
+                  <button
+                    type="button"
+                    onClick={onTriggerEchoFreeze}
+                    disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                    className="h-5 px-1.5 rounded bg-[#131720] hover:bg-purple-500/25 hover:text-purple-200 border border-white/10 text-[9.5px] font-semibold text-slate-300 transition-colors disabled:opacity-40"
+                    title="Vocal-Hook Echo Freeze: capture vocal phrase into tempo ping-pong delay tail & free deck"
+                  >
+                    Vox Freeze
+                  </button>
+                )}
+
+                {onTriggerChopSolo && (
+                  <button
+                    type="button"
+                    onClick={onTriggerChopSolo}
+                    disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                    className="h-5 px-1.5 rounded bg-[#131720] hover:bg-emerald-500/25 hover:text-emerald-200 border border-white/10 text-[9.5px] font-semibold text-slate-300 transition-colors disabled:opacity-40"
+                    title="Fred again..-Style Auto Vocal-Chop Solo: slices clean lyric phrase across Camelot pentatonic notes"
+                  >
+                    Chop Solo
+                  </button>
+                )}
+
+                {onCycleCleanEditMask && (
+                  <button
+                    type="button"
+                    onClick={onCycleCleanEditMask}
+                    disabled={!deck.track}
+                    className={`h-5 px-1.5 rounded text-[9.5px] font-semibold border transition-colors disabled:opacity-40 ${
+                      deck.cleanEditMask && deck.cleanEditMask !== 'off'
+                        ? 'bg-emerald-500/20 border-emerald-400/55 text-emerald-200'
+                        : 'bg-[#131720] border-white/10 text-slate-400 hover:text-white'
+                    }`}
+                    title="Whisper Clean / Radio Edit Masking (Off -> Mute -> Vinyl Reverse -> Scratch Chirp)"
+                  >
+                    {
+                      (
+                        {
+                          off: 'Clean: Off',
+                          mute: 'Clean: Mute',
+                          reverse: 'Clean: Rev',
+                          chirp: 'Clean: Chirp',
+                        } as Record<CleanEditMaskMode, string>
+                      )[deck.cleanEditMask || 'off']
+                    }
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Chromatic In-Key Tone-Play Pad Strip */}
+          {showTonePlay && onTriggerTonePlay && (
+            <div className="grid grid-cols-8 gap-1 pt-1 border-t border-white/[0.05]">
+              {[0, 2, 3, 5, 7, 8, 10, 12].map((semitone, idx) => (
+                <button
+                  key={semitone}
+                  type="button"
+                  onClick={() => onTriggerTonePlay(semitone)}
+                  disabled={!deck.track || deck.playbackMode === 'youtube-iframe'}
+                  className="h-6 rounded bg-purple-500/15 hover:bg-purple-500/35 active:scale-95 border border-purple-400/35 text-[10px] font-mono font-semibold text-purple-100 transition-all disabled:opacity-40"
+                  title={`Play scale degree ${idx + 1} (+${semitone} semitones in ${deck.track?.musicalKey || 'key'})`}
+                >
+                  {idx + 1}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </section>

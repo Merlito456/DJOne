@@ -749,6 +749,8 @@ export function findSparsestMashupPocket(params: {
   inDurationSec?: number;
   minOutPct?: number;
   maxOutPct?: number;
+  minInPct?: number;
+  maxInPct?: number;
   preferredBars?: number;
 }): {
   outStartPct: number;
@@ -766,11 +768,15 @@ export function findSparsestMashupPocket(params: {
     inDurationSec = 180,
     minOutPct = 0.34,
     maxOutPct = 0.72,
+    minInPct = 0.02,
+    maxInPct = 0.34,
     preferredBars = 8,
   } = params;
 
+  const safeMinIn = Math.max(0.0, Math.min(0.62, minInPct));
+  const safeMaxIn = Math.max(safeMinIn + 0.04, Math.min(0.68, maxInPct));
   const fallbackOutPct = Math.max(minOutPct, Math.min(maxOutPct, 0.52));
-  const fallbackInPct = 0.08;
+  const fallbackInPct = Math.max(safeMinIn, Math.min(safeMaxIn, 0.08));
   const clampedFallbackBars: 4 | 8 | 12 | 16 =
     preferredBars <= 4 ? 4 : preferredBars <= 8 ? 8 : preferredBars <= 12 ? 12 : 16;
 
@@ -797,8 +803,8 @@ export function findSparsestMashupPocket(params: {
   let bestInPct = fallbackInPct;
   let bestBars: 4 | 8 | 12 | 16 = clampedFallbackBars;
 
-  const safeMinOut = Math.max(0.28, Math.min(0.75, minOutPct));
-  const safeMaxOut = Math.max(safeMinOut + 0.04, Math.min(0.84, maxOutPct));
+  const safeMinOut = Math.max(0.28, Math.min(0.82, minOutPct));
+  const safeMaxOut = Math.max(safeMinOut + 0.04, Math.min(0.86, maxOutPct));
 
   for (const bars of candidateBarCounts) {
     const outOverlapPct = Math.min(0.24, Math.max(0.06, (bars * outBarSec) / outDur));
@@ -806,8 +812,8 @@ export function findSparsestMashupPocket(params: {
 
     for (let oPct = safeMinOut; oPct <= safeMaxOut; oPct += 0.04) {
       if (oPct + outOverlapPct > 0.94) continue;
-      for (let iPct = 0.02; iPct <= 0.34; iPct += 0.03) {
-        if (iPct + inOverlapPct > 0.55) continue;
+      for (let iPct = safeMinIn; iPct <= safeMaxIn; iPct += 0.03) {
+        if (iPct + inOverlapPct > 0.85) continue;
 
         let bassOverlap = 0;
         let midOverlap = 0;
@@ -857,8 +863,8 @@ export function findSparsestMashupPocket(params: {
     Math.min(safeMaxOut, Math.round(((outBars * outBarSec) / outDur) * 1000) / 1000)
   );
   const qInPct = Math.max(
-    0.02,
-    Math.min(0.32, Math.round(((inBars * inBarSec) / inDur) * 1000) / 1000)
+    safeMinIn,
+    Math.min(safeMaxIn, Math.round(((inBars * inBarSec) / inDur) * 1000) / 1000)
   );
   const qOverlapPct = Math.min(0.22, Math.max(0.08, (bestBars * outBarSec) / outDur));
   const clashProfile = analyzeOverlapClash(wfOut, wfIn, qOutPct, qInPct, qOverlapPct);

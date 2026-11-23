@@ -1,5 +1,13 @@
-import { DjVoiceDropId, GrooveBridgePattern, SoundTrickType } from '../types/dj';
+import {
+  BootlegFlipPreset,
+  DjVoiceDropId,
+  GrooveBridgePattern,
+  HarmonicSynthLayerMode,
+  SoundTrickType,
+} from '../types/dj';
 import { camelotToHarmony } from './aiMemory';
+
+export { camelotToHarmony };
 
 export function makeSynthSaturationCurve(amount = 40): Float32Array<ArrayBuffer> {
   const nSamples = 2048;
@@ -2222,4 +2230,727 @@ export function scheduleReharmonizerWindowSynth(params: {
       sub.stop(hitAt + dur + 0.02);
     }
   }
+}
+
+/**
+ * Genre "Bootleg Flip" Step Synthesizer (Jersey Club, Amapiano Log-Drum, Phonk 808 Cowbell)
+ * Tuned strictly to the track's Camelot root & synchronized to the 16th-note beat grid.
+ */
+export function scheduleBootlegFlipStepSynth(params: {
+  ctx: BaseAudioContext;
+  dest: AudioNode;
+  noiseBuf: AudioBuffer;
+  stepIdx: number;
+  barIdx: number;
+  atTime: number;
+  preset: BootlegFlipPreset;
+  bpm: number;
+  musicalKey?: string;
+  pitchRate?: number;
+}): void {
+  const {
+    ctx,
+    dest,
+    noiseBuf,
+    stepIdx,
+    barIdx,
+    atTime: time,
+    preset,
+    bpm,
+    musicalKey = '8A',
+    pitchRate = 1,
+  } = params;
+  if (preset === 'off' || preset === 'slowed-reverb' || preset === 'nightcore') return;
+
+  const step16 = ((stepIdx % 16) + 16) % 16;
+  const safeBar = ((barIdx % 4) + 4) % 4;
+  const harmony = camelotToHarmony(musicalKey, pitchRate);
+  const rootSub = Math.max(41, Math.min(78, harmony.rootHz * 0.25));
+  const beatSec = 60 / Math.max(65, bpm);
+  const prog = harmony.isMinor ? [0, -4, -9, -2] : [0, -5, -3, -7];
+  const barMult = Math.pow(2, prog[safeBar] / 12);
+
+  const playTightKick = (gainAmt: number, startHz = 152, endHz = 46, decay = 0.14) => {
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(startHz, time);
+    osc.frequency.exponentialRampToValueAtTime(endHz, time + 0.065);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(gainAmt, time);
+    g.gain.exponentialRampToValueAtTime(0.001, time + decay);
+    osc.connect(g);
+    g.connect(dest);
+    osc.start(time);
+    osc.stop(time + decay + 0.02);
+  };
+
+  const playBedSqueak = (accent = false) => {
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    const base = accent ? 880 : 760;
+    osc.frequency.setValueAtTime(base, time);
+    osc.frequency.exponentialRampToValueAtTime(base * 1.48, time + 0.065);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1450, time);
+    bp.Q.value = 3.2;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, time);
+    g.gain.linearRampToValueAtTime(accent ? 0.15 : 0.11, time + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.001, time + 0.09);
+    osc.connect(bp);
+    bp.connect(g);
+    g.connect(dest);
+    osc.start(time);
+    osc.stop(time + 0.1);
+  };
+
+  const playCrispHat = (gainAmt: number, decay = 0.045, hpHz = 6600) => {
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.setValueAtTime(hpHz, time);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(gainAmt, time);
+    g.gain.exponentialRampToValueAtTime(0.001, time + decay);
+    src.connect(hp);
+    hp.connect(g);
+    g.connect(dest);
+    src.start(time);
+    src.stop(time + decay + 0.02);
+  };
+
+  if (preset === 'jersey-club') {
+    // Classic Jersey Club 5-hit triplet kick pattern: steps 0, 3, 6, 8, 12 (with turnaround bounce)
+    if (step16 === 0 || step16 === 3 || step16 === 6 || step16 === 8 || step16 === 12) {
+      playTightKick(step16 === 0 || step16 === 8 ? 0.36 : 0.3, 165, 48, 0.125);
+    }
+    // Signature bed-squeak / vocal chop chirp on off-beats
+    if (step16 === 10 || (safeBar % 2 === 1 && step16 === 14)) {
+      playBedSqueak(step16 === 14);
+    }
+    if (step16 % 2 === 0) {
+      playCrispHat(step16 % 4 === 2 ? 0.095 : 0.045, 0.04, 7200);
+    }
+    if (step16 === 4 || step16 === 12) {
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(2100, time);
+      bp.Q.value = 1.6;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.14, time);
+      g.gain.exponentialRampToValueAtTime(0.001, time + 0.09);
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(dest);
+      src.start(time);
+      src.stop(time + 0.1);
+    }
+    return;
+  }
+
+  if (preset === 'amapiano') {
+    // Warm Afro/Amapiano Shaker 16ths + Signature In-Key Log-Drum Bassline
+    playCrispHat(step16 % 4 === 2 ? 0.095 : step16 % 2 === 0 ? 0.06 : 0.032, 0.038, 4900);
+    if (step16 === 0 || step16 === 8) {
+      playTightKick(0.24, 118, 45, 0.13);
+    }
+    const logSteps = safeBar % 2 === 0 ? [0, 3, 6, 10, 14] : [0, 3, 7, 10, 12, 15];
+    if (logSteps.includes(step16)) {
+      const intervals = harmony.isMinor ? [1, 1.189, 1.335, 1.498] : [1, 1.26, 1.498, 1.682];
+      const noteFreq = rootSub * barMult * intervals[step16 % intervals.length];
+      const dur = beatSec * 0.42;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(noteFreq * 2.25, time);
+      osc.frequency.exponentialRampToValueAtTime(noteFreq, time + 0.042);
+
+      const clickOsc = ctx.createOscillator();
+      clickOsc.type = 'sine';
+      clickOsc.frequency.setValueAtTime(noteFreq * 4.5, time);
+      clickOsc.frequency.exponentialRampToValueAtTime(noteFreq * 2, time + 0.025);
+
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(420, time);
+      lp.Q.value = 3.2;
+
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, time);
+      g.gain.linearRampToValueAtTime(0.32, time + 0.007);
+      g.gain.exponentialRampToValueAtTime(0.001, time + dur);
+
+      osc.connect(lp);
+      clickOsc.connect(lp);
+      lp.connect(g);
+      g.connect(dest);
+      osc.start(time);
+      clickOsc.start(time);
+      osc.stop(time + dur + 0.02);
+      clickOsc.stop(time + 0.05);
+    }
+    return;
+  }
+
+  if (preset === 'phonk') {
+    // Distorted 808 Sub + Tuned Camelot Memphis Cowbell Melody
+    if (step16 === 0 || step16 === 6 || step16 === 10) {
+      const subOsc = ctx.createOscillator();
+      subOsc.type = 'sine';
+      const subHz = rootSub * barMult * (step16 === 10 ? 1.335 : 1);
+      subOsc.frequency.setValueAtTime(subHz * 1.9, time);
+      subOsc.frequency.exponentialRampToValueAtTime(subHz, time + 0.032);
+      const shaper = ctx.createWaveShaper();
+      shaper.curve = makeSynthSaturationCurve(48);
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.setValueAtTime(280, time);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.3, time);
+      g.gain.exponentialRampToValueAtTime(0.001, time + beatSec * 0.72);
+      subOsc.connect(shaper);
+      shaper.connect(lp);
+      lp.connect(g);
+      g.connect(dest);
+      subOsc.start(time);
+      subOsc.stop(time + beatSec * 0.75);
+    }
+    if (step16 === 8) {
+      playBedSqueak(false);
+    }
+    if (step16 % 2 === 0 || step16 === 13 || step16 === 15) {
+      playCrispHat(0.07, 0.035, 7000);
+    }
+    // Tuned metallic 808 cowbell melody locked to Camelot minor/major scale
+    const cowbellSteps = [0, 2, 4, 7, 8, 11, 14];
+    if (cowbellSteps.includes(step16)) {
+      const scaleMult = [1, 1.189, 1.335, 1.498, 1.189, 1.587, 1.498][
+        cowbellSteps.indexOf(step16) % 7
+      ];
+      const baseFreq = Math.max(380, Math.min(1150, harmony.rootHz * 1.5 * barMult * scaleMult));
+      const o1 = ctx.createOscillator();
+      const o2 = ctx.createOscillator();
+      o1.type = 'square';
+      o2.type = 'square';
+      o1.frequency.setValueAtTime(baseFreq, time);
+      o2.frequency.setValueAtTime(baseFreq * 1.487, time);
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(baseFreq * 1.35, time);
+      bp.Q.value = 2.4;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, time);
+      g.gain.linearRampToValueAtTime(0.11, time + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.001, time + 0.14);
+      o1.connect(bp);
+      o2.connect(bp);
+      bp.connect(g);
+      g.connect(dest);
+      o1.start(time);
+      o2.start(time);
+      o1.stop(time + 0.15);
+      o2.stop(time + 0.15);
+    }
+  }
+}
+
+export function scheduleBootlegFlipWindow(params: {
+  ctx: BaseAudioContext;
+  dest: AudioNode;
+  noiseBuf: AudioBuffer;
+  preset: BootlegFlipPreset;
+  startAt: number;
+  bars: number;
+  bpm: number;
+  musicalKey?: string;
+}): void {
+  const { ctx, dest, noiseBuf, preset, startAt, bars, bpm, musicalKey = '8A' } = params;
+  if (preset === 'off' || preset === 'slowed-reverb' || preset === 'nightcore' || bars <= 0) return;
+  const stepSec = 60 / Math.max(65, bpm) / 4;
+  const totalSteps = Math.max(16, Math.round(bars * 16));
+  for (let s = 0; s < totalSteps; s++) {
+    scheduleBootlegFlipStepSynth({
+      ctx,
+      dest,
+      noiseBuf,
+      stepIdx: s,
+      barIdx: Math.floor(s / 16) % 4,
+      atTime: startAt + s * stepSec,
+      preset,
+      bpm,
+      musicalKey,
+    });
+  }
+}
+
+/**
+ * Auto-Harmonic Synth Layering Step Engine (Supersaw Pad, Acid 303, Sidechain Arp)
+ */
+export function scheduleHarmonicLayerStepSynth(params: {
+  ctx: BaseAudioContext;
+  dest: AudioNode;
+  stepIdx: number;
+  barIdx: number;
+  atTime: number;
+  mode: HarmonicSynthLayerMode;
+  bpm: number;
+  musicalKey?: string;
+  pitchRate?: number;
+  intensity?: number;
+}): void {
+  const {
+    ctx,
+    dest,
+    stepIdx,
+    barIdx,
+    atTime: time,
+    mode,
+    bpm,
+    musicalKey = '8A',
+    pitchRate = 1,
+    intensity = 0.78,
+  } = params;
+  if (mode === 'off') return;
+
+  const step16 = ((stepIdx % 16) + 16) % 16;
+  const safeBar = ((barIdx % 4) + 4) % 4;
+  const harmony = camelotToHarmony(musicalKey, pitchRate);
+  const beatSec = 60 / Math.max(65, bpm);
+  const prog = harmony.isMinor ? [0, -4, -2, -5] : [0, -5, -3, -7];
+  const barMult = Math.pow(2, prog[safeBar] / 12);
+
+  if (mode === 'supersaw-pad') {
+    if (step16 !== 0 && step16 !== 8) return;
+    const dur = beatSec * 1.92;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(1950, time);
+    lp.frequency.exponentialRampToValueAtTime(720, time + dur);
+    lp.Q.value = 1.1;
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.001, time);
+    env.gain.linearRampToValueAtTime(0.055 * intensity, time + beatSec * 0.45);
+    env.gain.exponentialRampToValueAtTime(0.001, time + dur);
+    lp.connect(env);
+    env.connect(dest);
+
+    harmony.chordHz.slice(0, 3).forEach((freq, idx) => {
+      for (const det of [-11, 11]) {
+        const osc = ctx.createOscillator();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(freq * barMult, time);
+        osc.detune.setValueAtTime(det + (idx - 1) * 5, time);
+        osc.connect(lp);
+        osc.start(time);
+        osc.stop(time + dur + 0.02);
+      }
+    });
+    return;
+  }
+
+  if (mode === 'acid-303') {
+    const acidSteps = [0, 2, 3, 6, 8, 10, 11, 14, 15];
+    if (!acidSteps.includes(step16)) return;
+    const accent = step16 === 0 || step16 === 6 || step16 === 14;
+    const oct = step16 === 14 || step16 === 15 ? 1.498 : step16 === 6 ? 1.189 : 1;
+    const freq = Math.max(48, Math.min(210, harmony.rootHz * 0.5 * barMult * oct));
+    const dur = beatSec * (accent ? 0.34 : 0.22);
+
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(freq, time);
+    if (step16 === 14) {
+      osc.frequency.exponentialRampToValueAtTime(freq * 1.25, time + dur * 0.7);
+    }
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.Q.setValueAtTime(accent ? 7.5 : 4.2, time);
+    lp.frequency.setValueAtTime(accent ? 2350 : 920, time);
+    lp.frequency.exponentialRampToValueAtTime(175, time + dur);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, time);
+    g.gain.linearRampToValueAtTime((accent ? 0.16 : 0.11) * intensity, time + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.001, time + dur);
+
+    osc.connect(lp);
+    lp.connect(g);
+    g.connect(dest);
+    osc.start(time);
+    osc.stop(time + dur + 0.02);
+    return;
+  }
+
+  if (mode === 'sidechain-arp') {
+    if (step16 % 2 !== 0 && step16 !== 15) return;
+    const notes = [harmony.chordHz[0], harmony.chordHz[1], harmony.chordHz[2], harmony.chordHz[0] * 2];
+    const freq = notes[(step16 + safeBar) % notes.length] * barMult;
+    // Quarter-note sidechain pump attenuation on downbeats (steps 0, 4, 8, 12)
+    const pumpMult = step16 % 4 === 0 ? 0.35 : step16 % 4 === 2 ? 1.15 : 0.85;
+    const dur = beatSec * 0.34;
+
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(freq, time);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(2900, time);
+    lp.frequency.exponentialRampToValueAtTime(620, time + dur);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, time);
+    g.gain.linearRampToValueAtTime(0.11 * pumpMult * intensity, time + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.001, time + dur);
+
+    osc.connect(lp);
+    lp.connect(g);
+    g.connect(dest);
+    osc.start(time);
+    osc.stop(time + dur + 0.02);
+  }
+}
+
+export function scheduleHarmonicLayerWindow(params: {
+  ctx: BaseAudioContext;
+  dest: AudioNode;
+  mode: HarmonicSynthLayerMode;
+  startAt: number;
+  bars: number;
+  bpm: number;
+  musicalKey?: string;
+  intensity?: number;
+}): void {
+  const { ctx, dest, mode, startAt, bars, bpm, musicalKey = '8A', intensity = 0.78 } = params;
+  if (mode === 'off' || bars <= 0) return;
+  const stepSec = 60 / Math.max(65, bpm) / 4;
+  const totalSteps = Math.max(16, Math.round(bars * 16));
+  for (let s = 0; s < totalSteps; s++) {
+    scheduleHarmonicLayerStepSynth({
+      ctx,
+      dest,
+      stepIdx: s,
+      barIdx: Math.floor(s / 16) % 4,
+      atTime: startAt + s * stepSec,
+      mode,
+      bpm,
+      musicalKey,
+      intensity,
+    });
+  }
+}
+
+/**
+ * Offline/Live Reverse-Reverb Vocal Swell Generator:
+ * Extracts 1..1.5 beats from source/harmonic buffer at cueSec, reverses -> convolver reverb -> reverses again
+ * so lush vocal reverb swells smoothly upward into Beat 1 peak at the very last sample.
+ */
+export async function createReverseReverbSwellBuffer(params: {
+  sourceBuffer: AudioBuffer;
+  cueSec: number;
+  bpm: number;
+  beats?: number;
+}): Promise<AudioBuffer | null> {
+  const { sourceBuffer, cueSec, bpm, beats = 1.5 } = params;
+  if (!sourceBuffer || sourceBuffer.duration < 4) return null;
+
+  const sr = sourceBuffer.sampleRate;
+  const beatSec = 60 / Math.max(60, Math.min(185, bpm || 124));
+  const sliceSec = Math.max(0.35, Math.min(1.4, beatSec * 1.1));
+  const tailSec = Math.max(0.55, Math.min(1.5, beatSec * Math.max(1, beats)));
+  const totalSec = sliceSec + tailSec;
+  const sliceFrames = Math.max(1024, Math.floor(sliceSec * sr));
+  const totalFrames = Math.max(sliceFrames + 1024, Math.floor(totalSec * sr));
+
+  const startSample = Math.max(
+    0,
+    Math.min(Math.max(0, sourceBuffer.length - sliceFrames - 64), Math.floor(cueSec * sr))
+  );
+  const numCh = Math.min(2, sourceBuffer.numberOfChannels);
+
+  const off = new OfflineAudioContext(2, totalFrames, sr);
+  const revSlice = off.createBuffer(2, sliceFrames, sr);
+  for (let ch = 0; ch < 2; ch++) {
+    const src = sourceBuffer.getChannelData(Math.min(ch, numCh - 1));
+    const dst = revSlice.getChannelData(ch);
+    const fadeLen = Math.min(Math.floor(sr * 0.025), Math.floor(sliceFrames * 0.15));
+    for (let i = 0; i < sliceFrames; i++) {
+      let env = 1;
+      if (i < fadeLen) env = i / fadeLen;
+      else if (i > sliceFrames - fadeLen) env = (sliceFrames - i) / fadeLen;
+      // Store reversed dry slice
+      dst[sliceFrames - 1 - i] = src[startSample + i] * env;
+    }
+  }
+
+  const srcNode = off.createBufferSource();
+  srcNode.buffer = revSlice;
+
+  const hp = off.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 260;
+
+  const lp = off.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 4600;
+
+  const conv = off.createConvolver();
+  conv.buffer = createSynthReverbImpulse(off, tailSec * 1.05, 2.2);
+
+  const wetGain = off.createGain();
+  wetGain.gain.value = 1.25;
+
+  srcNode.connect(hp);
+  hp.connect(lp);
+  lp.connect(conv);
+  conv.connect(wetGain);
+  wetGain.connect(off.destination);
+  srcNode.start(0);
+
+  const rendered = await off.startRendering();
+  // Reverse rendered reverb audio so it swells forward into Beat 1 peak!
+  let maxAbs = 0.001;
+  for (let ch = 0; ch < 2; ch++) {
+    const data = rendered.getChannelData(ch);
+    for (let i = 0; i < data.length; i++) {
+      const a = Math.abs(data[i]);
+      if (a > maxAbs) maxAbs = a;
+    }
+  }
+  const norm = Math.min(1.6, 0.72 / maxAbs);
+  const fadeInLen = Math.floor(rendered.length * 0.22);
+  const clickOutLen = Math.min(Math.floor(sr * 0.01), Math.floor(rendered.length * 0.04));
+
+  for (let ch = 0; ch < 2; ch++) {
+    const data = rendered.getChannelData(ch);
+    const copy = new Float32Array(data);
+    for (let i = 0; i < data.length; i++) {
+      let env = 1;
+      if (i < fadeInLen) env = Math.pow(i / fadeInLen, 1.4);
+      else if (i > data.length - clickOutLen) env = (data.length - i) / clickOutLen;
+      data[i] = copy[data.length - 1 - i] * norm * env;
+    }
+  }
+  return rendered;
+}
+
+/**
+ * In-Key 808 Sub-Bass Re-Synthesizer Hit (Sub Swap):
+ * Phase-locked pure sine or triangle sub-bass tuned directly to the deck's Camelot root octave (36..72 Hz).
+ */
+export function scheduleSubBass808Hit(params: {
+  ctx: BaseAudioContext;
+  dest: AudioNode;
+  rootHz: number;
+  mode?: 'sine' | 'triangle';
+  atTime: number;
+  gainAmt?: number;
+  decaySec?: number;
+}): void {
+  const {
+    ctx,
+    dest,
+    rootHz,
+    mode = 'sine',
+    atTime,
+    gainAmt = 0.52,
+    decaySec = 0.28,
+  } = params;
+
+  let subFreq = rootHz;
+  while (subFreq > 72) subFreq *= 0.5;
+  while (subFreq < 36) subFreq *= 2;
+  subFreq = Math.max(36, Math.min(72, subFreq));
+
+  const osc = ctx.createOscillator();
+  osc.type = mode;
+  osc.frequency.setValueAtTime(Math.min(130, subFreq * 2.15), atTime);
+  osc.frequency.exponentialRampToValueAtTime(subFreq, atTime + 0.032);
+
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(mode === 'triangle' ? 145 : 115, atTime);
+  lp.Q.value = 0.8;
+
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.001, atTime);
+  g.gain.linearRampToValueAtTime(gainAmt, atTime + 0.008);
+  g.gain.exponentialRampToValueAtTime(0.001, atTime + Math.max(0.14, Math.min(0.65, decaySec)));
+
+  osc.connect(lp);
+  lp.connect(g);
+  g.connect(dest);
+  osc.start(atTime);
+  osc.stop(atTime + Math.max(0.16, Math.min(0.7, decaySec + 0.02)));
+}
+
+/**
+ * Clean / Radio Edit Mask Audio Burst ('reverse' vinyl spin or 'chirp' scratch cut).
+ */
+export function scheduleCleanEditMaskAudio(params: {
+  ctx: BaseAudioContext;
+  noiseBuf: AudioBuffer;
+  dest: AudioNode;
+  mode: 'reverse' | 'chirp';
+  atTime: number;
+  durSec?: number;
+  bpm?: number;
+}): void {
+  const { ctx, noiseBuf, dest, mode, atTime, durSec = 0.28 } = params;
+  const dur = Math.max(0.14, Math.min(0.65, durSec));
+
+  if (mode === 'reverse') {
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(160, atTime);
+    osc.frequency.exponentialRampToValueAtTime(680, atTime + dur * 0.65);
+    osc.frequency.exponentialRampToValueAtTime(220, atTime + dur);
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(950, atTime);
+    bp.Q.value = 2.4;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, atTime);
+    g.gain.linearRampToValueAtTime(0.24, atTime + dur * 0.25);
+    g.gain.exponentialRampToValueAtTime(0.001, atTime + dur);
+
+    osc.connect(bp);
+    bp.connect(g);
+    g.connect(dest);
+    osc.start(atTime);
+    osc.stop(atTime + dur + 0.02);
+    return;
+  }
+
+  // Sharp DJ scratch chirp
+  for (let k = 0; k < 2; k++) {
+    const t = atTime + k * (dur * 0.48);
+    const hitDur = Math.max(0.06, dur * 0.42);
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(k === 0 ? 1600 : 2400, t);
+    bp.frequency.exponentialRampToValueAtTime(k === 0 ? 2800 : 1200, t + hitDur);
+    bp.Q.value = 3.2;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(0.3, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.001, t + hitDur);
+
+    src.connect(bp);
+    bp.connect(g);
+    g.connect(dest);
+    src.start(t);
+    src.stop(t + hitDur + 0.02);
+  }
+}
+
+/**
+ * "Fred again..-Style" Auto Vocal-Chop Solo Generator:
+ * Schedules an 8-bar quantized Camelot pentatonic melodic chop solo from an isolated vocal grain
+ * paired with a warm sidechained chord pad.
+ */
+export function scheduleVocalChopSoloPhrase(params: {
+  ctx: BaseAudioContext;
+  dest: AudioNode;
+  reverbImpulse: AudioBuffer | null;
+  grainBuffer: AudioBuffer;
+  grainOffsetSec: number;
+  bpm: number;
+  musicalKey: string;
+  semitonesSeq: number[];
+  startAt: number;
+  bars?: number;
+}): void {
+  const {
+    ctx,
+    dest,
+    reverbImpulse,
+    grainBuffer,
+    grainOffsetSec,
+    bpm,
+    musicalKey,
+    semitonesSeq,
+    startAt,
+    bars = 8,
+  } = params;
+
+  if (!grainBuffer || grainBuffer.duration < 0.5) return;
+  const safeBpm = Math.max(65, Math.min(185, bpm || 124));
+  const beatSec = 60 / safeBpm;
+  const step8Sec = beatSec * 0.5;
+  const total8ths = Math.max(16, Math.round(bars * 8));
+  const safeOffset = Math.max(0.1, Math.min(grainBuffer.duration - 0.5, grainOffsetSec));
+  const notes = semitonesSeq.length > 0 ? semitonesSeq : [0, 3, 5, 7, 10, 12, 10, 7];
+
+  // Wet stereo bus for emotional house chord-chop bloom
+  const fxBus = ctx.createGain();
+  fxBus.gain.value = 0.78;
+  const hp = ctx.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 210;
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 4400;
+
+  fxBus.connect(hp);
+  hp.connect(lp);
+  lp.connect(dest);
+
+  if (reverbImpulse) {
+    const verb = ctx.createConvolver();
+    verb.buffer = reverbImpulse;
+    const wet = ctx.createGain();
+    wet.gain.value = 0.34;
+    lp.connect(verb);
+    verb.connect(wet);
+    wet.connect(dest);
+  }
+
+  // Rhythmic pattern inside each bar (8 eighth-notes per bar)
+  const hitPattern = [0, 2, 3, 5, 6];
+  for (let i = 0; i < total8ths; i++) {
+    const posInBar = i % 8;
+    if (!hitPattern.includes(posInBar)) continue;
+    const barIdx = Math.floor(i / 8);
+    const semi = notes[(barIdx * 3 + hitPattern.indexOf(posInBar)) % notes.length];
+    const pitchMult = Math.pow(2, Math.max(-7, Math.min(14, semi)) / 12);
+    const t = startAt + i * step8Sec;
+    const dur = posInBar === 6 ? step8Sec * 1.45 : step8Sec * 0.82;
+
+    const src = ctx.createBufferSource();
+    src.buffer = grainBuffer;
+    src.playbackRate.setValueAtTime(pitchMult, t);
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.001, t);
+    g.gain.linearRampToValueAtTime(posInBar === 0 ? 0.85 : 0.68, t + 0.012);
+    g.gain.setValueAtTime(posInBar === 0 ? 0.8 : 0.62, t + Math.max(0.04, dur - 0.05));
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+
+    src.connect(g);
+    g.connect(fxBus);
+    src.start(t, safeOffset, dur * pitchMult + 0.04);
+  }
+
+  // Pair with subtle sidechained chord bed across bars
+  scheduleHarmonicLayerWindow({
+    ctx,
+    dest,
+    mode: 'supersaw-pad',
+    startAt,
+    bars,
+    bpm: safeBpm,
+    musicalKey,
+    intensity: 0.62,
+  });
 }

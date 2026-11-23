@@ -39,6 +39,7 @@ import {
   Upload,
   Trash2,
   Sliders,
+  CornerDownRight,
 } from 'lucide-react';
 import { ALL_VOICE_IDS, DJ_VOICE_CATEGORIES, DJ_VOICE_LIBRARY } from '../audio/djVoices';
 import { DEFAULT_AI_FEATURE_TOGGLES } from '../audio/offlineAiDj';
@@ -53,7 +54,9 @@ import {
   DjVoiceCategory,
   DjVoiceDropId,
   GrooveBridgePattern,
+  HarmonicSynthLayerMode,
   MashupTemplateId,
+  MicFxState,
   Playlist,
   SoundTrickType,
   VoiceFrequencyMode,
@@ -66,6 +69,13 @@ const BRIDGE_LABELS: Record<GrooveBridgePattern, string> = {
   'sub-808': 'Bridge: 808',
   'afro-perc': 'Bridge: Afro',
   'chord-arp': 'Bridge: Arp',
+};
+
+const HARMONIC_LAYER_LABELS: Record<HarmonicSynthLayerMode, string> = {
+  off: 'Synth: Off',
+  'supersaw-pad': 'Synth: Pad',
+  'acid-303': 'Synth: 303',
+  'sidechain-arp': 'Synth: Arp',
 };
 
 const MASHUP_TEMPLATES: { id: MashupTemplateId; label: string; title: string }[] = [
@@ -119,6 +129,19 @@ interface AiAutopilotPanelProps {
   onToggleFeature: (key: AiFeatureKey) => void;
   onApplyFeaturePreset: (preset: 'all-on' | 'clean-mix') => void;
   onCycleGrooveBridge: () => void;
+  onCycleHarmonicLayer?: () => void;
+  onTriggerSwellDrop?: () => void;
+  onGenerateHostDrop?: (stationName: string, slotId: CustomVoiceSlotId) => Promise<void>;
+  generatingHostDrop?: boolean;
+  liveDirectorLoading?: boolean;
+  micFxState?: MicFxState;
+  onToggleMicRack?: () => void;
+  onToggleMicRadioEq?: () => void;
+  onMicDubWetChange?: (wet: number) => void;
+  onToggleMicLoop?: () => void;
+  onClearMicLoop?: () => void;
+  reactiveAdLibsEnabled?: boolean;
+  onToggleReactiveAdLibs?: () => void;
   onOpenCrate?: () => void;
 }
 
@@ -128,6 +151,12 @@ const AI_FEATURE_CONTROLS: {
   sub: string;
   desc: string;
 }[] = [
+  {
+    key: 'smartEntry',
+    label: 'Smart Entry',
+    sub: 'Off = start at 0:00',
+    desc: 'Do not require incoming songs to start at the beginning — cue into chorus, verse, or high-energy in-sync pockets',
+  },
   {
     key: 'vipSkip',
     label: 'VIP Skip',
@@ -265,17 +294,34 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
   onToggleFeature,
   onApplyFeaturePreset,
   onCycleGrooveBridge,
+  onCycleHarmonicLayer,
+  onTriggerSwellDrop,
+  onGenerateHostDrop,
+  generatingHostDrop = false,
+  liveDirectorLoading = false,
+  micFxState,
+  onToggleMicRack,
+  onToggleMicRadioEq,
+  onMicDubWetChange,
+  onToggleMicLoop,
+  onClearMicLoop,
+  reactiveAdLibsEnabled = false,
+  onToggleReactiveAdLibs,
   onOpenCrate,
 }) => {
   const [directionInput, setDirectionInput] = useState('');
   const [zone3Tab, setZone3Tab] = useState<'tricks' | 'voices' | 'features'>('tricks');
   const [voiceCategoryFilter, setVoiceCategoryFilter] = useState<DjVoiceCategory | 'all'>('all');
   const [dragOverSlotId, setDragOverSlotId] = useState<CustomVoiceSlotId | null>(null);
+  const [hostStationName, setHostStationName] = useState('DJOne FM');
+  const [hostTargetSlot, setHostTargetSlot] = useState<CustomVoiceSlotId>('custom-1');
   const isTransitioning = autopilot.phase === 'transitioning';
   const isPlanning = autopilot.phase === 'planning';
   const enabledFeaturesCount = AI_FEATURE_CONTROLS.filter(
     (f) => autopilot.features?.[f.key] ?? DEFAULT_AI_FEATURE_TOGGLES[f.key]
   ).length;
+  const smartEntryEnabled =
+    autopilot.features?.smartEntry ?? DEFAULT_AI_FEATURE_TOGGLES.smartEntry;
 
   const enabledVoiceSet = new Set(autopilot.enabledVoiceIds);
   const filteredVoices =
@@ -518,12 +564,12 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
           ))}
         </div>
 
-        {/* 4 Selectable 32-Bar Mashup Styles */}
-        <div className="flex items-center gap-1">
+        {/* 4 Selectable 32-Bar Mashup Styles + Smart Entry Toggle */}
+        <div className="flex items-center gap-1.5">
           <span className="text-[9px] font-mono uppercase tracking-wider text-purple-300/80 shrink-0">
             Style
           </span>
-          <div className="grid grid-cols-4 gap-1 flex-1">
+          <div className="grid grid-cols-4 gap-1 flex-1 min-w-0">
             {MASHUP_TEMPLATES.map((tpl) => (
               <button
                 key={tpl.id}
@@ -540,6 +586,24 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
               </button>
             ))}
           </div>
+          <button
+            type="button"
+            onClick={() => onToggleFeature('smartEntry')}
+            aria-pressed={smartEntryEnabled}
+            title={
+              smartEntryEnabled
+                ? 'Smart Entry ON: Songs do not have to start at 0:00 — AI may start in a chorus, verse, or high-energy in-sync pocket. Click to require starting at the beginning.'
+                : 'From Intro (0:00): Require songs to start at the beginning. Click to allow starting in chorus, verse, or high-energy in-sync pockets.'
+            }
+            className={`h-5 px-1.5 rounded text-[9.5px] font-semibold border flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+              smartEntryEnabled
+                ? 'bg-cyan-500/20 border-cyan-400/55 text-cyan-200 hover:bg-cyan-500/30'
+                : 'bg-[#0B0E14] border-white/10 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <CornerDownRight className="w-2.5 h-2.5 shrink-0" />
+            <span>{smartEntryEnabled ? 'Smart Entry' : 'From Intro'}</span>
+          </button>
         </div>
       </div>
 
@@ -573,8 +637,18 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
               <span className="truncate">
                 {autopilot.activePlan.grooveRecipeLabel || 'Balanced Blend'}
                 {autopilot.activePlan.bpmDeltaLabel ? ` · ${autopilot.activePlan.bpmDeltaLabel}` : ''}
+                {autopilot.activePlan.tempoMorphBars
+                  ? ` · ${autopilot.activePlan.tempoMorphBars}b Morph`
+                  : ''}
                 {autopilot.activePlan.keyTransitionLabel
                   ? ` · Key ${autopilot.activePlan.keyTransitionLabel}`
+                  : ''}
+                {autopilot.activePlan.keyGlideSemitones &&
+                autopilot.activePlan.keyGlideSemitones.from !== autopilot.activePlan.keyGlideSemitones.to
+                  ? ` · Glide ${autopilot.activePlan.keyGlideSemitones.from}→${autopilot.activePlan.keyGlideSemitones.to}st`
+                  : ''}
+                {autopilot.activePlan.wordplayMatch
+                  ? ` · "${autopilot.activePlan.wordplayMatch.word}"`
                   : ''}
                 {typeof autopilot.activePlan.doubleDropCueSec === 'number'
                   ? ' · 2xDrop'
@@ -584,8 +658,13 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
                   : ''}
               </span>
               {autopilot.upcomingQueue.length > 0 && (
-                <span className="truncate text-slate-500">
-                  {autopilot.upcomingQueue[0].title.split('(')[0].trim()}
+                <span className="truncate text-slate-400">
+                  {autopilot.activePlan.incomingEntryLabel
+                    ? `${autopilot.activePlan.incomingEntryLabel} · `
+                    : ''}
+                  <span className="text-slate-500">
+                    {autopilot.upcomingQueue[0].title.split('(')[0].trim()}
+                  </span>
                 </span>
               )}
             </div>
@@ -677,6 +756,38 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
           </button>
         </div>
 
+        {/* Harmonic Synth Layer + Reverse-Reverb Vocal Swell Drop Prep */}
+        {(onCycleHarmonicLayer || onTriggerSwellDrop) && (
+          <div className="grid grid-cols-2 gap-1">
+            {onCycleHarmonicLayer && (
+              <button
+                type="button"
+                onClick={onCycleHarmonicLayer}
+                className={`h-6 px-2 rounded text-[10px] font-semibold border flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
+                  autopilot.harmonicLayer !== 'off'
+                    ? 'bg-purple-500/20 border-purple-400/55 text-purple-200'
+                    : 'bg-[#151A24] border-white/[0.08] text-slate-300 hover:text-white'
+                }`}
+                title="Cycle Auto-Harmonic Synth Layering (Off -> Supersaw Pad -> Acid 303 -> Sidechain Arp)"
+              >
+                <Music2 className="w-3 h-3 shrink-0" />
+                <span>{HARMONIC_LAYER_LABELS[autopilot.harmonicLayer || 'off']}</span>
+              </button>
+            )}
+            {onTriggerSwellDrop && (
+              <button
+                type="button"
+                onClick={onTriggerSwellDrop}
+                className="h-6 px-2 rounded text-[10px] font-semibold bg-[#151A24] hover:bg-cyan-500/20 hover:text-cyan-200 border border-white/[0.08] text-slate-300 flex items-center justify-center gap-1 transition-colors whitespace-nowrap"
+                title="Trigger Reverse-Reverb Vocal Swell & Tape-Stop Drop Prep into Beat 1"
+              >
+                <Waves className="w-3 h-3 shrink-0 text-cyan-400" />
+                <span>Swell + Tape Drop</span>
+              </button>
+            )}
+          </div>
+        )}
+
         {/* 8 One-Click AI FX Transition Choreography Triggers (4x2) */}
         <div className="grid grid-cols-4 gap-1">
           {QUICK_AI_MOVES.map((mv) => (
@@ -693,7 +804,7 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
           ))}
         </div>
 
-        {/* Wild Take Improviser + Custom Offline AI Cue Prompt */}
+        {/* Wild Take Improviser + Live Groq Prompt Director / Cue AI */}
         <div className="flex items-center gap-1.5">
           <button
             type="button"
@@ -710,16 +821,20 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
               type="text"
               value={directionInput}
               onChange={(e) => setDirectionInput(e.target.value)}
-              placeholder="Cue AI (sub, shimmer, lofi, dub, stutter)..."
+              placeholder="Direct AI Set or FX (e.g. Afrobeats into House, dub, sub)..."
               className="flex-1 h-7 px-2 rounded-md bg-[#090B0F] border border-white/10 text-[11px] text-white placeholder:text-slate-500 focus:outline-none focus:border-cyan-400 min-w-0"
             />
             <button
               type="submit"
-              disabled={!directionInput.trim() || isPlanning}
+              disabled={!directionInput.trim() || isPlanning || liveDirectorLoading}
               className="h-7 px-2.5 rounded-md bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500 hover:text-[#090B0F] text-[10px] font-semibold flex items-center gap-1 transition-colors disabled:opacity-40 shrink-0"
-              title="Execute AI transition cue"
+              title="Execute AI transition cue or Live Groq Set Director"
             >
-              <Send className="w-3 h-3" />
+              {liveDirectorLoading ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Send className="w-3 h-3" />
+              )}
             </button>
           </form>
         </div>
@@ -765,27 +880,45 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
               }`}
             >
               <Sliders className="w-2.5 h-2.5 shrink-0" />
-              <span>Auto ({enabledFeaturesCount}/8)</span>
+              <span>
+                Auto ({enabledFeaturesCount}/{AI_FEATURE_CONTROLS.length})
+              </span>
             </button>
           </div>
 
-          <button
-            type="button"
-            onClick={onToggleVoiceFx}
-            className={`h-6 px-2 rounded-md text-[10px] font-semibold border flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
-              autopilot.voiceFxEnabled && !autopilot.muteSoundTricks
-                ? 'bg-emerald-500/20 border-emerald-500/45 text-emerald-300'
-                : 'bg-[#171C26] border-white/10 text-slate-400 hover:text-slate-200'
-            }`}
-            title="Master toggle: allow or disable DJ voices, grooving chants, and shouts in AI offline remixes"
-          >
-            {autopilot.voiceFxEnabled ? (
-              <Mic className="w-3 h-3 shrink-0" />
-            ) : (
-              <MicOff className="w-3 h-3 shrink-0" />
+          <div className="flex items-center gap-1 shrink-0">
+            {onToggleReactiveAdLibs && (
+              <button
+                type="button"
+                onClick={onToggleReactiveAdLibs}
+                className={`h-6 px-1.5 rounded-md text-[9.5px] font-semibold border transition-colors whitespace-nowrap ${
+                  reactiveAdLibsEnabled
+                    ? 'bg-amber-500/20 border-amber-400/50 text-amber-200'
+                    : 'bg-[#171C26] border-white/10 text-slate-400 hover:text-slate-200'
+                }`}
+                title="Reactive MC Ad-Libs: fire beat-quantized Orpheus shoutouts with -4 dB duck on Spinback, Wild Take & Drop Slams"
+              >
+                {reactiveAdLibsEnabled ? 'MC AdLib On' : 'MC AdLib'}
+              </button>
             )}
-            <span>{autopilot.voiceFxEnabled ? 'AI Vox On' : 'AI Vox Off'}</span>
-          </button>
+            <button
+              type="button"
+              onClick={onToggleVoiceFx}
+              className={`h-6 px-2 rounded-md text-[10px] font-semibold border flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                autopilot.voiceFxEnabled && !autopilot.muteSoundTricks
+                  ? 'bg-emerald-500/20 border-emerald-500/45 text-emerald-300'
+                  : 'bg-[#171C26] border-white/10 text-slate-400 hover:text-slate-200'
+              }`}
+              title="Master toggle: allow or disable DJ voices, grooving chants, and shouts in AI offline remixes"
+            >
+              {autopilot.voiceFxEnabled ? (
+                <Mic className="w-3 h-3 shrink-0" />
+              ) : (
+                <MicOff className="w-3 h-3 shrink-0" />
+              )}
+              <span>{autopilot.voiceFxEnabled ? 'AI Vox On' : 'AI Vox Off'}</span>
+            </button>
+          </div>
         </div>
 
         {zone3Tab === 'tricks' ? (
@@ -940,8 +1073,118 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
               })}
             </div>
 
-            {/* Upgrade #6: Compact 4-Slot My Drops (Mic Record / Audio File Upload) */}
-            <div className="flex flex-col gap-0.5 shrink-0">
+            {/* Dynamic Radio Host Drop Generator + 4-Slot My Drops */}
+            <div className="flex flex-col gap-1 shrink-0">
+              {onGenerateHostDrop && (
+                <div className="flex items-center gap-1">
+                  <input
+                    type="text"
+                    value={hostStationName}
+                    onChange={(e) => setHostStationName(e.target.value)}
+                    maxLength={24}
+                    placeholder="DJ / Station Name"
+                    className="flex-1 min-w-0 h-5 px-1.5 rounded bg-[#0B0E14] border border-white/10 text-[9.5px] text-slate-200 focus:outline-none focus:border-cyan-400"
+                  />
+                  <select
+                    value={hostTargetSlot}
+                    onChange={(e) => setHostTargetSlot(e.target.value as CustomVoiceSlotId)}
+                    aria-label="Target custom drop slot"
+                    className="h-5 px-1 rounded bg-[#0B0E14] border border-white/10 text-[9.5px] text-slate-200"
+                  >
+                    <option value="custom-1">Slot 1</option>
+                    <option value="custom-2">Slot 2</option>
+                    <option value="custom-3">Slot 3</option>
+                    <option value="custom-4">Slot 4</option>
+                  </select>
+                  <button
+                    type="button"
+                    disabled={generatingHostDrop}
+                    onClick={() => onGenerateHostDrop(hostStationName, hostTargetSlot)}
+                    className="h-5 px-2 rounded bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-[9px] font-semibold text-cyan-200 flex items-center gap-1 whitespace-nowrap shrink-0 disabled:opacity-45"
+                    title="Generate contextual Orpheus TTS DJ drop referencing current & next track BPM"
+                  >
+                    {generatingHostDrop ? (
+                      <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                    ) : (
+                      <Radio className="w-2.5 h-2.5" />
+                    )}
+                    <span>{generatingHostDrop ? 'Gen...' : 'AI Host Drop'}</span>
+                  </button>
+                </div>
+              )}
+              {/* Live Mic FX Rack ("Beatbox / MC 4-Bar Loop Pedal") */}
+              {micFxState && onToggleMicRack && (
+                <div className="flex flex-wrap items-center gap-1 px-1.5 py-1 rounded bg-[#0B0E14] border border-white/[0.06]">
+                  <button
+                    type="button"
+                    onClick={onToggleMicRack}
+                    className={`h-5 px-1.5 rounded text-[9px] font-semibold border flex items-center gap-1 transition-colors ${
+                      micFxState.active
+                        ? 'bg-rose-500/25 border-rose-400/55 text-rose-200'
+                        : 'bg-[#141822] border-white/10 text-slate-300 hover:text-white'
+                    }`}
+                    title="Enable Live Mic through Bandpass Radio EQ, Tempo Dub Delay & 4-Bar Overdub Looper"
+                  >
+                    <Mic className="w-2.5 h-2.5" />
+                    <span>{micFxState.active ? 'Live Mic ON' : 'Mic Rack'}</span>
+                  </button>
+                  {onToggleMicRadioEq && (
+                    <button
+                      type="button"
+                      disabled={!micFxState.active}
+                      onClick={onToggleMicRadioEq}
+                      className={`h-5 px-1.5 rounded text-[9px] font-semibold border transition-colors disabled:opacity-40 ${
+                        micFxState.radioEq
+                          ? 'bg-amber-500/25 border-amber-400/50 text-amber-200'
+                          : 'bg-[#141822] border-white/10 text-slate-400'
+                      }`}
+                      title="Bandpass Megaphone / Radio EQ on Live Mic"
+                    >
+                      Radio EQ
+                    </button>
+                  )}
+                  {onMicDubWetChange && (
+                    <label className="flex items-center gap-1 text-[9px] text-slate-400 flex-1 min-w-[78px]">
+                      <span>Dub</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={85}
+                        disabled={!micFxState.active}
+                        value={Math.round(micFxState.dubWet * 100)}
+                        onChange={(e) => onMicDubWetChange(parseInt(e.target.value, 10) / 100)}
+                        className="dj-fader flex-1 h-3"
+                      />
+                    </label>
+                  )}
+                  {onToggleMicLoop && (
+                    <button
+                      type="button"
+                      disabled={!micFxState.active}
+                      onClick={onToggleMicLoop}
+                      className={`h-5 px-1.5 rounded text-[9px] font-semibold border transition-colors disabled:opacity-40 ${
+                        micFxState.loopRecording
+                          ? 'bg-rose-500 text-white border-rose-400 animate-pulse'
+                          : micFxState.loopPlaying
+                          ? 'bg-emerald-500/25 border-emerald-400/55 text-emerald-200'
+                          : 'bg-[#141822] border-white/10 text-slate-300'
+                      }`}
+                      title="Record / Overdub 4-Bar Quantized Mic Loop locked to Master Clock"
+                    >
+                      {micFxState.loopRecording ? 'REC 4-Bar' : micFxState.loopPlaying ? 'Loop Play' : '4-Bar Loop'}
+                    </button>
+                  )}
+                  {onClearMicLoop && micFxState.loopPlaying && (
+                    <button
+                      type="button"
+                      onClick={onClearMicLoop}
+                      className="h-5 px-1.5 rounded bg-[#141822] hover:text-rose-300 border border-white/10 text-[9px] text-slate-400"
+                    >
+                      Clr
+                    </button>
+                  )}
+                </div>
+              )}
               {micError && (
                 <div className="text-[9px] text-rose-400 truncate px-1">{micError}</div>
               )}
@@ -1087,7 +1330,7 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
                   type="button"
                   onClick={() => onApplyFeaturePreset('all-on')}
                   className="h-4.5 px-1.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-[9px] font-semibold text-emerald-200 transition-colors"
-                  title="Enable all 8 AI DJ features"
+                  title={`Enable all ${AI_FEATURE_CONTROLS.length} AI DJ features`}
                 >
                   All On
                 </button>

@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ZoomIn, ZoomOut } from 'lucide-react';
-import { DeckId, DeckState, WaveformAiMarker } from '../types/dj';
+import { Scissors, ZoomIn, ZoomOut } from 'lucide-react';
+import { DeckId, DeckState, FrequencyClashReport, WaveformAiMarker } from '../types/dj';
 
 interface DualWaveformDisplayProps {
   deckA: DeckState;
@@ -11,6 +11,8 @@ interface DualWaveformDisplayProps {
   onTriggerAiMarker?: (marker: WaveformAiMarker) => void;
   onToggleMuteAiMarker?: (marker: WaveformAiMarker) => void;
   onMoveAiMarker?: (marker: WaveformAiMarker, newTimeSec: number) => void;
+  clashReport?: FrequencyClashReport | null;
+  onAutoCarveClash?: () => void;
 }
 
 interface MarkerHitRect {
@@ -45,6 +47,8 @@ export const DualWaveformDisplay: React.FC<DualWaveformDisplayProps> = ({
   onTriggerAiMarker,
   onToggleMuteAiMarker,
   onMoveAiMarker,
+  clashReport = null,
+  onAutoCarveClash,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [windowSec, setWindowSec] = useState<number>(12); // visible time window in seconds
@@ -352,6 +356,18 @@ export const DualWaveformDisplay: React.FC<DualWaveformDisplayProps> = ({
       ctx.textAlign = 'left';
       ctx.fillText(isPhaseLocked ? 'PHASE LOCKED' : 'PHASE ALIGN', 10, barY + 14);
 
+      // Frequency Clash Radar meters along center bar
+      if (clashReport && deckA.track && deckB.track) {
+        const bassPct = Math.round(clashReport.bassClash * 100);
+        const midPct = Math.round(clashReport.midClash * 100);
+        const badgeX = 96;
+        ctx.font = '700 8.5px "JetBrains Mono", monospace';
+        ctx.fillStyle = bassPct >= 45 ? '#FB7185' : bassPct >= 28 ? '#FBBF24' : '#64748B';
+        ctx.fillText(`SUB:${bassPct}%`, badgeX, barY + 14);
+        ctx.fillStyle = midPct >= 45 ? '#C084FC' : midPct >= 28 ? '#38BDF8' : '#64748B';
+        ctx.fillText(`VOX:${midPct}%`, badgeX + 54, barY + 14);
+      }
+
       // Center Playhead hairline across both lanes
       ctx.strokeStyle = '#FFFFFF';
       ctx.lineWidth = 1.5;
@@ -366,7 +382,7 @@ export const DualWaveformDisplay: React.FC<DualWaveformDisplayProps> = ({
 
     rafId = requestAnimationFrame(render);
     return () => cancelAnimationFrame(rafId);
-  }, [deckA, deckB, getLiveTime, windowSec, aiMarkers]);
+  }, [deckA, deckB, getLiveTime, windowSec, aiMarkers, clashReport]);
 
   const findHitMarker = (x: number, y: number): MarkerHitRect | undefined =>
     markerHitRectsRef.current.find(
@@ -487,26 +503,43 @@ export const DualWaveformDisplay: React.FC<DualWaveformDisplayProps> = ({
         className="w-full h-[110px] lg:h-[96px] block cursor-grab active:cursor-grabbing touch-none"
         title="Drag waveform to scrub · AI Flags: Click=Preview, Drag=Move, Right/Shift-Click=Mute"
       />
-      <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 bg-[#090B0F]/90 border border-white/10 rounded-md px-1 py-0.5">
-        <button
-          type="button"
-          onClick={() => setWindowSec((w) => Math.max(4, w - 4))}
-          className="p-1 text-slate-400 hover:text-white transition-colors"
-          title="Zoom in waveform"
-          aria-label="Zoom in waveform"
-        >
-          <ZoomIn className="w-3.5 h-3.5" />
-        </button>
-        <span className="text-[10px] font-mono text-slate-400 px-1 tabular-nums">{windowSec}s</span>
-        <button
-          type="button"
-          onClick={() => setWindowSec((w) => Math.min(32, w + 4))}
-          className="p-1 text-slate-400 hover:text-white transition-colors"
-          title="Zoom out waveform"
-          aria-label="Zoom out waveform"
-        >
-          <ZoomOut className="w-3.5 h-3.5" />
-        </button>
+      <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
+        {onAutoCarveClash &&
+          clashReport &&
+          deckA.track &&
+          deckB.track &&
+          (clashReport.bassClash >= 0.4 || clashReport.midClash >= 0.4) && (
+            <button
+              type="button"
+              onClick={onAutoCarveClash}
+              className="h-6 px-2 rounded-md bg-rose-500/90 hover:bg-rose-400 text-[#090B0F] text-[10px] font-bold flex items-center gap-1 shadow transition-colors"
+              title={`Overlap detected (${Math.round(clashReport.bassClash * 100)}% sub · ${Math.round(clashReport.midClash * 100)}% vocal). Click to auto-carve EQ & stems.`}
+            >
+              <Scissors className="w-3 h-3" />
+              <span>Auto-Carve</span>
+            </button>
+          )}
+        <div className="flex items-center gap-1 bg-[#090B0F]/90 border border-white/10 rounded-md px-1 py-0.5">
+          <button
+            type="button"
+            onClick={() => setWindowSec((w) => Math.max(4, w - 4))}
+            className="p-1 text-slate-400 hover:text-white transition-colors"
+            title="Zoom in waveform"
+            aria-label="Zoom in waveform"
+          >
+            <ZoomIn className="w-3.5 h-3.5" />
+          </button>
+          <span className="text-[10px] font-mono text-slate-400 px-1 tabular-nums">{windowSec}s</span>
+          <button
+            type="button"
+            onClick={() => setWindowSec((w) => Math.min(32, w + 4))}
+            className="p-1 text-slate-400 hover:text-white transition-colors"
+            title="Zoom out waveform"
+            aria-label="Zoom out waveform"
+          >
+            <ZoomOut className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
     </div>
   );

@@ -76,6 +76,72 @@ export type GrooveBridgePattern =
   | 'afro-perc'
   | 'chord-arp';
 
+export type BootlegFlipPreset =
+  | 'off'
+  | 'jersey-club'
+  | 'amapiano'
+  | 'phonk'
+  | 'slowed-reverb'
+  | 'nightcore';
+
+export type HarmonicSynthLayerMode =
+  | 'off'
+  | 'supersaw-pad'
+  | 'acid-303'
+  | 'sidechain-arp';
+
+export type StutterSubdiv = '1/4' | '1/8' | '1/16' | '1/32';
+
+export interface LyricCueWord {
+  word: string;
+  startSec: number;
+  endSec: number;
+}
+
+export interface CleanEditWindow {
+  startSec: number;
+  endSec: number;
+  word: string;
+}
+
+export type CleanEditMaskMode = 'off' | 'mute' | 'reverse' | 'chirp';
+
+export interface TrackLyricCues {
+  source: 'groq-whisper' | 'heuristic-fallback';
+  words: LyricCueWord[];
+  busyWindows: { startSec: number; endSec: number }[];
+  hookPhrases: { text: string; startSec: number; endSec: number }[];
+  anchorWords: { word: string; timeSec: number }[];
+  cleanEditWindows?: CleanEditWindow[];
+  scannedAt: number;
+}
+
+export interface TrackEnrichment {
+  subGenre: string;
+  mood: string;
+  crowdMoment: 'Opener' | 'Peak' | 'Cooldown';
+  energyScore: number; // 1..10
+  chemistryNote: string;
+  updatedAt: number;
+}
+
+export interface GroqLiveDirectorResponse {
+  source: 'groq' | 'heuristic-fallback';
+  configured?: boolean;
+  summary: string;
+  orderedTrackIds: string[];
+  vibe: AiDjVibe;
+  energyMode: AiEnergyMode;
+  aggressiveness: number;
+  bootlegFlip: BootlegFlipPreset;
+  harmonicLayer: HarmonicSynthLayerMode;
+  grooveBridge: GrooveBridgePattern;
+  transitionStylePrompt: string;
+  pairNotes: Record<string, string>;
+  hostDropScript: string;
+  hostVoice: GroqVoicePersona;
+}
+
 export type VocalDensityTag = 'instrumental' | 'balanced' | 'vocal-dense' | 'acapella';
 
 export type MashupTemplateId =
@@ -139,6 +205,8 @@ export interface TrackItem {
   autoTrimGain?: number;
   detectedVocalDensity?: VocalDensityTag;
   vocalPockets?: VocalPhrasePocket[];
+  lyricCues?: TrackLyricCues;
+  enrichment?: TrackEnrichment;
   calibrated?: boolean;
   addedAt: number;
 }
@@ -208,6 +276,10 @@ export interface DeckState {
   pflCue: boolean;
   fx: DeckFxState;
   stemMode: StemIsolationMode;
+  bootlegFlip?: BootlegFlipPreset;
+  subSwapEnabled?: boolean;
+  subSwapMode?: 'sine' | 'triangle';
+  cleanEditMask?: CleanEditMaskMode;
   waveform: WaveformBandSample[];
   sections?: TrackSectionSegment[];
   detectedDropSec?: number;
@@ -262,6 +334,90 @@ export interface GroqDirectorPlan {
   calloutScript: string;
   directorNotes: string;
   reharmonizeSynth: boolean;
+  bootlegPreset?: BootlegFlipPreset;
+  synthLayerMode?: HarmonicSynthLayerMode;
+  reverseVocalSwell?: boolean;
+  tapeStopDropPrep?: boolean;
+  filterEnvelope?: 'none' | 'dark-warm' | 'lpf-drop-open' | 'hpf-tension';
+}
+
+export interface MixStoryChapter {
+  timestamp: string;
+  label: string;
+  note?: string;
+}
+
+export interface MixStoryExport {
+  source: 'groq' | 'heuristic-fallback';
+  headline: string;
+  youtubeChapters: string;
+  mixcloudTracklist: string;
+  storySummary: string;
+  socialCaption: string;
+  chapters: MixStoryChapter[];
+}
+
+export interface GoldenMashupPair {
+  vocalTrackId: string;
+  instTrackId: string;
+  vocalTitle: string;
+  instTitle: string;
+  compatibilityScore: number; // 0..100
+  template: MashupTemplateId;
+  stemSwapMode: StemSwapMode;
+  reason: string;
+}
+
+export interface GapFillerResult {
+  source: 'groq' | 'heuristic-fallback';
+  summary: string;
+  targetBpmMin: number;
+  targetBpmMax: number;
+  targetKeys: string[];
+  vibeNote: string;
+  searchQueries: string[];
+}
+
+export interface VocalChopSoloPlan {
+  source: 'groq' | 'heuristic-fallback';
+  word: string;
+  cueSec: number;
+  pentatonicSemitones: number[];
+  moodNote: string;
+}
+
+export interface VipDropVariation {
+  id: 'A' | 'B' | 'C';
+  name: string;
+  tagline: string;
+  vibe: AiDjVibe;
+  aggressiveness: number;
+  mashupTemplate: MashupTemplateId;
+  bootlegFlip: BootlegFlipPreset;
+  harmonicSynthLayer: HarmonicSynthLayerMode;
+  flipBridgePattern: GrooveBridgePattern;
+  reverseVocalSwell: boolean;
+  tapeStopDropPrep: boolean;
+  filterEnvelope: 'none' | 'dark-warm' | 'lpf-drop-open' | 'hpf-tension';
+}
+
+export type ReactiveAdLibKind = 'backspin' | 'wild-take' | 'drop-slam';
+
+export interface MicFxState {
+  active: boolean;
+  radioEq: boolean;
+  dubWet: number; // 0..0.9
+  monitoring: boolean;
+  loopRecording: boolean;
+  loopPlaying: boolean;
+  loopHasAudio: boolean;
+}
+
+export interface FrequencyClashReport {
+  bassClash: number; // 0..1 (<100 Hz sub overlap)
+  midClash: number;  // 0..1 (300Hz-3kHz vocal/mid overlap)
+  carveActive: boolean;
+  summary: string;
 }
 
 export interface RecordingItem {
@@ -275,6 +431,7 @@ export interface RecordingItem {
   cueSheetText?: string;
   tracklistCount?: number;
   packRole?: OfflineRenderVariant;
+  mixStory?: MixStoryExport;
 }
 
 export type AiDjVibe =
@@ -488,7 +645,10 @@ export interface AiTransitionPlan {
   mixStyleKey: string;
   sessionSignature: string;
   transitionBars: number;
-  incomingStartPct: number; // 0.0 .. 0.28 beat-quantized cue-in offset
+  incomingStartPct: number; // 0.0 .. 0.68 beat-quantized cue-in offset
+  incomingEntrySec?: number;
+  incomingEntryKind?: 'intro' | 'verse' | 'build' | 'chorus' | 'sync-pocket';
+  incomingEntryLabel?: string;
   tempoTargetBpm: number;   // smooth master BPM ramp target
   tempoFoldFactor?: 1 | 2 | 0.5;
   grooveRecipeLabel?: string;
@@ -496,9 +656,13 @@ export interface AiTransitionPlan {
   inGroove?: GrooveDnaGenre;
   genrePhysicsMode?: GenrePhysicsMode;
   recommendedBridge?: GrooveBridgePattern;
+  tempoMorphBars?: number;
+  wordplayMatch?: { word: string; outSec: number; inSec: number };
+  bootlegFlip?: BootlegFlipPreset;
   bpmDeltaLabel?: string;
   keyTransitionLabel?: string;
   semitoneShiftIn?: number;
+  keyGlideSemitones?: { from: number; to: number };
   doubleDropCueSec?: number;
   clashProfile?: OverlapClashProfile;
   useBeatSliceStutter?: boolean;
@@ -585,6 +749,7 @@ export interface AiMashupBlendAdvice {
 }
 
 export interface AiFeatureToggles {
+  smartEntry: boolean;
   vipSkip: boolean;
   breakdownTease: boolean;
   vocalCarryover: boolean;
@@ -619,6 +784,7 @@ export interface AutopilotState {
   enabledVoiceIds: DjVoiceDropId[];
   mutedMomentIndices?: number[];
   grooveBridgePattern: GrooveBridgePattern;
+  harmonicLayer: HarmonicSynthLayerMode;
   nextTransitionEtaSec: number | null;
   holdExtraBars: number;
   mashupRoutineActive: boolean;

@@ -16,16 +16,23 @@ import {
   Wand2,
   Sliders,
   Mic,
+  Copy,
+  Check,
+  BookOpen,
 } from 'lucide-react';
 import {
   AiDjVibe,
+  BootlegFlipPreset,
+  CleanEditMaskMode,
   CueStartMode,
   GrooveBridgePattern,
   GroqDirectorPlan,
   GroqVoicePersona,
+  HarmonicSynthLayerMode,
   HotCue,
   MashupTemplateId,
   MasteringProfile,
+  MixStoryExport,
   OfflineExportFormat,
   OfflineRenderMode,
   Playlist,
@@ -33,9 +40,16 @@ import {
   RecordingItem,
   StemSwapMode,
   TrackItem,
+  VipDropVariation,
+  VocalChopSoloPlan,
 } from '../types/dj';
-import { buildOfflineRemixBlueprint } from '../audio/offlineAiDj';
-import { requestGroqRemixDirector } from '../audio/groqDirector';
+import { buildOfflineRemixBlueprint, detectBestChopCueSec } from '../audio/offlineAiDj';
+import {
+  requestGroqRemixDirector,
+  requestMixStory,
+  requestVipVariations,
+  requestVocalChopSolo,
+} from '../audio/groqDirector';
 
 export interface OfflineRenderOptions {
   mode: OfflineRenderMode;
@@ -58,6 +72,15 @@ export interface OfflineRenderOptions {
   exportFormat: OfflineExportFormat;
   includeVoicesAndFx: boolean;
   preservePitch: boolean;
+  bootlegFlip?: BootlegFlipPreset;
+  harmonicSynthLayer?: HarmonicSynthLayerMode;
+  reverseVocalSwell?: boolean;
+  tapeStopDropPrep?: boolean;
+  filterEnvelope?: 'none' | 'dark-warm' | 'lpf-drop-open' | 'hpf-tension';
+  subSwapEnabled?: boolean;
+  cleanEditMask?: CleanEditMaskMode;
+  vocalChopSolo?: VocalChopSoloPlan | null;
+  keyGlideCorrection?: boolean;
 }
 
 export interface OfflinePreviewResult {
@@ -96,6 +119,7 @@ interface RecordingModalProps {
   canRenderPlaylistMix?: boolean;
   playlistMixLabel?: string;
   defaultMashupTemplate?: MashupTemplateId;
+  onSaveRecordingStory?: (recordingId: string, story: MixStoryExport) => void;
   onRenderAiRemixWav?: (
     opts: OfflineRenderOptions,
     onProgress: (pct: number) => void
@@ -189,6 +213,7 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
   canRenderPlaylistMix = false,
   playlistMixLabel = '',
   defaultMashupTemplate = 'club-groove-swap',
+  onSaveRecordingStory,
   onRenderAiRemixWav,
 }) => {
   const [captureTabAudio, setCaptureTabAudio] = useState(false);
@@ -207,6 +232,24 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
   const [exportFormat, setExportFormat] = useState<OfflineExportFormat>('wav');
   const [includeVoicesAndFx, setIncludeVoicesAndFx] = useState(true);
   const [preservePitch, setPreservePitch] = useState(true);
+  const [bootlegFlip, setBootlegFlip] = useState<BootlegFlipPreset>('off');
+  const [harmonicSynthLayer, setHarmonicSynthLayer] = useState<HarmonicSynthLayerMode>('off');
+  const [reverseVocalSwell, setReverseVocalSwell] = useState(false);
+  const [tapeStopDropPrep, setTapeStopDropPrep] = useState(false);
+  const [filterEnvelope, setFilterEnvelope] = useState<'none' | 'dark-warm' | 'lpf-drop-open' | 'hpf-tension'>('none');
+  const [subSwapEnabled, setSubSwapEnabled] = useState(false);
+  const [cleanEditMask, setCleanEditMask] = useState<CleanEditMaskMode>('off');
+  const [enableVocalChopSolo, setEnableVocalChopSolo] = useState(false);
+  const [keyGlideCorrection, setKeyGlideCorrection] = useState(true);
+
+  const [vipVariations, setVipVariations] = useState<
+    (VipDropVariation & { previewUrl?: string })[]
+  >([]);
+  const [vipLoading, setVipLoading] = useState(false);
+
+  const [mixStoryLoadingId, setMixStoryLoadingId] = useState<string | null>(null);
+  const [openStoryId, setOpenStoryId] = useState<string | null>(null);
+  const [copiedStoryId, setCopiedStoryId] = useState<string | null>(null);
 
   // Groq AI Remix Director + Spoken Orpheus Intro Drop
   const [directorPrompt, setDirectorPrompt] = useState('');
@@ -285,6 +328,24 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
         : []
       : [deckATrack, deckBTrack].filter((t): t is TrackItem => Boolean(t));
 
+  const applyDirectorPlan = (plan: GroqDirectorPlan) => {
+    setDirectorPlan(plan);
+    setMashupTemplate(plan.recommendedTemplate);
+    setFlipBridgePattern(plan.recommendedBridge);
+    setStemSwapMode(plan.stemSwapPreference);
+    setMasteringProfile(plan.masteringProfile);
+    setReharmonizeSynth(plan.reharmonizeSynth);
+    if (plan.bootlegPreset) setBootlegFlip(plan.bootlegPreset);
+    if (plan.synthLayerMode) setHarmonicSynthLayer(plan.synthLayerMode);
+    if (typeof plan.reverseVocalSwell === 'boolean') setReverseVocalSwell(plan.reverseVocalSwell);
+    if (typeof plan.tapeStopDropPrep === 'boolean') setTapeStopDropPrep(plan.tapeStopDropPrep);
+    if (plan.filterEnvelope) setFilterEnvelope(plan.filterEnvelope);
+    if (plan.calloutScript) {
+      setGroqCalloutScript(plan.calloutScript);
+      if (plan.configured) setUseGroqIntroDrop(true);
+    }
+  };
+
   const handleAskGroqDirector = async () => {
     if (directorTracks.length === 0 || directorLoading) return;
     setDirectorLoading(true);
@@ -296,16 +357,7 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
         directionPrompt: directorPrompt,
         tracks: directorTracks,
       });
-      setDirectorPlan(plan);
-      setMashupTemplate(plan.recommendedTemplate);
-      setFlipBridgePattern(plan.recommendedBridge);
-      setStemSwapMode(plan.stemSwapPreference);
-      setMasteringProfile(plan.masteringProfile);
-      setReharmonizeSynth(plan.reharmonizeSynth);
-      if (plan.calloutScript) {
-        setGroqCalloutScript(plan.calloutScript);
-        if (plan.configured) setUseGroqIntroDrop(true);
-      }
+      applyDirectorPlan(plan);
     } catch (err: any) {
       setRenderError(err?.message || 'Unable to reach Groq AI Director.');
     } finally {
@@ -319,13 +371,29 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
     );
   };
 
-  const handleTriggerRender = async (previewOnly = false) => {
+  const handleTriggerRender = async (
+    previewOnly = false,
+    overrides?: Partial<OfflineRenderOptions>
+  ) => {
     if (!onRenderAiRemixWav || !canRenderCurrentMode || isRendering) return;
     setIsRendering(true);
     setRenderingPreview(previewOnly);
     setRenderPct(4);
     setRenderError(null);
     try {
+      let vocalChopSolo: VocalChopSoloPlan | null = null;
+      if (enableVocalChopSolo && deckATrack) {
+        const aiPlan = await requestVocalChopSolo({
+          title: deckATrack.title,
+          musicalKey: deckATrack.musicalKey || '8A',
+          durationSec: deckATrack.durationSec || 180,
+          words: deckATrack.lyricCues?.words,
+        });
+        const cueSec =
+          aiPlan.cueSec > 1 ? aiPlan.cueSec : detectBestChopCueSec(deckATrack);
+        vocalChopSolo = { ...aiPlan, cueSec };
+      }
+
       const res = await onRenderAiRemixWav(
         {
           mode: renderMode,
@@ -348,6 +416,16 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
           exportFormat: previewOnly ? 'wav' : exportFormat,
           includeVoicesAndFx,
           preservePitch,
+          bootlegFlip,
+          harmonicSynthLayer,
+          reverseVocalSwell,
+          tapeStopDropPrep,
+          filterEnvelope,
+          subSwapEnabled,
+          cleanEditMask,
+          vocalChopSolo,
+          keyGlideCorrection,
+          ...overrides,
         },
         (pct) => setRenderPct(pct)
       );
@@ -362,6 +440,129 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
     } finally {
       setIsRendering(false);
       setRenderingPreview(false);
+    }
+  };
+
+  const handleGenerateVipVariations = async () => {
+    if (!onRenderAiRemixWav || !canRenderCurrentMode || vipLoading || isRendering) return;
+    setVipLoading(true);
+    setRenderError(null);
+    try {
+      const specsResp = await requestVipVariations({
+        prompt: directorPrompt || currentVibe,
+        titleA: deckATrack?.title || 'Track A',
+        titleB: deckBTrack?.title || 'Track B',
+      });
+      const specs = specsResp.variations;
+      const rendered: (VipDropVariation & { previewUrl?: string })[] = [];
+      for (let i = 0; i < specs.length; i++) {
+        const v = specs[i];
+        const previewRes = await onRenderAiRemixWav(
+          {
+            mode: renderMode,
+            mashupTemplate: v.mashupTemplate,
+            stemSwapMode,
+            reharmonizeSynth: true,
+            masteringProfile,
+            exportDjPack: false,
+            sessionSeedOverride: renderSeed + (i + 1) * 97,
+            mutedPhaseIndices,
+            useGroqIntroDrop: false,
+            groqCalloutScript,
+            groqVoicePersona,
+            playlistPacing,
+            flipBridgePattern: v.flipBridgePattern,
+            cueAMode,
+            cueBMode,
+            preview8BarsOnly: true,
+            exportFormat: 'wav',
+            includeVoicesAndFx,
+            preservePitch,
+            bootlegFlip: v.bootlegFlip,
+            harmonicSynthLayer: v.harmonicSynthLayer,
+            reverseVocalSwell: v.reverseVocalSwell,
+            tapeStopDropPrep: v.tapeStopDropPrep,
+            filterEnvelope: v.filterEnvelope,
+            subSwapEnabled,
+            cleanEditMask,
+            keyGlideCorrection,
+          },
+          () => {}
+        );
+        rendered.push({ ...v, previewUrl: previewRes?.previewUrl });
+      }
+      setVipVariations(rendered);
+    } catch (err: any) {
+      setRenderError(err?.message || 'Unable to generate VIP A/B/C variations.');
+    } finally {
+      setVipLoading(false);
+    }
+  };
+
+  const applyVipVariation = (v: VipDropVariation) => {
+    setMashupTemplate(v.mashupTemplate);
+    setFlipBridgePattern(v.flipBridgePattern);
+    setBootlegFlip(v.bootlegFlip);
+    setHarmonicSynthLayer(v.harmonicSynthLayer);
+    setReverseVocalSwell(v.reverseVocalSwell);
+    setTapeStopDropPrep(v.tapeStopDropPrep);
+    setFilterEnvelope(v.filterEnvelope);
+  };
+
+  const handleGenerateMixStory = async (rec: RecordingItem) => {
+    if (mixStoryLoadingId) return;
+    if (rec.mixStory) {
+      setOpenStoryId((cur) => (cur === rec.id ? null : rec.id));
+      return;
+    }
+    setMixStoryLoadingId(rec.id);
+    try {
+      const story = await requestMixStory({
+        title: rec.title,
+        durationSec: rec.durationSec,
+        cueSheetText: rec.cueSheetText || '',
+      });
+      onSaveRecordingStory?.(rec.id, story);
+      setOpenStoryId(rec.id);
+    } finally {
+      setMixStoryLoadingId(null);
+    }
+  };
+
+  const handleOneClickPromptToRemix = async () => {
+    if (directorTracks.length === 0 || !canRenderCurrentMode || directorLoading || isRendering) return;
+    setDirectorLoading(true);
+    setRenderError(null);
+    let plan: GroqDirectorPlan | null = null;
+    try {
+      plan = await requestGroqRemixDirector({
+        mode: renderMode,
+        vibe: currentVibe,
+        directionPrompt: directorPrompt || 'Dark club remix flip with spoken intro drop and reverse swell',
+        tracks: directorTracks,
+      });
+      applyDirectorPlan(plan);
+    } catch (err: any) {
+      setRenderError(err?.message || 'Unable to reach Groq AI Director.');
+    } finally {
+      setDirectorLoading(false);
+    }
+    if (plan) {
+      await handleTriggerRender(false, {
+        mashupTemplate: plan.recommendedTemplate,
+        flipBridgePattern: plan.recommendedBridge,
+        stemSwapMode: plan.stemSwapPreference,
+        masteringProfile: plan.masteringProfile,
+        reharmonizeSynth: plan.reharmonizeSynth,
+        customMixTitle: plan.mixTitle,
+        useGroqIntroDrop: Boolean(plan.calloutScript && plan.configured),
+        groqCalloutScript: plan.calloutScript || groqCalloutScript,
+        bootlegFlip: plan.bootlegPreset || bootlegFlip,
+        harmonicSynthLayer: plan.synthLayerMode || harmonicSynthLayer,
+        reverseVocalSwell: plan.reverseVocalSwell ?? reverseVocalSwell,
+        tapeStopDropPrep: plan.tapeStopDropPrep ?? tapeStopDropPrep,
+        filterEnvelope: plan.filterEnvelope || filterEnvelope,
+      });
     }
   };
 
@@ -594,6 +795,16 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
                       </>
                     )}
                   </button>
+                  <button
+                    type="button"
+                    onClick={handleOneClickPromptToRemix}
+                    disabled={!canRenderCurrentMode || directorTracks.length === 0 || directorLoading || isRendering}
+                    className="h-7 px-2.5 rounded-md bg-emerald-500 hover:bg-emerald-400 disabled:opacity-45 text-[#090B0F] text-[11px] font-bold flex items-center gap-1.5 transition-colors"
+                    title="Hybrid 1-Click Prompt-to-Remix: Groq plans recipe + Orpheus voices drop + Local DSP bounces remix"
+                  >
+                    <Zap className="w-3 h-3 fill-current" />
+                    <span>1-Click Prompt-to-Remix</span>
+                  </button>
                 </div>
 
                 {directorPlan && (
@@ -785,6 +996,137 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
                 </div>
               )}
 
+              {/* Bootleg Flip Presets, Harmonic Synth Layering & Drop Prep DSP */}
+              {renderMode !== 'playlist-mix' && (
+                <div className="bg-[#11151C] border border-white/[0.06] rounded-lg px-2.5 py-2 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="flex items-center gap-1 text-[10.5px] text-slate-300">
+                      <span className="text-slate-400">Bootleg:</span>
+                      <select
+                        value={bootlegFlip}
+                        disabled={isRendering}
+                        onChange={(e) => setBootlegFlip(e.target.value as BootlegFlipPreset)}
+                        className="h-6 px-1.5 rounded bg-[#0B0E14] border border-white/10 text-[10.5px] text-emerald-200"
+                      >
+                        <option value="off">Off</option>
+                        <option value="jersey-club">Jersey Club Flip</option>
+                        <option value="amapiano">Amapiano Log-Drum</option>
+                        <option value="phonk">Phonk 808 Cowbell</option>
+                        <option value="slowed-reverb">Slowed + Reverb</option>
+                        <option value="nightcore">Nightcore Rave</option>
+                      </select>
+                    </label>
+                    <label className="flex items-center gap-1 text-[10.5px] text-slate-300">
+                      <span className="text-slate-400">Synth:</span>
+                      <select
+                        value={harmonicSynthLayer}
+                        disabled={isRendering}
+                        onChange={(e) => setHarmonicSynthLayer(e.target.value as HarmonicSynthLayerMode)}
+                        className="h-6 px-1.5 rounded bg-[#0B0E14] border border-white/10 text-[10.5px] text-purple-200"
+                      >
+                        <option value="off">Off</option>
+                        <option value="supersaw-pad">Supersaw Pad</option>
+                        <option value="acid-303">Acid 303</option>
+                        <option value="sidechain-arp">Sidechain Arp</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3 text-[10.5px] text-slate-300">
+                    <label className="flex items-center gap-1 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={reverseVocalSwell}
+                        disabled={isRendering}
+                        onChange={(e) => setReverseVocalSwell(e.target.checked)}
+                        className="accent-cyan-400"
+                      />
+                      <span>Rev Vocal Swell</span>
+                    </label>
+                    <label className="flex items-center gap-1 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={tapeStopDropPrep}
+                        disabled={isRendering}
+                        onChange={(e) => setTapeStopDropPrep(e.target.checked)}
+                        className="accent-amber-400"
+                      />
+                      <span>Tape-Stop Drop</span>
+                    </label>
+                    <label className="flex items-center gap-1 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={subSwapEnabled}
+                        disabled={isRendering}
+                        onChange={(e) => setSubSwapEnabled(e.target.checked)}
+                        className="accent-amber-400"
+                      />
+                      <span>808 Sub Swap</span>
+                    </label>
+                    <label className="flex items-center gap-1 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={enableVocalChopSolo}
+                        disabled={isRendering}
+                        onChange={(e) => setEnableVocalChopSolo(e.target.checked)}
+                        className="accent-emerald-400"
+                      />
+                      <span>Fred.. Chop Solo</span>
+                    </label>
+                    <label className="flex items-center gap-1 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={keyGlideCorrection}
+                        disabled={isRendering}
+                        onChange={(e) => setKeyGlideCorrection(e.target.checked)}
+                        className="accent-purple-400"
+                      />
+                      <span>Key Glide</span>
+                    </label>
+                    <label className="flex items-center gap-1 text-[10.5px] text-slate-300">
+                      <span className="text-slate-400">Clean Edit:</span>
+                      <select
+                        value={cleanEditMask}
+                        disabled={isRendering}
+                        onChange={(e) => setCleanEditMask(e.target.value as CleanEditMaskMode)}
+                        className="h-5 px-1 rounded bg-[#0B0E14] border border-white/10 text-[10px] text-emerald-200"
+                      >
+                        <option value="off">Off</option>
+                        <option value="mute">Mute</option>
+                        <option value="reverse">Vinyl Reverse</option>
+                        <option value="chirp">Scratch Chirp</option>
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              {/* VIP A/B/C Auditionable Variations */}
+              {vipVariations.length > 0 && (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  {vipVariations.map((v) => (
+                    <div
+                      key={v.id}
+                      className="p-2 rounded-lg bg-[#11151C] border border-purple-500/35 flex flex-col gap-1.5"
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="text-[11px] font-bold text-purple-200">
+                          VIP {v.id}: {v.name}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => applyVipVariation(v)}
+                          className="px-1.5 py-0.5 rounded bg-purple-500 hover:bg-purple-400 text-[#090B0F] text-[9.5px] font-bold"
+                        >
+                          Apply
+                        </button>
+                      </div>
+                      <p className="text-[9.5px] text-slate-400 truncate">{v.tagline}</p>
+                      {v.previewUrl && <audio controls src={v.previewUrl} className="w-full h-7" />}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {/* Enhancement #4: Interactive Pre-Render Blueprint Strip */}
               {blueprintSegments.length > 0 && (
                 <div className="bg-[#11151C] border border-white/[0.06] rounded-lg p-2.5 flex flex-col gap-1.5">
@@ -946,6 +1288,28 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
 
               {/* Action Buttons */}
               <div className="flex flex-wrap items-center justify-end gap-2">
+                {renderMode !== 'playlist-mix' && (
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateVipVariations()}
+                    disabled={!canRenderCurrentMode || isRendering || vipLoading}
+                    className="h-8 px-3 rounded-lg bg-purple-500/20 hover:bg-purple-500/30 disabled:opacity-45 border border-purple-400/40 text-purple-200 font-semibold text-xs flex items-center gap-1.5 transition-colors"
+                    title="Render 3 contrasting 8-bar VIP drop variations (A, B, C) for instant A/B/C audition"
+                  >
+                    {vipLoading ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Baking A/B/C...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Gen VIP A/B/C</span>
+                      </>
+                    )}
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={() => handleTriggerRender(true)}
@@ -1062,6 +1426,24 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
                           </p>
                         </div>
                         <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            disabled={mixStoryLoadingId === rec.id}
+                            onClick={() => void handleGenerateMixStory(rec)}
+                            className={`h-8 px-2.5 rounded-lg border text-xs font-semibold flex items-center gap-1 transition-colors ${
+                              openStoryId === rec.id
+                                ? 'bg-purple-500/20 border-purple-400 text-purple-200'
+                                : 'bg-[#171C26] border-white/10 text-purple-200 hover:text-white'
+                            }`}
+                            title="Auto-generate YouTube chapters, Mixcloud tracklist & social caption"
+                          >
+                            {mixStoryLoadingId === rec.id ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <BookOpen className="w-3.5 h-3.5" />
+                            )}
+                            <span>Mix Story</span>
+                          </button>
                           {rec.cueSheetText && (
                             <>
                               <button
@@ -1111,6 +1493,50 @@ export const RecordingModal: React.FC<RecordingModalProps> = ({
                         <pre className="p-2.5 rounded-lg bg-[#080A0E] border border-white/[0.06] text-[10.5px] font-mono text-slate-300 whitespace-pre-wrap max-h-36 overflow-y-auto">
                           {rec.cueSheetText}
                         </pre>
+                      )}
+                      {openStoryId === rec.id && rec.mixStory && (
+                        <div className="p-2.5 rounded-lg bg-[#080A0E] border border-purple-500/25 flex flex-col gap-1.5 text-[11px] text-slate-200">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-purple-200">
+                              Auto Chapter &amp; Mix-Story Export
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const fullText = [
+                                  rec.mixStory!.storySummary,
+                                  '',
+                                  'YOUTUBE CHAPTERS:',
+                                  rec.mixStory!.youtubeChapters,
+                                  '',
+                                  'SOCIAL CAPTION:',
+                                  rec.mixStory!.socialCaption,
+                                ].join('\n');
+                                void navigator.clipboard?.writeText(fullText);
+                                setCopiedStoryId(rec.id);
+                                setTimeout(() => setCopiedStoryId(null), 1600);
+                              }}
+                              className="px-2 py-0.5 rounded bg-purple-500/20 hover:bg-purple-500/35 border border-purple-400/40 text-[10px] font-semibold text-purple-200 flex items-center gap-1"
+                            >
+                              {copiedStoryId === rec.id ? (
+                                <>
+                                  <Check className="w-3 h-3" />
+                                  <span>Copied</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3 h-3" />
+                                  <span>Copy Story + Chapters</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
+                          <p className="text-slate-300">{rec.mixStory.storySummary}</p>
+                          <pre className="p-2 rounded bg-[#05070B] border border-white/[0.05] text-[10px] font-mono text-cyan-200 whitespace-pre-wrap max-h-28 overflow-y-auto">
+                            {rec.mixStory.youtubeChapters}
+                          </pre>
+                          <p className="text-[10.5px] text-amber-200">{rec.mixStory.socialCaption}</p>
+                        </div>
                       )}
                     </div>
                   );

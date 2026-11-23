@@ -16,9 +16,19 @@ import {
   Download,
   FolderOpen,
   X,
+  Shuffle,
+  ArrowLeftRight,
 } from 'lucide-react';
+import { requestGapFiller, requestGoldenMashups } from '../audio/groqDirector';
 import { extractYouTubeId, extractYouTubePlaylistId } from '../store/useLibraryStore';
-import { DeckId, Playlist, TrackItem, YouTubeSearchResult } from '../types/dj';
+import {
+  DeckId,
+  GapFillerResult,
+  GoldenMashupPair,
+  Playlist,
+  TrackItem,
+  YouTubeSearchResult,
+} from '../types/dj';
 
 interface LibraryPanelProps {
   tracks: TrackItem[];
@@ -49,6 +59,9 @@ interface LibraryPanelProps {
   deckBTrackId?: string | null;
   sidebarMode?: boolean;
   onCloseDrawer?: () => void;
+  onEnrichCrate?: () => void;
+  enrichingCrate?: boolean;
+  onLoadMashupPair?: (vocalTrack: TrackItem, instTrack: TrackItem, pair: GoldenMashupPair) => void;
 }
 
 async function parseApiJson<T = any>(res: Response): Promise<T> {
@@ -97,6 +110,9 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
   deckBTrackId,
   sidebarMode = false,
   onCloseDrawer,
+  onEnrichCrate,
+  enrichingCrate = false,
+  onLoadMashupPair,
 }) => {
   const [ytQuery, setYtQuery] = useState('');
   const [ytSearching, setYtSearching] = useState(false);
@@ -105,6 +121,13 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
   const [ytNotice, setYtNotice] = useState<string | null>(null);
 
   const [crateFilter, setCrateFilter] = useState('');
+  const [mashupsOpen, setMashupsOpen] = useState(false);
+  const [mashupsLoading, setMashupsLoading] = useState(false);
+  const [goldenPairs, setGoldenPairs] = useState<GoldenMashupPair[]>([]);
+  const [bridgeOpen, setBridgeOpen] = useState(false);
+  const [bridgePrompt, setBridgePrompt] = useState('');
+  const [bridgeLoading, setBridgeLoading] = useState(false);
+  const [bridgeResult, setBridgeResult] = useState<GapFillerResult | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const carloInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -234,6 +257,56 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
       setYtError(err?.message || 'Unable to query YouTube right now.');
     } finally {
       setYtSearching(false);
+    }
+  };
+
+  const runDirectYtSearch = async (queryStr: string) => {
+    const trimmed = queryStr.trim();
+    if (!trimmed) return;
+    setYtError(null);
+    setYtSearching(true);
+    try {
+      const res = await fetch(`/api/yt/search?q=${encodeURIComponent(trimmed)}`);
+      const data = await parseApiJson<{ results?: YouTubeSearchResult[]; error?: string }>(res);
+      if (!res.ok) throw new Error(data.error || 'YouTube search failed');
+      setYtResults(data.results || []);
+      if (!data.results?.length) setYtError('No YouTube tracks found for that search.');
+    } catch (err: any) {
+      setYtError(err?.message || 'Unable to query YouTube right now.');
+    } finally {
+      setYtSearching(false);
+    }
+  };
+
+  const handleScanMashups = async () => {
+    const sourceTracks = visibleTracks.length >= 2 ? visibleTracks : tracks;
+    if (sourceTracks.length < 2 || mashupsLoading) return;
+    setMashupsOpen(true);
+    setMashupsLoading(true);
+    try {
+      const res = await requestGoldenMashups({ tracks: sourceTracks });
+      setGoldenPairs(res.pairs);
+    } finally {
+      setMashupsLoading(false);
+    }
+  };
+
+  const handleBridgeSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!bridgePrompt.trim() || bridgeLoading) return;
+    setBridgeLoading(true);
+    try {
+      const res = await requestGapFiller({
+        query: bridgePrompt,
+        tracks: visibleTracks.length > 0 ? visibleTracks : tracks,
+      });
+      setBridgeResult(res);
+      if (res.searchQueries[0]) {
+        setYtQuery(res.searchQueries[0]);
+        await runDirectYtSearch(res.searchQueries[0]);
+      }
+    } finally {
+      setBridgeLoading(false);
     }
   };
 
@@ -570,21 +643,182 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
 
       {/* Active Playlist Actions + Track Filter */}
       <div className="px-3 py-2 border-b border-white/[0.06] flex flex-col gap-1.5 bg-[#0F131A] shrink-0">
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center justify-between gap-1.5">
           <span className="text-[11px] font-medium text-slate-300 truncate">
             {activePlaylist.name} ·{' '}
             <span className="font-mono text-slate-400 tabular-nums">
               {visibleTracks.length} tracks
             </span>
           </span>
-          <input
-            type="text"
-            value={crateFilter}
-            onChange={(e) => setCrateFilter(e.target.value)}
-            placeholder="Filter songs..."
-            className="h-6 w-32 px-2 rounded bg-[#090B0F] border border-white/10 text-[11px] text-white placeholder:text-slate-500 focus:outline-none focus:border-cyan-400"
-          />
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              disabled={tracks.length < 2 || mashupsLoading}
+              onClick={() => (mashupsOpen ? setMashupsOpen(false) : void handleScanMashups())}
+              className={`h-6 px-2 rounded border text-[10px] font-semibold flex items-center gap-1 transition-colors disabled:opacity-40 ${
+                mashupsOpen
+                  ? 'bg-purple-500/25 border-purple-400 text-purple-200'
+                  : 'bg-[#171C26] hover:bg-white/10 border-white/15 text-purple-200'
+              }`}
+              title="Golden Mashup Finder: scan crate for top Vocal-over-Instrumental pairs"
+            >
+              {mashupsLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Shuffle className="w-3 h-3" />}
+              <span>Mashups</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setBridgeOpen((v) => !v)}
+              className={`h-6 px-2 rounded border text-[10px] font-semibold flex items-center gap-1 transition-colors ${
+                bridgeOpen
+                  ? 'bg-amber-500/25 border-amber-400 text-amber-200'
+                  : 'bg-[#171C26] hover:bg-white/10 border-white/15 text-amber-200'
+              }`}
+              title="Crate Gap-Filler & Smart Bridge Search (e.g. 116 BPM Afrobeats -> 128 BPM Tech House)"
+            >
+              <ArrowLeftRight className="w-3 h-3" />
+              <span>Bridge</span>
+            </button>
+            {onEnrichCrate && (
+              <button
+                type="button"
+                disabled={visibleTracks.length === 0 || enrichingCrate}
+                onClick={onEnrichCrate}
+                className="h-6 px-2 rounded bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/40 text-[10px] font-semibold text-cyan-200 flex items-center gap-1 transition-colors disabled:opacity-40"
+                title="Enrich playlist with Groq Llama-3.1 sub-genre, crowd moment, mood & energy ratings"
+              >
+                {enrichingCrate ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Sparkles className="w-3 h-3" />
+                )}
+                <span>{enrichingCrate ? 'Enriching...' : 'AI Enrich'}</span>
+              </button>
+            )}
+            <input
+              type="text"
+              value={crateFilter}
+              onChange={(e) => setCrateFilter(e.target.value)}
+              placeholder="Filter..."
+              className="h-6 w-20 px-2 rounded bg-[#090B0F] border border-white/10 text-[11px] text-white placeholder:text-slate-500 focus:outline-none focus:border-cyan-400"
+            />
+          </div>
         </div>
+
+        {/* Golden Mashup Finder Drawer */}
+        {mashupsOpen && (
+          <div className="bg-[#0B0E14] border border-purple-500/30 rounded-lg p-2 flex flex-col gap-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10.5px] font-semibold text-purple-200">
+                Golden Mashup Finder ({goldenPairs.length})
+              </span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void handleScanMashups()}
+                  disabled={mashupsLoading}
+                  className="text-[10px] text-purple-300 hover:text-white"
+                >
+                  {mashupsLoading ? 'Scanning...' : 'Rescan'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMashupsOpen(false)}
+                  className="text-[10px] text-slate-400 hover:text-white"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            {mashupsLoading ? (
+              <div className="text-[10.5px] text-slate-400 py-1">Analyzing BPM, Camelot keys & vocal pockets...</div>
+            ) : goldenPairs.length === 0 ? (
+              <div className="text-[10.5px] text-slate-400 py-1">Add at least 2 tracks to find mashup pairs.</div>
+            ) : (
+              <div className="flex flex-col gap-1 max-h-36 overflow-y-auto">
+                {goldenPairs.map((pair, idx) => {
+                  const vTrack = tracks.find((t) => t.id === pair.vocalTrackId);
+                  const iTrack = tracks.find((t) => t.id === pair.instTrackId);
+                  if (!vTrack || !iTrack) return null;
+                  return (
+                    <div
+                      key={`${pair.vocalTrackId}-${pair.instTrackId}-${idx}`}
+                      className="p-1.5 rounded bg-[#121620] border border-white/[0.06] flex items-center justify-between gap-2"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[10.5px] font-semibold text-white truncate">
+                          <span className="text-purple-300">{Math.round(pair.compatibilityScore)}%</span>{' '}
+                          · {vTrack.title.split('(')[0].trim()} × {iTrack.title.split('(')[0].trim()}
+                        </div>
+                        <div className="text-[9.5px] text-slate-400 truncate">
+                          {pair.reason} · {pair.template}
+                        </div>
+                      </div>
+                      {onLoadMashupPair && (
+                        <button
+                          type="button"
+                          onClick={() => onLoadMashupPair(vTrack, iTrack, pair)}
+                          className="h-6 px-2 rounded bg-purple-500 hover:bg-purple-400 text-[#090B0F] text-[10px] font-bold shrink-0"
+                        >
+                          Load A+B
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Crate Gap-Filler & Smart Bridge Search Drawer */}
+        {bridgeOpen && (
+          <div className="bg-[#0B0E14] border border-amber-500/30 rounded-lg p-2 flex flex-col gap-1.5">
+            <form onSubmit={handleBridgeSearch} className="flex items-center gap-1.5">
+              <input
+                type="text"
+                value={bridgePrompt}
+                onChange={(e) => setBridgePrompt(e.target.value)}
+                placeholder="Bridge e.g. 116 BPM Afro into 128 BPM House..."
+                className="flex-1 min-w-0 h-6 px-2 rounded bg-[#121620] border border-white/10 text-[10.5px] text-white placeholder:text-slate-500 focus:outline-none focus:border-amber-400"
+              />
+              <button
+                type="submit"
+                disabled={bridgeLoading || !bridgePrompt.trim()}
+                className="h-6 px-2 rounded bg-amber-400 hover:bg-amber-300 text-[#090B0F] text-[10px] font-bold flex items-center gap-1 shrink-0 disabled:opacity-45"
+              >
+                {bridgeLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
+                <span>Find</span>
+              </button>
+            </form>
+            {bridgeResult && (
+              <div className="flex flex-col gap-1 text-[10px] text-slate-300">
+                <div className="text-amber-200 font-semibold">
+                  Target {bridgeResult.targetBpmMin}–{bridgeResult.targetBpmMax} BPM · Keys{' '}
+                  {bridgeResult.targetKeys.join(', ')}
+                </div>
+                <div className="text-slate-400">
+                  {bridgeResult.summary}
+                  {bridgeResult.vibeNote ? ` — ${bridgeResult.vibeNote}` : ''}
+                </div>
+                <div className="flex flex-wrap gap-1 pt-0.5">
+                  {bridgeResult.searchQueries.map((q) => (
+                    <button
+                      key={q}
+                      type="button"
+                      onClick={() => {
+                        setYtQuery(q);
+                        void runDirectYtSearch(q);
+                      }}
+                      className="px-1.5 py-0.5 rounded bg-[#171C26] hover:bg-amber-500/20 border border-white/10 text-[9.5px] text-amber-200"
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="grid grid-cols-2 gap-1.5">
           <button
@@ -662,6 +896,15 @@ export const LibraryPanel: React.FC<LibraryPanelProps> = ({
                         {track.artist} · {track.bpm.toFixed(0)} BPM · {track.musicalKey} ·{' '}
                         {formatDuration(track.durationSec)} · {srcLabel}
                       </p>
+                      {(track.enrichment || track.lyricCues?.words?.length) && (
+                        <p className="text-[9.5px] text-cyan-300/85 truncate font-mono mt-0.5">
+                          {track.enrichment
+                            ? `${track.enrichment.subGenre} · ${track.enrichment.crowdMoment} · E${track.enrichment.energyScore}`
+                            : ''}
+                          {track.enrichment && track.lyricCues?.words?.length ? ' · ' : ''}
+                          {track.lyricCues?.words?.length ? 'Lyrics✓' : ''}
+                        </p>
+                      )}
                     </div>
                   </div>
 

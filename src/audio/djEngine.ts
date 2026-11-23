@@ -1,22 +1,35 @@
 import {
+  BootlegFlipPreset,
+  CleanEditMaskMode,
   CrossfaderCurve,
   DeckFxState,
   DeckId,
   DjVoiceDropId,
   FxType,
   GrooveBridgePattern,
+  HarmonicSynthLayerMode,
+  MicFxState,
+  ReactiveAdLibKind,
   SoundTrickType,
   StemIsolationMode,
+  StutterSubdiv,
   WaveformBandSample,
 } from '../types/dj';
 import { ensurePitchWorkletLoaded } from './timeStretchWorklet';
 import { encodeStereoChunksToWav } from './waveformAnalyzer';
 import {
+  camelotToHarmony,
+  createReverseReverbSwellBuffer,
   createSynthNoiseBuffer,
+  scheduleBootlegFlipStepSynth,
   scheduleBuildUpSequenceSynth,
+  scheduleCleanEditMaskAudio,
   scheduleCustomVoiceBufferSynth,
   scheduleGrooveBridgeStepSynth,
+  scheduleHarmonicLayerStepSynth,
   scheduleSoundTrickSynth,
+  scheduleSubBass808Hit,
+  scheduleVocalChopSoloPhrase,
   scheduleVoiceDropSynth,
 } from './webAudioSynths';
 
@@ -105,7 +118,9 @@ class DeckChannel {
   public eqMid: BiquadFilterNode;
   public eqHigh: BiquadFilterNode;
   private vocalSidechainFilter: BiquadFilterNode;
+  private subSwapHp: BiquadFilterNode;
   public sweepFilter: BiquadFilterNode;
+  private cleanMaskUntilCtxTime = 0;
 
   // FX send/return
   private dryGain: GainNode;
@@ -386,6 +401,11 @@ class DeckChannel {
     this.vocalSidechainFilter.frequency.value = 1750;
     this.vocalSidechainFilter.Q.value = 0.85;
     this.vocalSidechainFilter.gain.value = 0;
+
+    this.subSwapHp = ctx.createBiquadFilter();
+    this.subSwapHp.type = 'highpass';
+    this.subSwapHp.frequency.value = 18;
+    this.subSwapHp.Q.value = 0.707;
 
     this.sweepFilter = ctx.createBiquadFilter();
     this.sweepFilter.type = 'lowpass';
@@ -771,7 +791,8 @@ class DeckChannel {
     this.eqLow.connect(this.eqMid);
     this.eqMid.connect(this.eqHigh);
     this.eqHigh.connect(this.vocalSidechainFilter);
-    this.vocalSidechainFilter.connect(this.sweepFilter);
+    this.vocalSidechainFilter.connect(this.subSwapHp);
+    this.subSwapHp.connect(this.sweepFilter);
 
     widthMerger.connect(this.dryGain);
     widthMerger.connect(this.fxInput);
@@ -817,8 +838,65 @@ class DeckChannel {
   }
 
   setSemitoneShift(semitones: number) {
-    this.semitoneShift = Math.max(-4, Math.min(4, semitones));
+    this.semitoneShift = Math.max(-7, Math.min(12, semitones));
     this.updatePitchShiftParam();
+  }
+
+  getSemitoneShift(): number {
+    return this.semitoneShift;
+  }
+
+  rampSemitoneShift(fromSemi: number, toSemi: number, durationSec: number) {
+    this.semitoneShift = Math.max(-7, Math.min(12, toSemi));
+    if (!this.pitchWorklet) return;
+    const param = this.pitchWorklet.parameters.get('pitchFactor');
+    if (!param) return;
+    const baseComp = this.keyLock ? 1 / Math.max(0.4, this.playbackRate) : 1;
+    const startFactor = Math.max(0.55, Math.min(1.85, baseComp * Math.pow(2, fromSemi / 12)));
+    const endFactor = Math.max(0.55, Math.min(1.85, baseComp * Math.pow(2, toSemi / 12)));
+    const now = this.ctx.currentTime;
+    const dur = Math.max(0.4, Math.min(24, durationSec));
+    try {
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(startFactor, now);
+      param.linearRampToValueAtTime(endFactor, now + dur);
+    } catch {
+      param.setTargetAtTime(endFactor, now, Math.max(0.1, dur * 0.25));
+    }
+  }
+
+  setSubSwapFilter(enabled: boolean) {
+    this.subSwapHp.frequency.setTargetAtTime(enabled ? 86 : 18, this.ctx.currentTime, 0.025);
+  }
+
+  maskCleanEdit(mode: CleanEditMaskMode, bpm: number, durSec: number, noiseBuf: AudioBuffer) {
+    if (mode === 'off') return;
+    const now = this.ctx.currentTime;
+    if (now < this.cleanMaskUntilCtxTime) return;
+    const safeDur = Math.max(0.16, Math.min(0.65, durSec));
+    this.cleanMaskUntilCtxTime = now + safeDur + 0.18;
+
+    try {
+      this.trimGain.gain.cancelScheduledValues(now);
+      this.trimGain.gain.setValueAtTime(this.activeTrimValue, now);
+      this.trimGain.gain.linearRampToValueAtTime(0.02, now + 0.014);
+      this.trimGain.gain.setValueAtTime(0.02, now + Math.max(0.04, safeDur - 0.02));
+      this.trimGain.gain.linearRampToValueAtTime(this.activeTrimValue, now + safeDur + 0.02);
+    } catch {
+      // ignore gain overlap
+    }
+
+    if (mode === 'reverse' || mode === 'chirp') {
+      scheduleCleanEditMaskAudio({
+        ctx: this.ctx,
+        noiseBuf,
+        dest: this.sweepFilter,
+        mode,
+        atTime: now,
+        durSec: safeDur,
+        bpm,
+      });
+    }
   }
 
   setHpssBuffers(
@@ -1263,6 +1341,66 @@ class DeckChannel {
     });
   }
 
+  /**
+   * 16-Step Quantized Rhythmic Stutter Slicer (1/4, 1/8, 1/16, 1/32 rolls)
+   */
+  triggerStutterRoll(params: {
+    currentSec: number;
+    bpm: number;
+    subdiv: StutterSubdiv;
+    steps?: number;
+  }) {
+    if (!this.buffer || this.buffer.duration < 4) return;
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+    const bpm = Math.max(65, Math.min(185, params.bpm || 124));
+    const beatSec = 60 / bpm;
+    const divMap: Record<StutterSubdiv, number> = {
+      '1/4': 1,
+      '1/8': 0.5,
+      '1/16': 0.25,
+      '1/32': 0.125,
+    };
+    const sliceDur = Math.max(0.055, Math.min(0.48, beatSec * divMap[params.subdiv]));
+    const steps = Math.max(4, Math.min(16, params.steps ?? (params.subdiv === '1/32' ? 16 : 8)));
+    const totalDur = steps * sliceDur;
+    const anchorOffset = Math.max(
+      0.1,
+      Math.min(this.buffer.duration - sliceDur - 0.1, params.currentSec)
+    );
+
+    this.sliceDuckUntilCtxTime = now + totalDur;
+    this.trimGain.gain.setValueAtTime(this.activeTrimValue, now);
+    this.trimGain.gain.linearRampToValueAtTime(this.activeTrimValue * 0.12, now + 0.01);
+    this.trimGain.gain.setValueAtTime(
+      this.activeTrimValue * 0.12,
+      now + Math.max(0.04, totalDur - 0.03)
+    );
+    this.trimGain.gain.linearRampToValueAtTime(this.activeTrimValue, now + totalDur + 0.018);
+
+    const fade = Math.min(0.005, sliceDur * 0.14);
+    const gateDuty = params.subdiv === '1/32' ? 0.78 : 0.86;
+    for (let i = 0; i < steps; i++) {
+      // Rhythmic 16-step gate velocity pattern
+      const stepVel = i % 4 === 0 ? 1.08 : i % 2 === 0 ? 0.92 : 0.72;
+      const startCtx = now + i * sliceDur;
+      const playDur = sliceDur * gateDuty;
+      const src = ctx.createBufferSource();
+      src.buffer = this.buffer;
+      src.playbackRate.setValueAtTime(this.playbackRate, startCtx);
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.001, startCtx);
+      env.gain.linearRampToValueAtTime(stepVel, startCtx + fade);
+      env.gain.setValueAtTime(stepVel, Math.max(startCtx + fade, startCtx + playDur - fade));
+      env.gain.exponentialRampToValueAtTime(0.001, startCtx + playDur);
+
+      src.connect(env);
+      env.connect(this.sweepFilter);
+      src.start(startCtx, anchorOffset, playDur + 0.01);
+    }
+  }
+
   updateEqAndFilter(params: {
     trim: number;
     low: number;
@@ -1503,6 +1641,62 @@ export class DjAudioEngine {
   private roomReverbImpulse: AudioBuffer | null = null;
   private pitchWorkletReady = false;
 
+  // Bootleg Flip & Harmonic Synth Layer step sequencer state (shared 25ms clock)
+  private deckBootlegs: Record<DeckId, { preset: BootlegFlipPreset; bpm: number; key: string; rate: number }> = {
+    A: { preset: 'off', bpm: 124, key: '8A', rate: 1 },
+    B: { preset: 'off', bpm: 124, key: '8A', rate: 1 },
+  };
+  private harmonicLayerMode: HarmonicSynthLayerMode = 'off';
+  private harmonicLayerBpm = 124;
+  private harmonicLayerKey = '8A';
+  private harmonicLayerPitchRate = 1;
+  private layerTimerId: ReturnType<typeof setInterval> | null = null;
+  private layerStep = 0;
+  private layerBar = 0;
+  private layerNextStepTime = 0;
+
+  // Sub-Bass 808 Re-Synthesizer monitor state
+  private deckSubSwaps: Record<
+    DeckId,
+    { enabled: boolean; mode: 'sine' | 'triangle'; musicalKey: string; prevLow: number; lastHitAt: number }
+  > = {
+    A: { enabled: false, mode: 'sine', musicalKey: '8A', prevLow: 0, lastHitAt: 0 },
+    B: { enabled: false, mode: 'sine', musicalKey: '8A', prevLow: 0, lastHitAt: 0 },
+  };
+  private subSwapTimerId: ReturnType<typeof setInterval> | null = null;
+  private pitchRollTimers: Record<DeckId, ReturnType<typeof setTimeout>[]> = { A: [], B: [] };
+
+  // Reactive MC / Hype Ad-Lib Engine cache
+  private reactiveAdLibBuffers: Partial<Record<ReactiveAdLibKind, AudioBuffer>> = {};
+  private lastAdLibAt = 0;
+
+  // Live Mic FX Rack + 4-Bar Quantized Overdub Looper state
+  private micStream: MediaStream | null = null;
+  private micSource: MediaStreamAudioSourceNode | null = null;
+  private micRadioHp: BiquadFilterNode | null = null;
+  private micRadioLp: BiquadFilterNode | null = null;
+  private micRadioPeak: BiquadFilterNode | null = null;
+  private micDubDelay: DelayNode | null = null;
+  private micDubFeedback: GainNode | null = null;
+  private micDubWetGain: GainNode | null = null;
+  private micDryGain: GainNode | null = null;
+  private micMonitorGain: GainNode | null = null;
+  private micCaptureProc: ScriptProcessorNode | null = null;
+  private micLoopBuffer: AudioBuffer | null = null;
+  private micLoopSource: AudioBufferSourceNode | null = null;
+  private micLoopCaptureBuf: Float32Array | null = null;
+  private micLoopWriteIdx = 0;
+  private micFxState: MicFxState = {
+    active: false,
+    radioEq: true,
+    dubWet: 0.25,
+    monitoring: true,
+    loopRecording: false,
+    loopPlaying: false,
+    loopHasAudio: false,
+  };
+  private masterFreqData: Uint8Array<ArrayBuffer> | null = null;
+
   private ensureInit() {
     if (this.ctx && this.decks) return;
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -1617,6 +1811,7 @@ export class DjAudioEngine {
     this.masterAnalyser = ctx.createAnalyser();
     this.masterAnalyser.fftSize = 256;
     this.masterData = new Float32Array(new ArrayBuffer(this.masterAnalyser.fftSize * 4));
+    this.masterFreqData = new Uint8Array(new ArrayBuffer(this.masterAnalyser.frequencyBinCount));
 
     this.recordBus = ctx.createGain();
     this.recordBus.gain.value = 1.0;
@@ -1835,6 +2030,276 @@ export class DjAudioEngine {
   ) {
     this.ensureInit();
     this.decks![deckId].triggerBeatSlices(params);
+  }
+
+  public async triggerDeckStutterRoll(
+    deckId: DeckId,
+    params: {
+      currentSec: number;
+      bpm: number;
+      subdiv: StutterSubdiv;
+      steps?: number;
+    }
+  ) {
+    await this.resume();
+    this.decks![deckId].triggerStutterRoll(params);
+  }
+
+  /**
+   * Live Tone-Play: pitches Deck C vocal hook (or a live vocal/harmonic syllable grain from the deck)
+   * chromatically across Camelot scale degrees with lush stereo echo/reverb.
+   */
+  public async triggerTonePlayNote(
+    deckId: DeckId,
+    params: {
+      semitoneOffset: number;
+      currentSec: number;
+      bpm: number;
+      dropCueSec?: number;
+      musicalKey?: string;
+    }
+  ) {
+    const ctx = await this.resume();
+    if (!this.decks || !this.masterSum) return;
+    const ch = this.decks[deckId];
+    const srcBuf = this.deckCHookBuffer || ch.getHarmonicBuffer() || ch.buffer;
+    if (!srcBuf || srcBuf.duration < 0.4) return;
+
+    const now = ctx.currentTime;
+    const isDeckC = srcBuf === this.deckCHookBuffer;
+    const beatSec = 60 / Math.max(65, Math.min(185, params.bpm || 124));
+    const grainDur = Math.max(0.18, Math.min(0.45, beatSec * 0.72));
+    const anchorSec = isDeckC
+      ? 0.02
+      : Math.max(
+          0.1,
+          Math.min(
+            srcBuf.duration - grainDur - 0.1,
+            typeof params.dropCueSec === 'number' && params.dropCueSec > 4
+              ? params.dropCueSec
+              : params.currentSec
+          )
+        );
+    const pitchMult = Math.pow(2, Math.max(-12, Math.min(12, params.semitoneOffset)) / 12);
+
+    const src = ctx.createBufferSource();
+    src.buffer = srcBuf;
+    src.playbackRate.setValueAtTime(pitchMult, now);
+
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.setValueAtTime(220, now);
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(4200, now);
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.001, now);
+    env.gain.linearRampToValueAtTime(0.68, now + 0.015);
+    env.gain.setValueAtTime(0.64, now + Math.max(0.05, grainDur - 0.07));
+    env.gain.exponentialRampToValueAtTime(0.001, now + grainDur);
+
+    const voiceOut = this.postDuckSum || this.masterSum;
+    src.connect(hp);
+    hp.connect(lp);
+    lp.connect(env);
+    env.connect(voiceOut);
+
+    if (this.roomReverbImpulse) {
+      const conv = ctx.createConvolver();
+      conv.buffer = this.roomReverbImpulse;
+      const wet = ctx.createGain();
+      wet.gain.value = 0.28;
+      env.connect(conv);
+      conv.connect(wet);
+      wet.connect(voiceOut);
+    }
+
+    src.start(now, anchorSec, grainDur * pitchMult + 0.04);
+  }
+
+  /**
+   * Reverse-Reverb Vocal Swell Drop Prep: renders reversed harmonic vocal tail and fires it into master.
+   */
+  public async triggerReverseReverbSwell(
+    deckId: DeckId,
+    params: {
+      cueSec: number;
+      bpm: number;
+      beats?: number;
+      withTapeStopOnOther?: boolean;
+    }
+  ): Promise<number> {
+    const ctx = await this.resume();
+    if (!this.decks || !this.masterSum) return 0;
+    const ch = this.decks[deckId];
+    const srcBuf = ch.getHarmonicBuffer() || ch.buffer;
+    if (!srcBuf) return 0;
+
+    const swellBuf = await createReverseReverbSwellBuffer({
+      sourceBuffer: srcBuf,
+      cueSec: params.cueSec,
+      bpm: params.bpm,
+      beats: params.beats ?? 1.5,
+    });
+    if (!swellBuf) return 0;
+
+    const now = ctx.currentTime + 0.02;
+    const src = ctx.createBufferSource();
+    src.buffer = swellBuf;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.9, now);
+    src.connect(g);
+    g.connect(this.postDuckSum || this.masterSum);
+    src.start(now);
+
+    if (params.withTapeStopOnOther) {
+      const otherId: DeckId = deckId === 'A' ? 'B' : 'A';
+      if (this.isDeckPlaying(otherId)) {
+        const brakeAt = Math.max(0.35, swellBuf.duration - 0.15);
+        setTimeout(() => {
+          this.triggerDeckTapeBrake(otherId, 0.55);
+        }, Math.max(40, Math.round((brakeAt - 0.5) * 1000)));
+      }
+    }
+    return swellBuf.duration;
+  }
+
+  private ensureLayerTimer() {
+    if (!this.ctx) return;
+    const anyBootleg =
+      this.deckBootlegs.A.preset === 'jersey-club' ||
+      this.deckBootlegs.A.preset === 'amapiano' ||
+      this.deckBootlegs.A.preset === 'phonk' ||
+      this.deckBootlegs.B.preset === 'jersey-club' ||
+      this.deckBootlegs.B.preset === 'amapiano' ||
+      this.deckBootlegs.B.preset === 'phonk';
+    const needTimer = anyBootleg || this.harmonicLayerMode !== 'off';
+
+    if (!needTimer) {
+      if (this.layerTimerId) {
+        clearInterval(this.layerTimerId);
+        this.layerTimerId = null;
+      }
+      return;
+    }
+    if (this.layerTimerId) return;
+
+    this.layerStep = 0;
+    this.layerBar = 0;
+    this.layerNextStepTime = this.ctx.currentTime + 0.03;
+    this.layerTimerId = setInterval(() => {
+      if (!this.ctx || !this.masterSum) return;
+      const noiseBuf = this.ensureBridgeNoise(this.ctx);
+
+      const activeDeckId: DeckId | null =
+        this.decks?.A.isPlaying && this.deckBootlegs.A.preset !== 'off'
+          ? 'A'
+          : this.decks?.B.isPlaying && this.deckBootlegs.B.preset !== 'off'
+          ? 'B'
+          : this.deckBootlegs.A.preset !== 'off'
+          ? 'A'
+          : this.deckBootlegs.B.preset !== 'off'
+          ? 'B'
+          : null;
+
+      const refBpm = activeDeckId
+        ? this.deckBootlegs[activeDeckId].bpm * this.deckBootlegs[activeDeckId].rate
+        : this.harmonicLayerBpm * this.harmonicLayerPitchRate;
+      const stepSec = 60 / Math.max(65, Math.min(190, refBpm || 124)) / 4;
+
+      while (this.layerNextStepTime < this.ctx.currentTime + 0.12) {
+        for (const id of ['A', 'B'] as const) {
+          const cfg = this.deckBootlegs[id];
+          if (
+            cfg.preset !== 'off' &&
+            cfg.preset !== 'slowed-reverb' &&
+            cfg.preset !== 'nightcore' &&
+            this.decks?.[id].isPlaying
+          ) {
+            scheduleBootlegFlipStepSynth({
+              ctx: this.ctx,
+              dest: this.masterSum,
+              noiseBuf,
+              stepIdx: this.layerStep,
+              barIdx: this.layerBar,
+              atTime: this.layerNextStepTime,
+              preset: cfg.preset,
+              bpm: cfg.bpm * cfg.rate,
+              musicalKey: cfg.key,
+              pitchRate: cfg.rate,
+            });
+          }
+        }
+        if (this.harmonicLayerMode !== 'off') {
+          scheduleHarmonicLayerStepSynth({
+            ctx: this.ctx,
+            dest: this.masterSum,
+            stepIdx: this.layerStep,
+            barIdx: this.layerBar,
+            atTime: this.layerNextStepTime,
+            mode: this.harmonicLayerMode,
+            bpm: this.harmonicLayerBpm,
+            musicalKey: this.harmonicLayerKey,
+            pitchRate: this.harmonicLayerPitchRate,
+          });
+        }
+        this.layerNextStepTime += stepSec;
+        this.layerStep = (this.layerStep + 1) % 16;
+        if (this.layerStep === 0) {
+          this.layerBar = (this.layerBar + 1) % 4;
+        }
+      }
+    }, 25);
+  }
+
+  public async setDeckBootlegFlip(
+    deckId: DeckId,
+    preset: BootlegFlipPreset,
+    bpm = 124,
+    musicalKey = '8A',
+    pitchRate = 1
+  ) {
+    await this.resume();
+    this.deckBootlegs[deckId] = {
+      preset,
+      bpm: Math.max(65, Math.min(185, bpm || 124)),
+      key: musicalKey || '8A',
+      rate: Math.max(0.5, Math.min(2.0, pitchRate || 1)),
+    };
+    this.ensureLayerTimer();
+  }
+
+  public async setHarmonicSynthLayer(
+    mode: HarmonicSynthLayerMode,
+    bpm = 124,
+    musicalKey = '8A',
+    pitchRate = 1
+  ) {
+    await this.resume();
+    this.harmonicLayerMode = mode;
+    this.harmonicLayerBpm = Math.max(65, Math.min(185, bpm || 124));
+    this.harmonicLayerKey = musicalKey || '8A';
+    this.harmonicLayerPitchRate = Math.max(0.5, Math.min(2.0, pitchRate || 1));
+    this.ensureLayerTimer();
+  }
+
+  public updateLayerClock(bpm: number, musicalKey?: string, pitchRate?: number) {
+    this.harmonicLayerBpm = Math.max(65, Math.min(185, bpm || 124));
+    if (musicalKey) this.harmonicLayerKey = musicalKey;
+    if (typeof pitchRate === 'number' && pitchRate > 0) {
+      this.harmonicLayerPitchRate = pitchRate;
+    }
+    for (const id of ['A', 'B'] as const) {
+      if (this.deckBootlegs[id].preset !== 'off') {
+        this.deckBootlegs[id].bpm = this.harmonicLayerBpm;
+        if (musicalKey) this.deckBootlegs[id].key = musicalKey;
+        if (typeof pitchRate === 'number' && pitchRate > 0) {
+          this.deckBootlegs[id].rate = pitchRate;
+        }
+      }
+    }
   }
 
   public computeCrossfaderGains(
@@ -2411,6 +2876,580 @@ export class DjAudioEngine {
 
   public getGrooveBridgePattern(): GrooveBridgePattern {
     return this.bridgePattern;
+  }
+
+  // =========================================================================
+  // 1. Pitch-Escalating Loop Roll & Polyrhythmic Beat-Repeat (3/8 & 3/16)
+  // =========================================================================
+
+  public async triggerDeckPitchLoopRoll(
+    deckId: DeckId,
+    params: {
+      currentSec: number;
+      bpm: number;
+      mode: 'escalate-roll' | 'poly-3-8' | 'poly-3-16';
+      baseSemitones?: number;
+    }
+  ) {
+    const ctx = await this.resume();
+    if (!this.decks) return;
+    const ch = this.decks[deckId];
+    if (!ch.buffer || ch.buffer.duration < 4) return;
+
+    this.pitchRollTimers[deckId].forEach((id) => clearTimeout(id));
+    this.pitchRollTimers[deckId] = [];
+
+    const bpm = Math.max(65, Math.min(185, params.bpm || 124));
+    const beatSec = 60 / bpm;
+    const barSec = beatSec * 4;
+    const baseSemi = params.baseSemitones ?? ch.getSemitoneShift();
+
+    if (params.mode === 'escalate-roll') {
+      // Narrowing 1 -> 1/2 -> 1/4 -> 1/8 -> 1/16 bar loop roll climbing +1 semitone per step
+      const stages = [
+        { loopSec: barSec * 1.0, durMs: Math.round(barSec * 1000), semi: baseSemi + 0 },
+        { loopSec: barSec * 0.5, durMs: Math.round(barSec * 500), semi: baseSemi + 1 },
+        { loopSec: barSec * 0.25, durMs: Math.round(barSec * 500), semi: baseSemi + 2 },
+        { loopSec: barSec * 0.125, durMs: Math.round(barSec * 500), semi: baseSemi + 3 },
+        { loopSec: barSec * 0.0625, durMs: Math.round(barSec * 500), semi: baseSemi + 4 },
+      ];
+      const anchor = Math.max(0.1, Math.min(ch.buffer.duration - barSec - 0.2, params.currentSec));
+      let elapsedMs = 0;
+
+      stages.forEach((st) => {
+        const tid = setTimeout(() => {
+          ch.setLoop(true, anchor, anchor + st.loopSec);
+          ch.setSemitoneShift(st.semi);
+        }, elapsedMs);
+        this.pitchRollTimers[deckId].push(tid);
+        elapsedMs += st.durMs;
+      });
+
+      const resetId = setTimeout(() => {
+        ch.setLoop(false, 0, 0);
+        ch.setSemitoneShift(baseSemi);
+      }, elapsedMs + 20);
+      this.pitchRollTimers[deckId].push(resetId);
+      return;
+    }
+
+    // Polyrhythmic Dotted 3/8 (0.75 beat) or 3/16 (0.375 beat) Stutter Beat-Repeat
+    const sliceBeats = params.mode === 'poly-3-8' ? 0.75 : 0.375;
+    const sliceDur = Math.max(0.09, Math.min(0.55, beatSec * sliceBeats));
+    const steps = params.mode === 'poly-3-8' ? 6 : 10;
+    const now = ctx.currentTime;
+    const anchor = Math.max(0.1, Math.min(ch.buffer.duration - sliceDur - 0.1, params.currentSec));
+
+    ch.triggerBeatSlices({
+      currentSec: anchor,
+      bpm,
+      pattern: Array.from({ length: steps }, () => 0),
+      sliceBeats,
+    });
+    void now;
+  }
+
+  // =========================================================================
+  // 2. Sub-Bass Re-Synthesizer ("In-Key 808 Sub Swap")
+  // =========================================================================
+
+  private ensureSubSwapTimer() {
+    const anyOn = this.deckSubSwaps.A.enabled || this.deckSubSwaps.B.enabled;
+    if (!anyOn) {
+      if (this.subSwapTimerId) {
+        clearInterval(this.subSwapTimerId);
+        this.subSwapTimerId = null;
+      }
+      return;
+    }
+    if (this.subSwapTimerId) return;
+
+    this.subSwapTimerId = setInterval(() => {
+      if (!this.ctx || !this.decks || !this.masterSum) return;
+      const now = this.ctx.currentTime;
+      for (const id of ['A', 'B'] as const) {
+        const cfg = this.deckSubSwaps[id];
+        const ch = this.decks[id];
+        if (!cfg.enabled || !ch.isPlaying) {
+          cfg.prevLow = 0;
+          continue;
+        }
+        const low = ch.getLowBandEnergy();
+        const delta = low - cfg.prevLow;
+        cfg.prevLow = low;
+        if (low > 0.31 && delta > 0.045 && now - cfg.lastHitAt > 0.19) {
+          cfg.lastHitAt = now;
+          const harm = camelotToHarmony(cfg.musicalKey, ch.playbackRate);
+          scheduleSubBass808Hit({
+            ctx: this.ctx,
+            dest: this.masterSum,
+            rootHz: harm.rootHz,
+            mode: cfg.mode,
+            atTime: now + 0.005,
+            gainAmt: 0.46,
+            decaySec: 0.28,
+          });
+        }
+      }
+    }, 25);
+  }
+
+  public async setDeckSubSwap(
+    deckId: DeckId,
+    enabled: boolean,
+    mode: 'sine' | 'triangle' = 'sine',
+    musicalKey = '8A'
+  ) {
+    await this.resume();
+    this.deckSubSwaps[deckId].enabled = enabled;
+    this.deckSubSwaps[deckId].mode = mode;
+    this.deckSubSwaps[deckId].musicalKey = musicalKey || '8A';
+    this.decks?.[deckId].setSubSwapFilter(enabled);
+    this.ensureSubSwapTimer();
+  }
+
+  // =========================================================================
+  // 3. Vocal-Hook Echo Freeze + Instant Acapella Tail (Deck C 2.0)
+  // =========================================================================
+
+  public async triggerVocalEchoFreeze(
+    deckId: DeckId,
+    params: { currentSec: number; bpm: number }
+  ): Promise<boolean> {
+    const ctx = await this.resume();
+    if (!this.decks || !this.masterSum) return false;
+    const ch = this.decks[deckId];
+    const srcBuf = ch.getHarmonicBuffer() || ch.buffer;
+    if (!srcBuf || srcBuf.duration < 2) return false;
+
+    const bpm = Math.max(65, Math.min(185, params.bpm || 124));
+    const beatSec = 60 / bpm;
+    const sliceDur = Math.max(0.45, Math.min(1.6, beatSec * 1.5));
+    const startSec = Math.max(0, Math.min(srcBuf.duration - sliceDur - 0.05, params.currentSec - sliceDur * 0.5));
+    const sr = srcBuf.sampleRate;
+    const startSample = Math.floor(startSec * sr);
+    const frameCount = Math.max(2048, Math.min(srcBuf.length - startSample, Math.floor(sliceDur * sr)));
+    const numCh = Math.min(2, srcBuf.numberOfChannels);
+
+    const clip = ctx.createBuffer(numCh, frameCount, sr);
+    const fade = Math.min(Math.floor(sr * 0.018), Math.floor(frameCount * 0.15));
+    for (let c = 0; c < numCh; c++) {
+      const srcData = srcBuf.getChannelData(c);
+      const dstData = clip.getChannelData(c);
+      for (let i = 0; i < frameCount; i++) {
+        let env = 1;
+        if (i < fade) env = i / fade;
+        else if (i > frameCount - fade) env = (frameCount - i) / fade;
+        dstData[i] = srcData[startSample + i] * env;
+      }
+    }
+
+    const now = ctx.currentTime;
+    const src = ctx.createBufferSource();
+    src.buffer = clip;
+
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 290;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 4200;
+
+    // Regenerative 1/2-beat ping-pong dub delay tail wired directly to postDuckSum
+    const delayL = ctx.createDelay(2.0);
+    delayL.delayTime.value = Math.min(1.5, beatSec * 0.5);
+    const delayR = ctx.createDelay(2.0);
+    delayR.delayTime.value = Math.min(1.5, beatSec * 0.75);
+    const fbL = ctx.createGain();
+    fbL.gain.value = 0.58;
+    const fbR = ctx.createGain();
+    fbR.gain.value = 0.58;
+    const panL = ctx.createStereoPanner();
+    panL.pan.value = -0.72;
+    const panR = ctx.createStereoPanner();
+    panR.pan.value = 0.72;
+    const tailMaster = ctx.createGain();
+    tailMaster.gain.setValueAtTime(0.85, now);
+    tailMaster.gain.setValueAtTime(0.85, now + Math.max(0.8, beatSec * 6));
+    tailMaster.gain.exponentialRampToValueAtTime(0.001, now + Math.max(2.0, beatSec * 12));
+
+    const outDest = this.postDuckSum || this.masterSum;
+    src.connect(hp);
+    hp.connect(lp);
+    lp.connect(tailMaster);
+    lp.connect(delayL);
+    delayL.connect(fbL);
+    fbL.connect(delayR);
+    delayR.connect(fbR);
+    fbR.connect(delayL);
+    delayL.connect(panL);
+    delayR.connect(panR);
+    panL.connect(tailMaster);
+    panR.connect(tailMaster);
+    tailMaster.connect(outDest);
+
+    src.start(now);
+    return true;
+  }
+
+  // =========================================================================
+  // 4. Live Mic FX Rack ("Beatbox / MC Loop Pedal")
+  // =========================================================================
+
+  public getMicFxState(): MicFxState {
+    return { ...this.micFxState };
+  }
+
+  public async startMicFxRack(bpm = 124): Promise<MicFxState> {
+    const ctx = await this.resume();
+    if (this.micFxState.active) return this.getMicFxState();
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Microphone input is not supported in this browser.');
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+    });
+    this.micStream = stream;
+    const src = ctx.createMediaStreamSource(stream);
+    this.micSource = src;
+
+    const radioHp = ctx.createBiquadFilter();
+    radioHp.type = 'highpass';
+    radioHp.frequency.value = this.micFxState.radioEq ? 460 : 85;
+    const radioLp = ctx.createBiquadFilter();
+    radioLp.type = 'lowpass';
+    radioLp.frequency.value = this.micFxState.radioEq ? 3100 : 14000;
+    const radioPeak = ctx.createBiquadFilter();
+    radioPeak.type = 'peaking';
+    radioPeak.frequency.value = 1650;
+    radioPeak.Q.value = 1.4;
+    radioPeak.gain.value = this.micFxState.radioEq ? 5.5 : 0;
+
+    const dryGain = ctx.createGain();
+    dryGain.gain.value = 1.0;
+
+    const beatSec = 60 / Math.max(65, Math.min(185, bpm || 124));
+    const dubDelay = ctx.createDelay(2.0);
+    dubDelay.delayTime.value = Math.min(1.5, beatSec * 0.75);
+    const dubFeedback = ctx.createGain();
+    dubFeedback.gain.value = 0.44;
+    const dubWetGain = ctx.createGain();
+    dubWetGain.gain.value = this.micFxState.dubWet;
+
+    const monGain = ctx.createGain();
+    monGain.gain.value = this.micFxState.monitoring ? 0.92 : 0;
+
+    const dest = this.postDuckSum || this.masterSum!;
+    src.connect(radioHp);
+    radioHp.connect(radioLp);
+    radioLp.connect(radioPeak);
+    radioPeak.connect(dryGain);
+    dryGain.connect(monGain);
+
+    radioPeak.connect(dubDelay);
+    dubDelay.connect(dubFeedback);
+    dubFeedback.connect(dubDelay);
+    dubDelay.connect(dubWetGain);
+    dubWetGain.connect(monGain);
+    monGain.connect(dest);
+
+    // 4-Bar Quantized Overdub Loop capture tap
+    const proc = ctx.createScriptProcessor(2048, 1, 1);
+    const silent = ctx.createGain();
+    silent.gain.value = 0;
+    proc.onaudioprocess = (ev) => {
+      if (!this.micFxState.loopRecording || !this.micLoopCaptureBuf) return;
+      const input = ev.inputBuffer.getChannelData(0);
+      const buf = this.micLoopCaptureBuf;
+      for (let i = 0; i < input.length; i++) {
+        const idx = this.micLoopWriteIdx % buf.length;
+        // Soft-clip overdub sum
+        buf[idx] = Math.max(-0.98, Math.min(0.98, buf[idx] * 0.78 + input[i]));
+        this.micLoopWriteIdx++;
+      }
+    };
+    radioPeak.connect(proc);
+    proc.connect(silent);
+    silent.connect(ctx.destination);
+
+    this.micRadioHp = radioHp;
+    this.micRadioLp = radioLp;
+    this.micRadioPeak = radioPeak;
+    this.micDubDelay = dubDelay;
+    this.micDubFeedback = dubFeedback;
+    this.micDubWetGain = dubWetGain;
+    this.micDryGain = dryGain;
+    this.micMonitorGain = monGain;
+    this.micCaptureProc = proc;
+    this.micFxState = { ...this.micFxState, active: true };
+    return this.getMicFxState();
+  }
+
+  public stopMicFxRack(): MicFxState {
+    if (this.micLoopSource) {
+      try {
+        this.micLoopSource.stop();
+        this.micLoopSource.disconnect();
+      } catch {
+        // ignore
+      }
+      this.micLoopSource = null;
+    }
+    if (this.micCaptureProc) {
+      try {
+        this.micCaptureProc.disconnect();
+      } catch {
+        // ignore
+      }
+      this.micCaptureProc = null;
+    }
+    if (this.micMonitorGain) {
+      try {
+        this.micMonitorGain.disconnect();
+      } catch {
+        // ignore
+      }
+      this.micMonitorGain = null;
+    }
+    if (this.micSource) {
+      try {
+        this.micSource.disconnect();
+      } catch {
+        // ignore
+      }
+      this.micSource = null;
+    }
+    if (this.micStream) {
+      this.micStream.getTracks().forEach((t) => t.stop());
+      this.micStream = null;
+    }
+    this.micFxState = {
+      ...this.micFxState,
+      active: false,
+      loopRecording: false,
+      loopPlaying: false,
+    };
+    return this.getMicFxState();
+  }
+
+  public updateMicFxParams(params: { radioEq?: boolean; dubWet?: number; monitoring?: boolean; bpm?: number }): MicFxState {
+    const t = this.ctx?.currentTime ?? 0;
+    if (typeof params.radioEq === 'boolean') {
+      this.micFxState.radioEq = params.radioEq;
+      if (this.micRadioHp && this.micRadioLp && this.micRadioPeak) {
+        this.micRadioHp.frequency.setTargetAtTime(params.radioEq ? 460 : 85, t, 0.02);
+        this.micRadioLp.frequency.setTargetAtTime(params.radioEq ? 3100 : 14000, t, 0.02);
+        this.micRadioPeak.gain.setTargetAtTime(params.radioEq ? 5.5 : 0, t, 0.02);
+      }
+    }
+    if (typeof params.dubWet === 'number') {
+      this.micFxState.dubWet = Math.max(0, Math.min(0.9, params.dubWet));
+      if (this.micDubWetGain) {
+        this.micDubWetGain.gain.setTargetAtTime(this.micFxState.dubWet, t, 0.02);
+      }
+    }
+    if (typeof params.monitoring === 'boolean') {
+      this.micFxState.monitoring = params.monitoring;
+      if (this.micMonitorGain) {
+        this.micMonitorGain.gain.setTargetAtTime(params.monitoring ? 0.92 : 0, t, 0.02);
+      }
+    }
+    if (typeof params.bpm === 'number' && this.micDubDelay) {
+      const beatSec = 60 / Math.max(65, Math.min(185, params.bpm));
+      this.micDubDelay.delayTime.setTargetAtTime(Math.min(1.5, beatSec * 0.75), t, 0.02);
+    }
+    return this.getMicFxState();
+  }
+
+  public async toggleMicLooper(bpm = 124): Promise<MicFxState> {
+    const ctx = await this.resume();
+    if (!this.micFxState.active) {
+      await this.startMicFxRack(bpm);
+    }
+
+    const barSec = (60 / Math.max(65, Math.min(185, bpm || 124))) * 4;
+    const loopDurSec = Math.max(3.5, Math.min(14, barSec * 4));
+    const targetFrames = Math.floor(loopDurSec * ctx.sampleRate);
+
+    if (!this.micFxState.loopRecording) {
+      if (!this.micLoopCaptureBuf || this.micLoopCaptureBuf.length !== targetFrames) {
+        this.micLoopCaptureBuf = new Float32Array(targetFrames);
+        this.micLoopWriteIdx = 0;
+      }
+      this.micFxState = { ...this.micFxState, loopRecording: true };
+      return this.getMicFxState();
+    }
+
+    // Stop recording -> play quantized 4-bar overdub AudioBuffer loop cleanly into postDuckSum
+    this.micFxState = {
+      ...this.micFxState,
+      loopRecording: false,
+      loopPlaying: true,
+      loopHasAudio: true,
+    };
+
+    if (this.micLoopSource) {
+      try {
+        this.micLoopSource.stop();
+        this.micLoopSource.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+
+    if (this.micLoopCaptureBuf) {
+      const ab = ctx.createBuffer(1, this.micLoopCaptureBuf.length, ctx.sampleRate);
+      ab.getChannelData(0).set(this.micLoopCaptureBuf);
+      this.micLoopBuffer = ab;
+
+      const src = ctx.createBufferSource();
+      src.buffer = ab;
+      src.loop = true;
+      const g = ctx.createGain();
+      g.gain.value = 0.88;
+      src.connect(g);
+      g.connect(this.micDryGain || this.postDuckSum || this.masterSum!);
+      src.start(ctx.currentTime + 0.02);
+      this.micLoopSource = src;
+    }
+
+    return this.getMicFxState();
+  }
+
+  public clearMicLoop(): MicFxState {
+    if (this.micLoopSource) {
+      try {
+        this.micLoopSource.stop();
+        this.micLoopSource.disconnect();
+      } catch {
+        // ignore
+      }
+      this.micLoopSource = null;
+    }
+    this.micLoopBuffer = null;
+    this.micLoopCaptureBuf = null;
+    this.micLoopWriteIdx = 0;
+    this.micFxState = {
+      ...this.micFxState,
+      loopRecording: false,
+      loopPlaying: false,
+      loopHasAudio: false,
+    };
+    return this.getMicFxState();
+  }
+
+  // =========================================================================
+  // 5. Breakdown Key-Glide, Clean-Edit Mask, Vocal-Chop Solo, Ad-Libs, Visualizer
+  // =========================================================================
+
+  public glideDeckSemitones(deckId: DeckId, fromSemi: number, toSemi: number, durationSec: number) {
+    if (!this.decks) return;
+    this.decks[deckId].rampSemitoneShift(fromSemi, toSemi, durationSec);
+  }
+
+  public maskDeckForCleanEdit(
+    deckId: DeckId,
+    mode: CleanEditMaskMode,
+    bpm: number,
+    durSec = 0.34
+  ) {
+    if (!this.ctx || !this.decks || mode === 'off') return;
+    const noiseBuf = this.ensureBridgeNoise(this.ctx);
+    this.decks[deckId].maskCleanEdit(mode, bpm, durSec, noiseBuf);
+  }
+
+  public async triggerVocalChopSolo(
+    deckId: DeckId,
+    params: {
+      bpm: number;
+      musicalKey: string;
+      cueSec: number;
+      semitonesSeq: number[];
+      bars?: number;
+    }
+  ): Promise<boolean> {
+    const ctx = await this.resume();
+    if (!this.decks || !this.masterSum) return false;
+    const ch = this.decks[deckId];
+    const grainBuf = ch.getHarmonicBuffer() || ch.buffer;
+    if (!grainBuf || grainBuf.duration < 2) return false;
+
+    const bars = params.bars ?? 4;
+    const beatSec = 60 / Math.max(65, Math.min(185, params.bpm || 124));
+    this.duckMasterForVoice(Math.min(4.2, bars * beatSec * 2));
+
+    scheduleVocalChopSoloPhrase({
+      ctx,
+      dest: this.postDuckSum || this.masterSum,
+      reverbImpulse: this.roomReverbImpulse,
+      grainBuffer: grainBuf,
+      grainOffsetSec: params.cueSec,
+      bpm: params.bpm,
+      musicalKey: params.musicalKey,
+      semitonesSeq: params.semitonesSeq,
+      startAt: ctx.currentTime + 0.03,
+      bars,
+    });
+    return true;
+  }
+
+  public setReactiveAdLibBuffers(buffers: Partial<Record<ReactiveAdLibKind, AudioBuffer>>) {
+    this.reactiveAdLibBuffers = { ...this.reactiveAdLibBuffers, ...buffers };
+  }
+
+  public async triggerReactiveAdLib(kind: ReactiveAdLibKind, bpm = 124, enabled = true) {
+    if (!enabled) return;
+    const nowMs = Date.now();
+    if (nowMs - this.lastAdLibAt < 2200) return;
+    this.lastAdLibAt = nowMs;
+
+    const buf = this.reactiveAdLibBuffers[kind];
+    if (buf) {
+      await this.playCustomVoiceBuffer(buf, bpm, 0.04);
+      return;
+    }
+    const fallbackVoice: Record<ReactiveAdLibKind, DjVoiceDropId> = {
+      backspin: 'pull-up',
+      'wild-take': 'dj-scratch-aaah',
+      'drop-slam': 'bass-drop',
+    };
+    await this.playVoiceDrop(fallbackVoice[kind], bpm, undefined, 1, 0.04);
+  }
+
+  public getVisualizerMetrics(): {
+    sub: number;
+    mid: number;
+    high: number;
+    master: number;
+    wave: Uint8Array | null;
+  } {
+    if (!this.masterAnalyser || !this.masterData || !this.masterFreqData) {
+      return { sub: 0, mid: 0, high: 0, master: 0, wave: null };
+    }
+    this.masterAnalyser.getByteFrequencyData(this.masterFreqData);
+    this.masterAnalyser.getFloatTimeDomainData(this.masterData);
+
+    const avgRange = (from: number, to: number) => {
+      let s = 0;
+      const hi = Math.min(this.masterFreqData!.length - 1, to);
+      const count = Math.max(1, hi - from + 1);
+      for (let i = from; i <= hi; i++) s += this.masterFreqData![i];
+      return Math.min(1, s / (count * 255));
+    };
+
+    let rmsSum = 0;
+    for (let i = 0; i < this.masterData.length; i++) {
+      rmsSum += this.masterData[i] * this.masterData[i];
+    }
+    const master = Math.min(1, Math.sqrt(rmsSum / this.masterData.length) * 2.4);
+
+    return {
+      sub: avgRange(0, 2),
+      mid: avgRange(3, 22),
+      high: avgRange(23, 64),
+      master,
+      wave: this.masterFreqData,
+    };
   }
 }
 

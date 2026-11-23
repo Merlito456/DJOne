@@ -2,11 +2,15 @@ import {
   AiDjVibe,
   AiFeatureToggles,
   AnyVoiceDropId,
+  BootlegFlipPreset,
+  CleanEditMaskMode,
+  CleanEditWindow,
   CustomVoiceDropMeta,
   CustomVoiceSlotId,
   DjVoiceDropId,
   FxType,
   GrooveBridgePattern,
+  HarmonicSynthLayerMode,
   MashupTemplateId,
   MasteringProfile,
   OfflineExportFormat,
@@ -16,6 +20,7 @@ import {
   StemIsolationMode,
   StemSwapMode,
   TrackItem,
+  VocalChopSoloPlan,
   VoiceFrequencyMode,
 } from '../types/dj';
 import { isCustomVoiceDropId, VOICE_PRESET_MAP } from './djVoices';
@@ -30,13 +35,20 @@ import {
 } from './offlineAiDj';
 import { estimateTrackLoudnessGain, timeStretchAudioBuffer } from './waveformAnalyzer';
 import {
+  camelotToHarmony,
+  createReverseReverbSwellBuffer,
   createSynthNoiseBuffer,
   createSynthReverbImpulse,
+  scheduleBootlegFlipWindow,
   scheduleBuildUpSequenceSynth,
+  scheduleCleanEditMaskAudio,
   scheduleCustomVoiceBufferSynth,
   scheduleGrooveBridgeStepSynth,
+  scheduleHarmonicLayerWindow,
   scheduleReharmonizerWindowSynth,
   scheduleSoundTrickSynth,
+  scheduleSubBass808Hit,
+  scheduleVocalChopSoloPhrase,
   scheduleVoiceDropSynth,
 } from './webAudioSynths';
 
@@ -534,6 +546,7 @@ interface OfflineDeckNodes {
   midFilter: BiquadFilterNode;
   vocalSidechainFilter: BiquadFilterNode;
   highFilter: BiquadFilterNode;
+  subHpFilter: BiquadFilterNode;
   sweeperFilter: BiquadFilterNode;
   gain: GainNode;
   fullGain: GainNode;
@@ -579,6 +592,11 @@ function createOfflineDeckChain(
   highFilter.type = 'highshelf';
   highFilter.frequency.value = 3400;
 
+  const subHpFilter = ctx.createBiquadFilter();
+  subHpFilter.type = 'highpass';
+  subHpFilter.frequency.value = 18;
+  subHpFilter.Q.value = 0.707;
+
   const sweeperFilter = ctx.createBiquadFilter();
   sweeperFilter.type = 'allpass';
   sweeperFilter.frequency.value = 1000;
@@ -615,7 +633,8 @@ function createOfflineDeckChain(
   lowFilter.connect(midFilter);
   midFilter.connect(vocalSidechainFilter);
   vocalSidechainFilter.connect(highFilter);
-  highFilter.connect(sweeperFilter);
+  highFilter.connect(subHpFilter);
+  subHpFilter.connect(sweeperFilter);
   sweeperFilter.connect(gain);
 
   gain.connect(dryBus);
@@ -637,6 +656,7 @@ function createOfflineDeckChain(
     midFilter,
     vocalSidechainFilter,
     highFilter,
+    subHpFilter,
     sweeperFilter,
     gain,
     fullGain,
@@ -925,6 +945,85 @@ function scheduleGrooveBridgeWindow(params: {
   }
 }
 
+function scheduleOfflineSubSwapWindow(params: {
+  ctx: OfflineAudioContext;
+  chain: OfflineDeckNodes;
+  dest: AudioNode;
+  startAt: number;
+  durationSec: number;
+  bpm: number;
+  musicalKey: string;
+}) {
+  const { ctx, chain, dest, startAt, durationSec, bpm, musicalKey } = params;
+  chain.subHpFilter.frequency.setValueAtTime(86, startAt);
+  const harm = camelotToHarmony(musicalKey || '8A', 1);
+  const beatSec = 60 / Math.max(65, Math.min(185, bpm || 124));
+  const totalBeats = Math.max(4, Math.floor(durationSec / beatSec));
+  for (let b = 0; b < totalBeats; b++) {
+    scheduleSubBass808Hit({
+      ctx,
+      dest,
+      rootHz: harm.rootHz,
+      mode: 'sine',
+      atTime: startAt + b * beatSec,
+      gainAmt: 0.44,
+      decaySec: Math.min(0.32, beatSec * 0.65),
+    });
+  }
+}
+
+function scheduleOfflineCleanEditMasking(params: {
+  ctx: OfflineAudioContext;
+  chain: OfflineDeckNodes;
+  dest: AudioNode;
+  noiseBuf: AudioBuffer;
+  windows: CleanEditWindow[] | undefined;
+  maskMode: CleanEditMaskMode;
+  sourceOffsetSec: number;
+  renderStartSec: number;
+  renderPlayDurSec: number;
+  playbackRate: number;
+  bpm: number;
+}) {
+  const {
+    ctx,
+    chain,
+    dest,
+    noiseBuf,
+    windows,
+    maskMode,
+    sourceOffsetSec,
+    renderStartSec,
+    renderPlayDurSec,
+    playbackRate,
+    bpm,
+  } = params;
+  if (maskMode === 'off' || !windows || windows.length === 0) return;
+
+  const rate = Math.max(0.5, Math.min(1.8, playbackRate || 1));
+  for (const w of windows) {
+    const relSec = (w.startSec - sourceOffsetSec) / rate;
+    const dur = Math.max(0.16, Math.min(0.65, (w.endSec - w.startSec) / rate));
+    if (relSec < 0 || relSec > renderPlayDurSec - 0.1) continue;
+    const at = renderStartSec + relSec;
+    chain.dryBus.gain.setValueAtTime(1, at);
+    chain.dryBus.gain.linearRampToValueAtTime(0.02, at + 0.015);
+    chain.dryBus.gain.setValueAtTime(0.02, at + Math.max(0.04, dur - 0.02));
+    chain.dryBus.gain.linearRampToValueAtTime(1, at + dur + 0.02);
+    if (maskMode === 'reverse' || maskMode === 'chirp') {
+      scheduleCleanEditMaskAudio({
+        ctx,
+        noiseBuf,
+        dest,
+        mode: maskMode,
+        atTime: at,
+        durSec: dur,
+        bpm,
+      });
+    }
+  }
+}
+
 function pickOfflineVoice(params: {
   voiceFxEnabled: boolean;
   voiceFrequency: VoiceFrequencyMode;
@@ -1090,6 +1189,15 @@ export async function renderOfflineAiRemixWav(params: {
   customVoiceDrops?: CustomVoiceDropMeta[];
   customVoiceBuffers?: Partial<Record<CustomVoiceSlotId, AudioBuffer>>;
   features?: Partial<AiFeatureToggles>;
+  bootlegFlip?: BootlegFlipPreset;
+  harmonicSynthLayer?: HarmonicSynthLayerMode;
+  reverseVocalSwell?: boolean;
+  tapeStopDropPrep?: boolean;
+  filterEnvelope?: 'none' | 'dark-warm' | 'lpf-drop-open' | 'hpf-tension';
+  subSwapEnabled?: boolean;
+  cleanEditMask?: CleanEditMaskMode;
+  vocalChopSolo?: VocalChopSoloPlan | null;
+  keyGlideCorrection?: boolean;
   onProgress?: (pct: number) => void;
 }): Promise<OfflineRemixRenderResult> {
   const {
@@ -1125,6 +1233,15 @@ export async function renderOfflineAiRemixWav(params: {
     customVoiceDrops = [],
     customVoiceBuffers = {},
     features: featureOverrides = {},
+    bootlegFlip = 'off',
+    harmonicSynthLayer = 'off',
+    reverseVocalSwell = false,
+    tapeStopDropPrep = false,
+    filterEnvelope = 'none',
+    subSwapEnabled = false,
+    cleanEditMask = 'off',
+    vocalChopSolo = null,
+    keyGlideCorrection = true,
     onProgress,
   } = params;
 
@@ -1150,16 +1267,26 @@ export async function renderOfflineAiRemixWav(params: {
       playlistTracks && playlistTracks.length >= 2 ? playlistTracks : [deckA, safeDeckB]
     ).slice(0, preview8BarsOnly ? 2 : 20);
 
+    const shuffledRaw = [...rawList];
+    if (!preview8BarsOnly && shuffledRaw.length > 1) {
+      let s = (sessionSeed ^ 0x9e3779b9) >>> 0;
+      for (let i = shuffledRaw.length - 1; i > 0; i--) {
+        s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+        const j = s % (i + 1);
+        [shuffledRaw[i], shuffledRaw[j]] = [shuffledRaw[j], shuffledRaw[i]];
+      }
+    }
+
     const orderedInputs = preview8BarsOnly
-      ? rawList.map((entry) => ({ ...entry.track, id: entry.track.id }))
+      ? shuffledRaw.map((entry) => ({ ...entry.track, id: entry.track.id }))
       : optimizePlaylistSetlist({
-          tracks: rawList.map((entry) => ({
+          tracks: shuffledRaw.map((entry) => ({
             ...entry.track,
             id: entry.track.id,
           })),
-          anchorTrack: rawList[0].track,
+          anchorTrack: null,
           energyMode: 'wave',
-          randomness,
+          randomness: Math.max(65, randomness),
           sessionSeed,
           maxLength: 20,
         });
@@ -1258,21 +1385,28 @@ export async function renderOfflineAiRemixWav(params: {
       const overlapSec = prev ? tBars * transBarSec : 0;
 
       // Upgrade #1: Set Pacing controls segment length (Megamix vs Extended vs Full Songs)
-      const preferEarlyCue = playlistPacing === 'extended' || playlistPacing === 'full-songs';
-      const fallbackFrac =
-        playlistPacing === 'full-songs'
-          ? 0.02
-          : playlistPacing === 'extended'
-          ? 0.06
-          : i === 0
-          ? 0.14
-          : plan?.incomingStartPct ?? 0.16;
+      const smartEntryEnabled = features.smartEntry !== false;
+      const preferEarlyCue =
+        !smartEntryEnabled || playlistPacing === 'extended' || playlistPacing === 'full-songs';
+      const fallbackFrac = !smartEntryEnabled
+        ? 0
+        : playlistPacing === 'full-songs'
+        ? 0.02
+        : playlistPacing === 'extended'
+        ? 0.06
+        : i === 0
+        ? 0.14
+        : plan?.incomingStartPct ?? 0.16;
 
       const cueSec = quantizeCueSec(
         cur.track,
         fallbackFrac,
         cur.buffer.duration,
-        i === 0 ? cueASecOverride : null,
+        i === 0
+          ? cueASecOverride
+          : smartEntryEnabled && typeof plan?.incomingEntrySec === 'number'
+          ? plan.incomingEntrySec
+          : null,
         preferEarlyCue
       );
 
@@ -1526,6 +1660,19 @@ export async function renderOfflineAiRemixWav(params: {
 
       const trim = entry.trimGain;
       setOfflineStemMix(chain, hasStems, variantStemOverride || 'off', entry.startSec);
+      scheduleOfflineCleanEditMasking({
+        ctx: offlineCtx,
+        chain,
+        dest: masterSum,
+        noiseBuf,
+        windows: entry.input.track.lyricCues?.cleanEditWindows,
+        maskMode: cleanEditMask,
+        sourceOffsetSec: entry.cueSec,
+        renderStartSec: entry.startSec,
+        renderPlayDurSec: entry.playDurSec,
+        playbackRate: entry.baseRate,
+        bpm: entry.nativeBpm,
+      });
 
       if (i === 0) {
         chain.gain.gain.setValueAtTime(0.001, 0);
@@ -1747,7 +1894,10 @@ export async function renderOfflineAiRemixWav(params: {
     onProgress?.(20);
 
     const sampleRate = 44100;
-    const aBpm = Math.max(72, Math.min(176, stemmedA.track.bpm || 124));
+    const rawBpm = Math.max(72, Math.min(176, stemmedA.track.bpm || 124));
+    const flipRate =
+      bootlegFlip === 'slowed-reverb' ? 0.82 : bootlegFlip === 'nightcore' ? 1.22 : 1;
+    const aBpm = rawBpm * flipRate;
     const beatSec = 60 / aBpm;
     const barSec = beatSec * 4;
     const qCueA = quantizeCueSec(stemmedA.track, 0.14, stemmedA.buffer.duration, cueASecOverride);
@@ -1759,6 +1909,16 @@ export async function renderOfflineAiRemixWav(params: {
     const djIntroBars = isDjEdit ? 8 : 0;
     const djOutroBars = isDjEdit ? 8 : 0;
     const totalSec = Math.max(10, (activeBars + djIntroBars + djOutroBars) * barSec + 1.8);
+
+    const swellBuffer =
+      reverseVocalSwell && effectiveVoicesAndFx && !mutedPhaseSet.has(2)
+        ? await createReverseReverbSwellBuffer({
+            sourceBuffer: stemmedA.harmonicBuffer || stemmedA.buffer,
+            cueSec: qCueA + 16 * ((60 / rawBpm) * 4),
+            bpm: aBpm,
+            beats: 1.5,
+          })
+        : null;
 
     const offlineCtx = new OfflineAudioContext(2, Math.ceil(totalSec * sampleRate), sampleRate);
     const noiseBuf = createSynthNoiseBuffer(offlineCtx, 0.35);
@@ -1812,12 +1972,14 @@ export async function renderOfflineAiRemixWav(params: {
 
     const introDurSec = djIntroBars * barSec;
     const mainEndSec = introDurSec + activeBars * barSec;
-    const sourceStartSec = qCueA + barOffset * barSec;
-    scheduleStemSource(offlineCtx, stemmedA.buffer, chainA.fullGain, introDurSec, sourceStartSec, activeBars * barSec + djOutroBars * barSec + 1.4, 1);
+    const rawBarSec = (60 / rawBpm) * 4;
+    const sourceStartSec = qCueA + barOffset * rawBarSec;
+    const sourcePlayDur = activeBars * barSec + djOutroBars * barSec + 1.4;
+    scheduleStemSource(offlineCtx, stemmedA.buffer, chainA.fullGain, introDurSec, sourceStartSec, sourcePlayDur, flipRate);
     if (hasStemsA) {
-      scheduleStemSource(offlineCtx, stemmedA.harmonicBuffer!, chainA.harmGain, introDurSec, sourceStartSec, activeBars * barSec + djOutroBars * barSec + 1.4, 1);
-      scheduleStemSource(offlineCtx, stemmedA.percussiveBuffer!, chainA.percGain, introDurSec, sourceStartSec, activeBars * barSec + djOutroBars * barSec + 1.4, 1);
-      scheduleStemSource(offlineCtx, stemmedA.bassBuffer!, chainA.bassGain, introDurSec, sourceStartSec, activeBars * barSec + djOutroBars * barSec + 1.4, 1);
+      scheduleStemSource(offlineCtx, stemmedA.harmonicBuffer!, chainA.harmGain, introDurSec, sourceStartSec, sourcePlayDur, flipRate);
+      scheduleStemSource(offlineCtx, stemmedA.percussiveBuffer!, chainA.percGain, introDurSec, sourceStartSec, sourcePlayDur, flipRate);
+      scheduleStemSource(offlineCtx, stemmedA.bassBuffer!, chainA.bassGain, introDurSec, sourceStartSec, sourcePlayDur, flipRate);
     }
 
     const chosenBridge: GrooveBridgePattern =
@@ -1892,18 +2054,47 @@ export async function renderOfflineAiRemixWav(params: {
       chainA.gain.gain.setValueAtTime(trimA, 0);
     }
 
-    // Bars 8..16: Vocal/Harmonic Flip riding over Groove Bridge drums!
+    // Bars 8..16: Vocal/Harmonic Flip riding over Groove Bridge or Genre Bootleg Flip drums!
     const flipStart = Math.max(introDurSec, tAtBar(8));
     const buildStart = Math.max(introDurSec, tAtBar(14));
     const dropAt = Math.max(introDurSec + 0.1, tAtBar(16));
 
+    const hasDrumBootleg =
+      bootlegFlip === 'jersey-club' || bootlegFlip === 'amapiano' || bootlegFlip === 'phonk';
+
     setOfflineStemMix(chainA, hasStemsA, variantStemOverride || 'vocal', flipStart);
-    if (!hasStemsA) {
-      chainA.lowFilter.gain.setTargetAtTime(renderVariant === 'acapella' ? -22 : -16, flipStart, 0.04);
+    if (!hasStemsA || hasDrumBootleg) {
+      chainA.lowFilter.gain.setTargetAtTime(
+        renderVariant === 'acapella' || hasDrumBootleg ? -22 : -16,
+        flipStart,
+        0.04
+      );
       chainA.midFilter.gain.setTargetAtTime(2.5, flipStart, 0.04);
     }
+    if (bootlegFlip === 'slowed-reverb' || filterEnvelope === 'dark-warm') {
+      chainA.highFilter.gain.setTargetAtTime(-5.5, introDurSec, 0.04);
+      scheduleOfflineFxAutomation(chainA, introDurSec, beatSec, {
+        enabled: true,
+        type: 'reverb',
+        wet: bootlegFlip === 'slowed-reverb' ? 0.5 : 0.34,
+        beatDiv: 0.5,
+      });
+    } else if (bootlegFlip === 'nightcore') {
+      chainA.highFilter.gain.setTargetAtTime(3.6, introDurSec, 0.04);
+    }
 
-    if (effectiveVoicesAndFx && !mutedPhaseSet.has(1) && features.autoGrooveBridge !== false) {
+    if (hasDrumBootleg && renderVariant !== 'acapella') {
+      scheduleBootlegFlipWindow({
+        ctx: offlineCtx,
+        dest: masterSum,
+        noiseBuf,
+        preset: bootlegFlip,
+        startAt: flipStart,
+        bars: preview8BarsOnly ? 8 : 20,
+        bpm: aBpm,
+        musicalKey: stemmedA.track.musicalKey,
+      });
+    } else if (effectiveVoicesAndFx && !mutedPhaseSet.has(1) && features.autoGrooveBridge !== false) {
       const bridgeStart = Math.max(introDurSec, tAtBar(8));
       const bridgeBars = preview8BarsOnly ? 4 : 8;
       scheduleGrooveBridgeWindow({
@@ -1918,8 +2109,19 @@ export async function renderOfflineAiRemixWav(params: {
       });
     }
 
-    // Enhancement #2: Key-Locked Synth Bass & Warm Club Pad Re-Harmonizer
-    if (reharmonizeSynth && renderVariant !== 'acapella') {
+    // Harmonic Synth Layering (Supersaw Pad, Acid 303, Sidechain Arp) & Reharmonizer
+    if (harmonicSynthLayer !== 'off' && renderVariant !== 'acapella') {
+      scheduleHarmonicLayerWindow({
+        ctx: offlineCtx,
+        dest: masterSum,
+        mode: harmonicSynthLayer,
+        startAt: flipStart,
+        bars: preview8BarsOnly ? 8 : 20,
+        bpm: aBpm,
+        musicalKey: stemmedA.track.musicalKey,
+        intensity: 0.84,
+      });
+    } else if (reharmonizeSynth && renderVariant !== 'acapella') {
       scheduleReharmonizerWindowSynth({
         ctx: offlineCtx,
         dest: masterSum,
@@ -1940,13 +2142,32 @@ export async function renderOfflineAiRemixWav(params: {
       });
     }
 
-    // HPF tension rise during bars 14..16 + Beat-Slice / Fakeout Stutter
-    chainA.sweeperFilter.type = 'highpass';
-    chainA.sweeperFilter.frequency.setValueAtTime(140, buildStart);
-    chainA.sweeperFilter.frequency.exponentialRampToValueAtTime(
-      1450,
-      Math.max(buildStart + 0.3, dropAt - beatSec * 0.5)
-    );
+    // Filter Tension Envelope during bars 14..16 (LPF Drop-Open or HPF Tension)
+    if (filterEnvelope === 'lpf-drop-open') {
+      chainA.sweeperFilter.type = 'lowpass';
+      chainA.sweeperFilter.frequency.setValueAtTime(320, buildStart);
+      chainA.sweeperFilter.frequency.exponentialRampToValueAtTime(
+        14000,
+        Math.max(buildStart + 0.3, dropAt)
+      );
+    } else {
+      chainA.sweeperFilter.type = 'highpass';
+      chainA.sweeperFilter.frequency.setValueAtTime(140, buildStart);
+      chainA.sweeperFilter.frequency.exponentialRampToValueAtTime(
+        filterEnvelope === 'hpf-tension' ? 2200 : 1450,
+        Math.max(buildStart + 0.3, dropAt - beatSec * 0.5)
+      );
+    }
+
+    if (swellBuffer) {
+      const swellSrc = offlineCtx.createBufferSource();
+      swellSrc.buffer = swellBuffer;
+      const swellGain = offlineCtx.createGain();
+      swellGain.gain.value = 0.88;
+      swellSrc.connect(swellGain);
+      swellGain.connect(postDuckSum);
+      swellSrc.start(Math.max(0.05, dropAt - swellBuffer.duration));
+    }
 
     if (effectiveVoicesAndFx && !mutedPhaseSet.has(2)) {
       const vId = pickOfflineVoice({
@@ -1983,16 +2204,39 @@ export async function renderOfflineAiRemixWav(params: {
           chainA.gain.gain.setValueAtTime(k % 2 === 0 ? trimA : 0.12, kt);
         }
       }
-      chainA.gain.gain.setValueAtTime(0.04, Math.max(0.05, dropAt - beatSec * 0.65));
+      if (tapeStopDropPrep) {
+        const brakeAt = Math.max(buildStart + 0.1, dropAt - 0.55);
+        chainA.gain.gain.setValueAtTime(trimA, brakeAt);
+        chainA.gain.gain.linearRampToValueAtTime(0.04, Math.max(brakeAt + 0.05, dropAt - 0.06));
+        scheduleSoundTrickSynth({
+          ctx: offlineCtx,
+          dest: masterSum,
+          type: 'vinyl-stop',
+          atTime: brakeAt,
+          bpm: aBpm,
+          musicalKey: stemmedA.track.musicalKey,
+        });
+      } else {
+        chainA.gain.gain.setValueAtTime(0.04, Math.max(0.05, dropAt - beatSec * 0.65));
+      }
     }
 
     // Bars 16..28: Club Flip Drop Slam!
-    setOfflineStemMix(chainA, hasStemsA, variantStemOverride || 'off', dropAt);
-    chainA.lowFilter.gain.setTargetAtTime(renderVariant === 'acapella' ? -18 : 1.5, dropAt, 0.02);
+    setOfflineStemMix(chainA, hasStemsA, variantStemOverride || (hasDrumBootleg ? 'vocal' : 'off'), dropAt);
+    chainA.lowFilter.gain.setTargetAtTime(
+      renderVariant === 'acapella' ? -18 : hasDrumBootleg ? -16 : 1.5,
+      dropAt,
+      0.02
+    );
     chainA.midFilter.gain.setTargetAtTime(0, dropAt, 0.02);
     chainA.gain.gain.setValueAtTime(Math.min(1.12, trimA * 1.05), dropAt);
-    chainA.sweeperFilter.type = 'allpass';
-    chainA.sweeperFilter.frequency.setTargetAtTime(1000, dropAt, 0.02);
+    if (bootlegFlip === 'slowed-reverb' || filterEnvelope === 'dark-warm') {
+      chainA.sweeperFilter.type = 'lowpass';
+      chainA.sweeperFilter.frequency.setTargetAtTime(2800, dropAt, 0.03);
+    } else {
+      chainA.sweeperFilter.type = 'allpass';
+      chainA.sweeperFilter.frequency.setTargetAtTime(1000, dropAt, 0.02);
+    }
 
     if (effectiveVoicesAndFx && !mutedPhaseSet.has(3)) {
       scheduleSoundTrickSynth({
@@ -2003,7 +2247,7 @@ export async function renderOfflineAiRemixWav(params: {
         bpm: aBpm,
         musicalKey: stemmedA.track.musicalKey,
       });
-      if (features.autoGrooveBridge !== false) {
+      if (!hasDrumBootleg && features.autoGrooveBridge !== false) {
         scheduleGrooveBridgeWindow({
           ctx: offlineCtx,
           dest: masterSum,
@@ -2020,9 +2264,50 @@ export async function renderOfflineAiRemixWav(params: {
     if (!preview8BarsOnly && effectiveVoicesAndFx && !mutedPhaseSet.has(4)) {
       scheduleOfflineFxAutomation(chainA, tAtBar(28), beatSec, {
         enabled: true,
-        type: 'dubdelay',
-        wet: 0.46,
+        type: bootlegFlip === 'slowed-reverb' ? 'reverb' : 'dubdelay',
+        wet: bootlegFlip === 'slowed-reverb' ? 0.54 : 0.46,
         beatDiv: 0.75,
+      });
+    }
+
+    if (subSwapEnabled && renderVariant !== 'acapella') {
+      scheduleOfflineSubSwapWindow({
+        ctx: offlineCtx,
+        chain: chainA,
+        dest: masterSum,
+        startAt: introDurSec,
+        durationSec: activeBars * barSec,
+        bpm: aBpm,
+        musicalKey: stemmedA.track.musicalKey || '8A',
+      });
+    }
+
+    scheduleOfflineCleanEditMasking({
+      ctx: offlineCtx,
+      chain: chainA,
+      dest: masterSum,
+      noiseBuf,
+      windows: stemmedA.track.lyricCues?.cleanEditWindows,
+      maskMode: cleanEditMask,
+      sourceOffsetSec: sourceStartSec,
+      renderStartSec: introDurSec,
+      renderPlayDurSec: activeBars * barSec,
+      playbackRate: flipRate,
+      bpm: aBpm,
+    });
+
+    if (vocalChopSolo && renderVariant !== 'instrumental') {
+      scheduleVocalChopSoloPhrase({
+        ctx: offlineCtx,
+        dest: postDuckSum,
+        reverbImpulse,
+        grainBuffer: stemmedA.harmonicBuffer || stemmedA.buffer,
+        grainOffsetSec: vocalChopSolo.cueSec,
+        bpm: aBpm,
+        musicalKey: stemmedA.track.musicalKey || '8A',
+        semitonesSeq: vocalChopSolo.pentatonicSemitones,
+        startAt: flipStart,
+        bars: preview8BarsOnly ? 4 : 8,
       });
     }
 
@@ -2066,9 +2351,10 @@ export async function renderOfflineAiRemixWav(params: {
         : renderVariant === 'dj-edit'
         ? ' [DJ 8-Bar Intro/Outro]'
         : '';
+    const flipLabel = bootlegFlip !== 'off' ? bootlegFlip : chosenBridge;
     const mixTitle = preview8BarsOnly
       ? `8-Bar Club Flip Preview — ${shortA}`
-      : `${customMixTitle || `AI Club Flip (${chosenBridge}) — ${shortA}`}${roleTag}`;
+      : `${customMixTitle || `AI Club Flip (${flipLabel}) — ${shortA}`}${roleTag}`;
     const cueEntries: CueSheetEntry[] = preview8BarsOnly
       ? [
           { atSec: 0, label: `${shortA} (Flip Build)`, bpm: aBpm, key: stemmedA.track.musicalKey },
@@ -2125,17 +2411,31 @@ export async function renderOfflineAiRemixWav(params: {
   const qCueB = quantizeCueSec(stemmedB.track, 0.18, stemmedB.buffer.duration, cueBSecOverride);
 
   const mashupBarOffset = mode === 'mashup-32' && preview8BarsOnly ? 16 : 0;
+  const wideMorphBars =
+    mode === 'ai-transition' && Math.abs(aBpm - bBpm) > 10
+      ? Math.max(12, Math.min(16, transitionBars + 4))
+      : transitionBars;
   const totalBars = preview8BarsOnly
     ? 8
     : mode === 'mashup-32'
     ? 32
-    : Math.max(20, Math.min(32, 8 + transitionBars + 8));
+    : Math.max(20, Math.min(34, 8 + wideMorphBars + 8));
   const isDjEdit = !preview8BarsOnly && renderVariant === 'dj-edit';
   const djIntroBars = isDjEdit ? 8 : 0;
   const djOutroBars = isDjEdit ? 8 : 0;
   const introDurSec = djIntroBars * barSec;
   const mainDurSec = totalBars * barSec;
   const totalSec = Math.max(preview8BarsOnly ? 10 : 24, Math.min(145, introDurSec + mainDurSec + djOutroBars * barSec + 1.4));
+
+  const pairSwellBuf =
+    reverseVocalSwell && effectiveVoicesAndFx && !mutedPhaseSet.has(2)
+      ? await createReverseReverbSwellBuffer({
+          sourceBuffer: stemmedB.harmonicBuffer || stemmedB.buffer,
+          cueSec: qCueB,
+          bpm: aBpm,
+          beats: 1.5,
+        })
+      : null;
 
   const offlineCtx = new OfflineAudioContext(2, Math.ceil(totalSec * sampleRate), sampleRate);
   const noiseBuf = createSynthNoiseBuffer(offlineCtx, 0.35);
@@ -2218,7 +2518,7 @@ export async function renderOfflineAiRemixWav(params: {
   // In AI Transition mode, allow smooth S-curve BPM glide from Deck A native BPM to Deck B native BPM across transition!
   const bTransitionRamps: TempoRampSegment[] = [];
   if (mode === 'ai-transition' && Math.abs(aBpm - bBpm) >= 1.5) {
-    const tBarsLocal = preview8BarsOnly ? 6 : Math.max(4, Math.min(16, transitionBars));
+    const tBarsLocal = preview8BarsOnly ? 6 : Math.max(4, Math.min(16, wideMorphBars));
     const leadBarsLocal = preview8BarsOnly ? 1 : 8;
     const rampStart = introDurSec + leadBarsLocal * barSec;
     const rampDur = tBarsLocal * barSec;
@@ -2422,7 +2722,18 @@ export async function renderOfflineAiRemixWav(params: {
         chainB.gain.gain.setTargetAtTime(gainB, tStart, 0.025);
       }
 
-      if (
+      if (harmonicSynthLayer !== 'off' && renderVariant !== 'acapella') {
+        scheduleHarmonicLayerWindow({
+          ctx: offlineCtx,
+          dest: masterSum,
+          mode: harmonicSynthLayer,
+          startAt: tStart,
+          bars: Math.max(2, effEndBar - effStartBar),
+          bpm: aBpm,
+          musicalKey: stemmedA.track.musicalKey,
+          intensity: ph.isDoubleDrop ? 0.84 : 0.65,
+        });
+      } else if (
         reharmonizeSynth &&
         renderVariant !== 'acapella' &&
         (ph.isDoubleDrop || idx === 0)
@@ -2435,6 +2746,23 @@ export async function renderOfflineAiRemixWav(params: {
           bpm: aBpm,
           musicalKey: stemmedA.track.musicalKey,
           intensity: ph.isDoubleDrop ? 0.78 : 0.56,
+        });
+      }
+
+      if (
+        (bootlegFlip === 'jersey-club' || bootlegFlip === 'amapiano' || bootlegFlip === 'phonk') &&
+        renderVariant !== 'acapella' &&
+        (ph.isDoubleDrop || idx === 1)
+      ) {
+        scheduleBootlegFlipWindow({
+          ctx: offlineCtx,
+          dest: masterSum,
+          noiseBuf,
+          preset: bootlegFlip,
+          startAt: tStart,
+          bars: Math.max(2, effEndBar - effStartBar),
+          bpm: aBpm,
+          musicalKey: stemmedA.track.musicalKey,
         });
       }
 
@@ -2511,6 +2839,15 @@ export async function renderOfflineAiRemixWav(params: {
       }
 
       if (effectiveVoicesAndFx && !phaseMuted && ph.isDoubleDrop) {
+        if (pairSwellBuf) {
+          const sw = offlineCtx.createBufferSource();
+          sw.buffer = pairSwellBuf;
+          const swG = offlineCtx.createGain();
+          swG.gain.value = 0.85;
+          sw.connect(swG);
+          swG.connect(postDuckSum);
+          sw.start(Math.max(0.05, tStart - pairSwellBuf.duration));
+        }
         scheduleSoundTrickSynth({
           ctx: offlineCtx,
           dest: masterSum,
@@ -2581,7 +2918,9 @@ export async function renderOfflineAiRemixWav(params: {
       features,
     });
 
-    const tBars = preview8BarsOnly ? 6 : Math.max(4, Math.min(16, plan.transitionBars || transitionBars));
+    const tBars = preview8BarsOnly
+      ? 6
+      : Math.max(4, Math.min(16, plan.tempoMorphBars || plan.transitionBars || wideMorphBars));
     const leadSoloBars = preview8BarsOnly ? 1 : 8;
     const mixStart = introDurSec + leadSoloBars * barSec;
     const mixEnd = mixStart + tBars * barSec;
@@ -2604,6 +2943,63 @@ export async function renderOfflineAiRemixWav(params: {
     chainA.gain.gain.setValueAtTime(trimA, introDurSec);
     chainB.gain.gain.setValueAtTime(0, introDurSec);
     chainB.lowFilter.gain.setValueAtTime(-20, introDurSec);
+
+    if (pairSwellBuf) {
+      const sw = offlineCtx.createBufferSource();
+      sw.buffer = pairSwellBuf;
+      const swG = offlineCtx.createGain();
+      swG.gain.value = 0.86;
+      sw.connect(swG);
+      swG.connect(postDuckSum);
+      sw.start(Math.max(0.05, midMix - pairSwellBuf.duration));
+    }
+
+    if (tapeStopDropPrep && effectiveVoicesAndFx) {
+      const brakeAt = Math.max(mixStart + 0.2, midMix - 0.55);
+      scheduleSoundTrickSynth({
+        ctx: offlineCtx,
+        dest: masterSum,
+        type: 'vinyl-stop',
+        atTime: brakeAt,
+        bpm: aBpm,
+        musicalKey: stemmedA.track.musicalKey,
+      });
+    }
+
+    if (filterEnvelope === 'lpf-drop-open') {
+      chainB.sweeperFilter.type = 'lowpass';
+      chainB.sweeperFilter.frequency.setValueAtTime(340, mixStart);
+      chainB.sweeperFilter.frequency.exponentialRampToValueAtTime(14000, midMix);
+    }
+
+    if (harmonicSynthLayer !== 'off' && renderVariant !== 'acapella') {
+      scheduleHarmonicLayerWindow({
+        ctx: offlineCtx,
+        dest: masterSum,
+        mode: harmonicSynthLayer,
+        startAt: mixStart,
+        bars: Math.min(8, tBars),
+        bpm: (aBpm + bBpm) * 0.5,
+        musicalKey: stemmedB.track.musicalKey,
+        intensity: 0.78,
+      });
+    }
+
+    if (
+      (bootlegFlip === 'jersey-club' || bootlegFlip === 'amapiano' || bootlegFlip === 'phonk') &&
+      renderVariant !== 'acapella'
+    ) {
+      scheduleBootlegFlipWindow({
+        ctx: offlineCtx,
+        dest: masterSum,
+        noiseBuf,
+        preset: bootlegFlip,
+        startAt: mixStart,
+        bars: Math.min(8, tBars),
+        bpm: (aBpm + bBpm) * 0.5,
+        musicalKey: stemmedB.track.musicalKey,
+      });
+    }
 
     if (effectiveVoicesAndFx && !mutedPhaseSet.has(2)) {
       const buildVoice =
@@ -2694,6 +3090,70 @@ export async function renderOfflineAiRemixWav(params: {
     chainA.gain.gain.setValueAtTime(trimA, mixStart);
     chainA.gain.gain.linearRampToValueAtTime(0.76 * trimA, midMix);
     chainA.gain.gain.linearRampToValueAtTime(0.0001, mixEnd);
+  }
+
+  if (subSwapEnabled && renderVariant !== 'acapella') {
+    scheduleOfflineSubSwapWindow({
+      ctx: offlineCtx,
+      chain: chainA,
+      dest: masterSum,
+      startAt: introDurSec,
+      durationSec: mainDurSec,
+      bpm: aBpm,
+      musicalKey: stemmedA.track.musicalKey || '8A',
+    });
+  }
+
+  scheduleOfflineCleanEditMasking({
+    ctx: offlineCtx,
+    chain: chainA,
+    dest: masterSum,
+    noiseBuf,
+    windows: stemmedA.track.lyricCues?.cleanEditWindows,
+    maskMode: cleanEditMask,
+    sourceOffsetSec: qCueA,
+    renderStartSec: introDurSec,
+    renderPlayDurSec: mainDurSec,
+    playbackRate: 1.0,
+    bpm: aBpm,
+  });
+  scheduleOfflineCleanEditMasking({
+    ctx: offlineCtx,
+    chain: chainB,
+    dest: masterSum,
+    noiseBuf,
+    windows: stemmedB.track.lyricCues?.cleanEditWindows,
+    maskMode: cleanEditMask,
+    sourceOffsetSec: qCueB,
+    renderStartSec: introDurSec,
+    renderPlayDurSec: mainDurSec,
+    playbackRate: mode === 'ai-transition' ? 1.0 : rateB,
+    bpm: mode === 'ai-transition' ? bBpm : aBpm,
+  });
+
+  if (vocalChopSolo && renderVariant !== 'instrumental') {
+    scheduleVocalChopSoloPhrase({
+      ctx: offlineCtx,
+      dest: postDuckSum,
+      reverbImpulse,
+      grainBuffer: stemmedA.harmonicBuffer || stemmedA.buffer,
+      grainOffsetSec: vocalChopSolo.cueSec,
+      bpm: aBpm,
+      musicalKey: stemmedA.track.musicalKey || '8A',
+      semitonesSeq: vocalChopSolo.pentatonicSemitones,
+      startAt: introDurSec + (preview8BarsOnly ? 0 : 8 * barSec),
+      bars: preview8BarsOnly ? 4 : 8,
+    });
+  }
+
+  if (keyGlideCorrection && mode === 'ai-transition' && semitoneSnap.snapped && semitoneSnap.semitones !== 0) {
+    // Breakdown Key-Glide polish: soft stereo wash while incoming key locks into harmonic alignment
+    scheduleOfflineFxAutomation(chainB, introDurSec + 8 * barSec, beatSec, {
+      enabled: true,
+      type: 'shimmer',
+      wet: 0.28,
+      beatDiv: 0.5,
+    });
   }
 
   if (isDjEdit) {
