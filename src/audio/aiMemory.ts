@@ -49,7 +49,10 @@ export function shiftCamelotKey(musicalKey: string, semitones: number): string {
   return `${shifted}${m[2]}`;
 }
 
-export function camelotToHarmony(musicalKey?: string): {
+export function camelotToHarmony(
+  musicalKey?: string,
+  pitchRate = 1
+): {
   rootHz: number;
   chordHz: number[];
   isMinor: boolean;
@@ -57,7 +60,8 @@ export function camelotToHarmony(musicalKey?: string): {
 } {
   const clean = String(musicalKey || '8A').trim().toUpperCase();
   const entry = CAMELOT_PITCH_MAP[clean] || CAMELOT_PITCH_MAP['8A'];
-  const r = entry.rootHz;
+  const safeRate = Math.max(0.5, Math.min(2.0, Number.isFinite(pitchRate) && pitchRate > 0 ? pitchRate : 1));
+  const r = entry.rootHz * safeRate;
   // Minor 7th vs Major 7th triad voicing
   const chordHz = entry.isMinor
     ? [r, r * 1.1892, r * 1.4983, r * 1.7818]

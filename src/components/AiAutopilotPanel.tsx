@@ -33,12 +33,22 @@ import {
   VolumeX,
   Plus,
   RefreshCw,
+  Mic,
+  MicOff,
+  Check,
+  Upload,
+  Trash2,
 } from 'lucide-react';
+import { ALL_VOICE_IDS, DJ_VOICE_CATEGORIES, DJ_VOICE_LIBRARY } from '../audio/djVoices';
 import {
   AiDjVibe,
   AiEnergyMode,
   AutopilotState,
+  CustomVoiceDropMeta,
+  CustomVoiceSlotId,
   DeckState,
+  DjVoiceCategory,
+  DjVoiceDropId,
   GrooveBridgePattern,
   Playlist,
   SoundTrickType,
@@ -77,6 +87,19 @@ interface AiAutopilotPanelProps {
   onHoldExtraBars: () => void;
   onSwapUpcomingStyle: () => void;
   onToggleMuteSfx: () => void;
+  onToggleVoiceFx: () => void;
+  onToggleVoiceItem: (voiceId: DjVoiceDropId) => void;
+  onSetVoiceCategoryEnabled: (category: DjVoiceCategory, enabled: boolean) => void;
+  onEnableAllVoices: (enableAll: boolean) => void;
+  onTriggerVoice: (voiceId: DjVoiceDropId) => void;
+  customVoiceDrops: CustomVoiceDropMeta[];
+  recordingSlotId: CustomVoiceSlotId | null;
+  micError: string | null;
+  onToggleRecordCustomSlot: (slotId: CustomVoiceSlotId) => void;
+  onUploadCustomSlot: (slotId: CustomVoiceSlotId, file: File) => void;
+  onTriggerCustomSlot: (slotId: CustomVoiceSlotId) => void;
+  onToggleCustomSlotEnabled: (slotId: CustomVoiceSlotId) => void;
+  onClearCustomSlot: (slotId: CustomVoiceSlotId) => void;
   onCycleGrooveBridge: () => void;
   onOpenCrate?: () => void;
 }
@@ -148,12 +171,35 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
   onHoldExtraBars,
   onSwapUpcomingStyle,
   onToggleMuteSfx,
+  onToggleVoiceFx,
+  onToggleVoiceItem,
+  onSetVoiceCategoryEnabled,
+  onEnableAllVoices,
+  onTriggerVoice,
+  customVoiceDrops,
+  recordingSlotId,
+  micError,
+  onToggleRecordCustomSlot,
+  onUploadCustomSlot,
+  onTriggerCustomSlot,
+  onToggleCustomSlotEnabled,
+  onClearCustomSlot,
   onCycleGrooveBridge,
   onOpenCrate,
 }) => {
   const [directionInput, setDirectionInput] = useState('');
+  const [zone3Tab, setZone3Tab] = useState<'tricks' | 'voices'>('tricks');
+  const [voiceCategoryFilter, setVoiceCategoryFilter] = useState<DjVoiceCategory | 'all'>('all');
   const isTransitioning = autopilot.phase === 'transitioning';
   const isPlanning = autopilot.phase === 'planning';
+
+  const enabledVoiceSet = new Set(autopilot.enabledVoiceIds);
+  const filteredVoices =
+    voiceCategoryFilter === 'all'
+      ? DJ_VOICE_LIBRARY
+      : DJ_VOICE_LIBRARY.filter((v) => v.category === voiceCategoryFilter);
+  const allFilteredEnabled =
+    filteredVoices.length > 0 && filteredVoices.every((v) => enabledVoiceSet.has(v.id));
 
   const handleSubmitDirection = (e: React.FormEvent) => {
     e.preventDefault();
@@ -200,7 +246,7 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
                   ? 'bg-purple-500 text-[#090B0F] border-purple-400 font-bold'
                   : 'bg-[#171C26] hover:bg-white/10 border-white/15 text-slate-200'
               }`}
-              title="Start/Stop 16-Bar Call-and-Response Stem Mashup Routine across Deck A + B"
+              title="Start/Stop 32-Bar Live Bootleg Mashup Routine across Deck A + B"
             >
               {mashupLoading ? (
                 <Loader2 className="w-3 h-3 animate-spin" />
@@ -411,7 +457,7 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
           <p className="text-[10px] text-slate-400 truncate">
             {autopilot.currentActionLabel ||
               autopilot.activePlan?.aiNotes ||
-              'Offline AI automates per-song FX, Groove Bridge, PLL sync & 16-bar mashups.'}
+              'Offline AI automates per-song FX, Groove Bridge, PLL sync & 32-bar bootleg mashups.'}
           </p>
 
           {autopilot.enabled && autopilot.activePlan ? (
@@ -571,33 +617,276 @@ export const AiAutopilotPanel: React.FC<AiAutopilotPanelProps> = ({
         </div>
       </div>
 
-      {/* ZONE 3 (Right, 4 cols): 16 Synthesized Master Sound Trick Performance Matrix (4x4) */}
+      {/* ZONE 3 (Right, 4 cols): Master Sound Tricks (16) & Enable/Disable DJ Voices Studio (24) */}
       <div className="lg:col-span-4 flex flex-col justify-between gap-1.5 min-w-0">
-        <div className="flex items-center justify-between gap-2 shrink-0">
-          <span className="text-[11px] font-display font-bold tracking-wide text-slate-200 uppercase">
-            Master Sound Tricks (16)
-          </span>
-          <span className="text-[10px] font-mono text-slate-400 tabular-nums">
-            Offline Synth Bus
-          </span>
+        <div className="flex items-center justify-between gap-1.5 shrink-0">
+          <div className="flex items-center gap-1 bg-[#0B0E14] p-0.5 rounded-md border border-white/[0.08]">
+            <button
+              type="button"
+              onClick={() => setZone3Tab('tricks')}
+              className={`h-5 px-2 rounded text-[10px] font-display font-bold uppercase tracking-wide transition-colors ${
+                zone3Tab === 'tricks'
+                  ? 'bg-cyan-500 text-[#090B0F]'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Tricks (16)
+            </button>
+            <button
+              type="button"
+              onClick={() => setZone3Tab('voices')}
+              className={`h-5 px-2 rounded text-[10px] font-display font-bold uppercase tracking-wide flex items-center gap-1 transition-colors ${
+                zone3Tab === 'voices'
+                  ? 'bg-emerald-500 text-[#090B0F]'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Mic className="w-2.5 h-2.5 shrink-0" />
+              <span>
+                Voices ({autopilot.enabledVoiceIds.length}/{ALL_VOICE_IDS.length})
+              </span>
+            </button>
+          </div>
+
+          <button
+            type="button"
+            onClick={onToggleVoiceFx}
+            className={`h-6 px-2 rounded-md text-[10px] font-semibold border flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+              autopilot.voiceFxEnabled && !autopilot.muteSoundTricks
+                ? 'bg-emerald-500/20 border-emerald-500/45 text-emerald-300'
+                : 'bg-[#171C26] border-white/10 text-slate-400 hover:text-slate-200'
+            }`}
+            title="Master toggle: allow or disable DJ voices, grooving chants, and shouts in AI offline remixes"
+          >
+            {autopilot.voiceFxEnabled ? (
+              <Mic className="w-3 h-3 shrink-0" />
+            ) : (
+              <MicOff className="w-3 h-3 shrink-0" />
+            )}
+            <span>{autopilot.voiceFxEnabled ? 'AI Vox On' : 'AI Vox Off'}</span>
+          </button>
         </div>
 
-        <div className="grid grid-cols-4 gap-1 flex-1">
-          {TRICKS.map((t) => {
-            const Icon = t.icon;
-            return (
+        {zone3Tab === 'tricks' ? (
+          <div className="grid grid-cols-4 gap-1 flex-1">
+            {TRICKS.map((t) => {
+              const Icon = t.icon;
+              return (
+                <button
+                  key={t.id}
+                  type="button"
+                  onClick={() => onTriggerTrick(t.id)}
+                  className="min-h-[30px] px-1 rounded-md bg-[#171C26] hover:bg-white/10 active:scale-[0.97] border border-white/10 text-[10px] font-semibold text-slate-200 flex items-center justify-center gap-1 transition-all whitespace-nowrap"
+                >
+                  <Icon className="w-3 h-3 text-cyan-400 shrink-0" />
+                  <span className="truncate">{t.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="flex flex-col gap-1 flex-1 min-h-0">
+            {/* Category Filter + Bulk Enable/Disable Row */}
+            <div className="flex items-center justify-between gap-1 shrink-0 overflow-x-auto">
+              <div className="flex items-center gap-1 min-w-0">
+                <button
+                  type="button"
+                  onClick={() => setVoiceCategoryFilter('all')}
+                  className={`h-5 px-1.5 rounded text-[9px] font-semibold border transition-colors whitespace-nowrap ${
+                    voiceCategoryFilter === 'all'
+                      ? 'bg-white/15 border-white/25 text-white'
+                      : 'bg-[#0B0E14] border-white/[0.06] text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  All
+                </button>
+                {DJ_VOICE_CATEGORIES.map((cat) => (
+                  <button
+                    key={cat.id}
+                    type="button"
+                    onClick={() => setVoiceCategoryFilter(cat.id)}
+                    className={`h-5 px-1.5 rounded text-[9px] font-semibold border transition-colors whitespace-nowrap ${
+                      voiceCategoryFilter === cat.id
+                        ? 'bg-emerald-500/20 border-emerald-500/45 text-emerald-300'
+                        : 'bg-[#0B0E14] border-white/[0.06] text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {cat.label}
+                  </button>
+                ))}
+              </div>
+
               <button
-                key={t.id}
                 type="button"
-                onClick={() => onTriggerTrick(t.id)}
-                className="min-h-[30px] px-1 rounded-md bg-[#171C26] hover:bg-white/10 active:scale-[0.97] border border-white/10 text-[10px] font-semibold text-slate-200 flex items-center justify-center gap-1 transition-all whitespace-nowrap"
+                onClick={() => {
+                  if (voiceCategoryFilter === 'all') {
+                    onEnableAllVoices(!allFilteredEnabled);
+                  } else {
+                    onSetVoiceCategoryEnabled(voiceCategoryFilter, !allFilteredEnabled);
+                  }
+                }}
+                className="h-5 px-1.5 rounded bg-[#171C26] hover:bg-white/10 border border-white/10 text-[9px] font-semibold text-cyan-300 whitespace-nowrap shrink-0"
+                title={
+                  allFilteredEnabled
+                    ? 'Disable all shown voices from AI offline remixes'
+                    : 'Enable all shown voices for AI offline remixes'
+                }
               >
-                <Icon className="w-3 h-3 text-cyan-400 shrink-0" />
-                <span className="truncate">{t.label}</span>
+                {allFilteredEnabled ? 'Disable Shown' : 'Enable Shown'}
               </button>
-            );
-          })}
-        </div>
+            </div>
+
+            {/* Scrollable Voice Pads Grid: Click label to play live, click check to enable/disable for AI */}
+            <div className="grid grid-cols-3 sm:grid-cols-4 gap-1 overflow-y-auto max-h-[78px] pr-0.5 flex-1">
+              {filteredVoices.map((v) => {
+                const isEnabled = enabledVoiceSet.has(v.id);
+                return (
+                  <div
+                    key={v.id}
+                    className={`h-[24px] rounded-md border flex items-stretch overflow-hidden transition-colors ${
+                      isEnabled && autopilot.voiceFxEnabled
+                        ? 'bg-[#171C26] border-emerald-500/40 text-slate-100'
+                        : isEnabled
+                        ? 'bg-[#151A24] border-white/15 text-slate-300'
+                        : 'bg-[#0C0F15] border-white/[0.06] text-slate-500'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onTriggerVoice(v.id)}
+                      title={`${v.calloutText} — ${v.description} (Click to trigger live)`}
+                      className="flex-1 px-1.5 text-[9.5px] font-semibold text-left truncate hover:bg-white/10 active:bg-white/15 transition-colors"
+                    >
+                      {v.label}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onToggleVoiceItem(v.id)}
+                      aria-label={`${isEnabled ? 'Disable' : 'Enable'} ${v.label} in AI remixes`}
+                      title={
+                        isEnabled
+                          ? `Included in AI remixes — click to disable ${v.label}`
+                          : `Disabled in AI remixes — click to enable ${v.label}`
+                      }
+                      className={`w-5 shrink-0 flex items-center justify-center border-l transition-colors ${
+                        isEnabled
+                          ? 'border-emerald-500/30 bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/35'
+                          : 'border-white/[0.06] bg-transparent text-slate-600 hover:text-slate-300 hover:bg-white/5'
+                      }`}
+                    >
+                      <Check className={`w-2.5 h-2.5 ${isEnabled ? 'opacity-100' : 'opacity-25'}`} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Upgrade #6: Compact 4-Slot My Drops (Mic Record / Audio File Upload) */}
+            <div className="flex flex-col gap-0.5 shrink-0">
+              {micError && (
+                <div className="text-[9px] text-rose-400 truncate px-1">{micError}</div>
+              )}
+              <div className="grid grid-cols-4 gap-1 shrink-0">
+                {customVoiceDrops.map((slot) => {
+                  const isRec = recordingSlotId === slot.id;
+                  return (
+                    <div
+                      key={slot.id}
+                      className={`h-[26px] rounded-md border flex items-center overflow-hidden transition-colors ${
+                        isRec
+                          ? 'bg-rose-500/20 border-rose-500 text-rose-200 animate-pulse'
+                          : slot.hasAudio && slot.enabled && autopilot.voiceFxEnabled
+                          ? 'bg-[#161D28] border-cyan-500/45 text-cyan-100'
+                          : slot.hasAudio
+                          ? 'bg-[#141822] border-white/15 text-slate-300'
+                          : 'bg-[#0B0E14] border-white/[0.07] text-slate-400'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() =>
+                          slot.hasAudio
+                            ? onTriggerCustomSlot(slot.id)
+                            : onToggleRecordCustomSlot(slot.id)
+                        }
+                        title={
+                          slot.hasAudio
+                            ? `${slot.label} (${slot.durationSec.toFixed(1)}s) — Click to fire live`
+                            : `Click Mic to record up to 4s or Upload .wav/.mp3 into ${slot.label}`
+                        }
+                        className="flex-1 h-full px-1 text-[9px] font-semibold text-left truncate hover:bg-white/10 transition-colors"
+                      >
+                        {isRec ? 'REC...' : slot.hasAudio ? slot.label : `Drop ${slot.id.slice(-1)}`}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => onToggleRecordCustomSlot(slot.id)}
+                        title={isRec ? 'Stop mic recording' : 'Record mic drop (max 4s)'}
+                        aria-label={isRec ? 'Stop recording drop' : `Record mic into ${slot.label}`}
+                        className={`w-4 h-full flex items-center justify-center border-l border-white/[0.06] ${
+                          isRec
+                            ? 'bg-rose-500 text-white'
+                            : 'text-slate-400 hover:text-rose-300 hover:bg-white/5'
+                        }`}
+                      >
+                        <Mic className="w-2.5 h-2.5" />
+                      </button>
+
+                      <label
+                        title={`Upload .wav/.mp3 to ${slot.label}`}
+                        className="w-4 h-full flex items-center justify-center border-l border-white/[0.06] text-slate-400 hover:text-cyan-300 hover:bg-white/5 cursor-pointer"
+                      >
+                        <Upload className="w-2.5 h-2.5" />
+                        <input
+                          type="file"
+                          accept="audio/*"
+                          className="hidden"
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            if (f) onUploadCustomSlot(slot.id, f);
+                            e.currentTarget.value = '';
+                          }}
+                        />
+                      </label>
+
+                      {slot.hasAudio && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => onToggleCustomSlotEnabled(slot.id)}
+                            title={
+                              slot.enabled
+                                ? 'Included in AI offline remixes (click to disable)'
+                                : 'Excluded from AI offline remixes (click to enable)'
+                            }
+                            aria-label={`Toggle ${slot.label} in AI remixes`}
+                            className={`w-4 h-full flex items-center justify-center border-l border-white/[0.06] ${
+                              slot.enabled
+                                ? 'bg-cyan-500/20 text-cyan-300'
+                                : 'text-slate-600 hover:text-slate-300'
+                            }`}
+                          >
+                            <Check className="w-2.5 h-2.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onClearCustomSlot(slot.id)}
+                            title={`Clear ${slot.label}`}
+                            aria-label={`Clear ${slot.label}`}
+                            className="w-4 h-full flex items-center justify-center border-l border-white/[0.06] text-slate-500 hover:text-rose-400 hover:bg-white/5"
+                          >
+                            <Trash2 className="w-2.5 h-2.5" />
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </section>
   );

@@ -8,9 +8,15 @@ import {
   AiSongEffectMoment,
   AiTasteProfile,
   AiTransitionPlan,
+  AiTransitionVoiceCue,
   AiTrickActionType,
   AiTrickStep,
+  AnyVoiceDropId,
+  CustomVoiceDropMeta,
+  DjVoiceCategory,
+  DjVoiceDropId,
   FxType,
+  GenrePhysicsMode,
   GrooveBridgePattern,
   GrooveDnaGenre,
   HotCue,
@@ -23,6 +29,7 @@ import {
   WaveformBandSample,
 } from '../types/dj';
 import { loadTasteProfile, shiftCamelotKey } from './aiMemory';
+import { DJ_VOICE_LIBRARY, isCustomVoiceDropId, VOICE_PRESET_MAP } from './djVoices';
 import { analyzeOverlapClash } from './waveformAnalyzer';
 
 export interface CandidateTrackInput {
@@ -742,6 +749,88 @@ const FX_FRIENDLY_NAME: Record<FxType, string> = {
   dubdelay: 'Dotted Dub',
 };
 
+function resolveGenrePhysicsMode(
+  vibe: AiDjVibe,
+  outGroove: GrooveDnaGenre,
+  inGroove: GrooveDnaGenre
+): GenrePhysicsMode {
+  if (
+    (outGroove === 'trap-halftime' || outGroove === 'lofi-slowed') &&
+    inGroove === 'house-edm'
+  ) {
+    return 'trap-to-house';
+  }
+  if (
+    vibe === 'chill-sunset' ||
+    (outGroove === 'lofi-slowed' && inGroove !== 'house-edm' && inGroove !== 'dnb-break')
+  ) {
+    return 'chill-velvet';
+  }
+  if (outGroove === 'dnb-break' || inGroove === 'dnb-break') {
+    return 'dnb-chop';
+  }
+  return 'standard';
+}
+
+function pickContextVoiceDrop(params: {
+  voiceFxEnabled?: boolean;
+  enabledVoiceIds?: DjVoiceDropId[];
+  enabledCustomDrops?: CustomVoiceDropMeta[];
+  vibe: AiDjVibe;
+  aggressiveness: number;
+  isGentle?: boolean;
+  preferCategories?: DjVoiceCategory[];
+  rng: () => number;
+}): { id: AnyVoiceDropId; label: string; isCustom: boolean } | undefined {
+  const {
+    voiceFxEnabled = false,
+    enabledVoiceIds = [],
+    enabledCustomDrops = [],
+    vibe,
+    aggressiveness,
+    isGentle = false,
+    preferCategories,
+    rng,
+  } = params;
+  if (!voiceFxEnabled) return undefined;
+
+  const activeCustom = enabledCustomDrops.filter((c) => c.hasAudio && c.enabled);
+  const allowedSet = new Set(enabledVoiceIds);
+  let candidates = DJ_VOICE_LIBRARY.filter((v) => allowedSet.has(v.id));
+
+  if (candidates.length === 0 && activeCustom.length === 0) return undefined;
+
+  // Sunset or Breather Mix only permits smooth chillSafe grooving/vocoder/tag voices (plus custom drops at lower rate)
+  if (vibe === 'chill-sunset' || isGentle) {
+    candidates = candidates.filter((v) => v.chillSafe);
+  } else {
+    const energyFiltered = candidates.filter((v) => v.energyMin <= aggressiveness + 20);
+    if (energyFiltered.length > 0) candidates = energyFiltered;
+  }
+
+  if (preferCategories && preferCategories.length > 0 && candidates.length > 0) {
+    const catMatched = candidates.filter((v) => preferCategories.includes(v.category));
+    if (catMatched.length > 0) candidates = catMatched;
+  }
+
+  // Give enabled user mic/audio drops a distinct 32% selection chance when available
+  if (activeCustom.length > 0 && (candidates.length === 0 || rng() < (isGentle ? 0.18 : 0.34))) {
+    const chosen = pickOne(activeCustom, rng);
+    return { id: chosen.id, label: chosen.label, isCustom: true };
+  }
+
+  if (candidates.length === 0) return undefined;
+  const chosenPreset = pickOne(candidates, rng);
+  return { id: chosenPreset.id, label: chosenPreset.label, isCustom: false };
+}
+
+function resolveVoiceDisplayLabel(id: AnyVoiceDropId, customDrops?: CustomVoiceDropMeta[]): string {
+  if (isCustomVoiceDropId(id)) {
+    return customDrops?.find((c) => c.id === id)?.label || 'Custom Drop';
+  }
+  return VOICE_PRESET_MAP[id]?.label || id;
+}
+
 function buildSongEffectMoments(params: {
   vibe: AiDjVibe;
   remixMode: boolean;
@@ -751,6 +840,11 @@ function buildSongEffectMoments(params: {
   beatDivScale?: number;
   sections?: TrackSectionSegment[];
   durationSec?: number;
+  bpm?: number;
+  dropSec?: number;
+  voiceFxEnabled?: boolean;
+  enabledVoiceIds?: DjVoiceDropId[];
+  enabledCustomDrops?: CustomVoiceDropMeta[];
   rng: () => number;
 }): AiSongEffectMoment[] {
   const {
@@ -762,6 +856,11 @@ function buildSongEffectMoments(params: {
     beatDivScale = 1,
     sections,
     durationSec = 180,
+    bpm = 124,
+    dropSec,
+    voiceFxEnabled = false,
+    enabledVoiceIds = [],
+    enabledCustomDrops = [],
     rng,
   } = params;
   const taste = loadTasteProfile();
@@ -771,6 +870,7 @@ function buildSongEffectMoments(params: {
   );
   const aggr = effectiveAggr / 100;
   const rand = Math.max(0, Math.min(100, randomness)) / 100;
+  const isChill = vibe === 'chill-sunset';
 
   const gentleFx: FxType[] = ['chorus', 'autopan', 'reverb', 'shimmer', 'lofi', 'echo', 'phaser'];
   const clubFx: FxType[] = [
@@ -797,22 +897,20 @@ function buildSongEffectMoments(params: {
   ];
 
   let pool: FxType[] =
-    aggr < 0.34
+    isChill || aggr < 0.34
       ? gentleFx
       : aggr < 0.68
-      ? vibe === 'chill-sunset'
-        ? gentleFx
-        : clubFx
+      ? clubFx
       : wildFx;
 
-  if (rand >= 0.65) {
+  if (rand >= 0.65 && !isChill) {
     pool = [...pool, ...clubFx, ...gentleFx];
   }
 
   const expandedPool: FxType[] = [...pool];
   for (const fx of pool) {
     const q = taste.fxScores[fx] ?? 0;
-    if (q > 1.5) expandedPool.push(fx);
+    if (q > 1.5 && (!isChill || gentleFx.includes(fx))) expandedPool.push(fx);
   }
 
   const gentleTricks: SoundTrickType[] = ['chord-stab', 'sweep-down', 'riser-chord', 'riser'];
@@ -838,7 +936,7 @@ function buildSongEffectMoments(params: {
     'air-horn',
     'dub-siren',
   ];
-  const trickPool = aggr < 0.34 ? gentleTricks : aggr < 0.68 ? clubTricks : wildTricks;
+  const trickPool = isChill || aggr < 0.34 ? gentleTricks : aggr < 0.68 ? clubTricks : wildTricks;
 
   let momentCount = 0;
   if (remixMode) {
@@ -872,6 +970,46 @@ function buildSongEffectMoments(params: {
   const moments: AiSongEffectMoment[] = [];
   const usedFx = new Set<FxType>();
 
+  // Upgrade #3: VIP Drop Fakeout & Rework right before detected/calibrated drop inside cruising window
+  const barSec = (60 / Math.max(65, bpm)) * 4;
+  if (
+    !isChill &&
+    (remixMode || aggr >= 0.58) &&
+    typeof dropSec === 'number' &&
+    durationSec > 24
+  ) {
+    const fakeoutStartSec = Math.max(6, dropSec - barSec * 1.5);
+    const fakeoutPct = fakeoutStartSec / durationSec;
+    if (fakeoutPct >= minPct && fakeoutPct <= maxPct - 0.04) {
+      const fakeoutVoice = pickContextVoiceDrop({
+        voiceFxEnabled,
+        enabledVoiceIds,
+        enabledCustomDrops,
+        vibe,
+        aggressiveness,
+        preferCategories: ['countdown', 'hype', 'shout'],
+        rng,
+      });
+      moments.push({
+        atPct: Math.round(fakeoutPct * 1000) / 1000,
+        durationMs: Math.round(Math.max(2400, Math.min(4400, barSec * 2 * 1000))),
+        fxType: 'dubdelay',
+        fxWet: 0.64,
+        beatDiv: Math.max(0.25, 0.5 * beatDivScale),
+        filter: 0.46,
+        eqLow: -0.92,
+        eqMid: 0.16,
+        soundTrick: 'snare-roll',
+        voiceDropId: fakeoutVoice?.id,
+        beatSlicePattern: [0, 0, 1, 2, 0, 1, 3, 2],
+        isVipDropFakeout: true,
+        useSampleAccurateBuild: true,
+        youtubePumpMode: 'drop-takeover',
+        label: `VIP Drop Fakeout${fakeoutVoice ? ` · "${fakeoutVoice.label}"` : ' · Sample-Accurate Build + Re-Drop'}`,
+      });
+    }
+  }
+
   const chopChoices: AiChopPatternType[] =
     vibe === 'scratch-chop' || aggr >= 0.62
       ? ['quarter-chop', 'eighth-gate', 'transformer-scratch']
@@ -882,13 +1020,17 @@ function buildSongEffectMoments(params: {
     [1, 1, 2, 1],
   ];
 
-  for (let i = 0; i < momentCount; i++) {
-    const slotBase = minPct + ((i + 0.15 + rng() * (0.4 + rand * 0.35)) / momentCount) * span;
+  const remainingSlots = Math.max(0, momentCount - moments.length);
+  for (let i = 0; i < remainingSlots; i++) {
+    const slotBase = minPct + ((i + 0.15 + rng() * (0.4 + rand * 0.35)) / Math.max(1, remainingSlots)) * span;
     const rawPct =
       i < preferredSectionPcts.length
         ? preferredSectionPcts[i]
         : Math.max(0.08, Math.min(maxPct, Math.round(slotBase * 1000) / 1000));
     const atPct = Math.max(0.08, Math.min(maxPct, rawPct));
+
+    // Skip colliding closely with a VIP Drop Fakeout window
+    if (moments.some((m) => Math.abs(m.atPct - atPct) < 0.06)) continue;
 
     let fxType = pickOne(expandedPool, rng);
     for (let retry = 0; retry < 5 && usedFx.has(fxType); retry++) {
@@ -918,18 +1060,20 @@ function buildSongEffectMoments(params: {
       eqLow = 0.22;
     }
 
-    const useLoop = remixMode || aggr > 0.52 || rand > 0.72;
+    const useLoop = !isChill && (remixMode || aggr > 0.52 || rand > 0.72);
     const loopBars = useLoop && rng() > 0.28 ? pickOne([0.25, 0.5, 1], rng) : undefined;
     const soundTrick = rng() < 0.42 + aggr * 0.35 + rand * 0.18 ? pickOne(trickPool, rng) : undefined;
     const pitchBurst =
-      aggr > 0.65 && rng() < 0.25 + rand * 0.32 ? pickOne([0.88, 0.92, 1.06], rng) : undefined;
+      !isChill && aggr > 0.65 && rng() < 0.25 + rand * 0.32
+        ? pickOne([0.88, 0.92, 1.06], rng)
+        : undefined;
 
     const chopPattern: AiChopPatternType | undefined =
-      (remixMode || vibe === 'scratch-chop' || aggr > 0.58) && rng() < 0.36 + aggr * 0.25
+      !isChill && (remixMode || vibe === 'scratch-chop' || aggr > 0.58) && rng() < 0.36 + aggr * 0.25
         ? pickOne(chopChoices, rng)
         : undefined;
     const cueJuggleSeq: number[] | undefined =
-      !loopBars && (remixMode || vibe === 'scratch-chop') && rng() < 0.24 + aggr * 0.22
+      !isChill && !loopBars && (remixMode || vibe === 'scratch-chop') && rng() < 0.24 + aggr * 0.22
         ? pickOne(cueSeqChoices, rng)
         : undefined;
 
@@ -939,8 +1083,26 @@ function buildSongEffectMoments(params: {
       [0, 0, 2, 2, 1, 3, 1, 3],
     ];
     const beatSlicePattern: number[] | undefined =
-      !loopBars && (remixMode || aggr >= 0.62) && rng() < 0.32 + aggr * 0.28
+      !isChill && !loopBars && (remixMode || aggr >= 0.62) && rng() < 0.32 + aggr * 0.28
         ? pickOne(sliceChoices, rng)
+        : undefined;
+
+    // Upgrade #2: Hybrid Synth Pump Mode for YouTube IFrame decks
+    const youtubePumpMode: AiSongEffectMoment['youtubePumpMode'] =
+      chopPattern === 'eighth-gate' || chopPattern === 'transformer-scratch'
+        ? 'gate-8th'
+        : beatSlicePattern || loopBars === 0.25 || loopBars === 0.5
+        ? 'drop-takeover'
+        : !isChill && (remixMode || aggr >= 0.45)
+        ? 'sidechain'
+        : undefined;
+
+    // Live Micro-Sampler ("Remix Deck C") vocal hook callback on build/drop moments
+    const deckCHookPattern: AiSongEffectMoment['deckCHookPattern'] =
+      !isChill && (remixMode || vibe === 'mashup-live' || aggr >= 0.55) && rng() < 0.42
+        ? pickOne(['quarter', 'half', 'full-echo'], rng)
+        : isChill && rng() < 0.28
+        ? 'full-echo'
         : undefined;
 
     const durationMs = Math.round(1050 + (1 - aggr * 0.28) * 900 + rng() * 750);
@@ -958,6 +1120,35 @@ function buildSongEffectMoments(params: {
         ? ' + Mid Scoop'
         : '';
 
+    const voiceChance = isChill
+      ? 0.25
+      : remixMode
+      ? 0.52 + aggr * 0.28
+      : 0.32 + aggr * 0.28;
+    const preferredCats: DjVoiceCategory[] =
+      vibe === 'scratch-chop'
+        ? ['scratch-vox', 'groove']
+        : vibe === 'festival-drop'
+        ? ['countdown', 'shout', 'hype']
+        : vibe === 'mashup-live'
+        ? ['groove', 'scratch-vox', 'shout']
+        : isChill
+        ? ['groove']
+        : ['groove', 'shout', 'hype', 'scratch-vox'];
+    const voicePick =
+      rng() < voiceChance
+        ? pickContextVoiceDrop({
+            voiceFxEnabled,
+            enabledVoiceIds,
+            enabledCustomDrops,
+            vibe,
+            aggressiveness,
+            preferCategories: preferredCats,
+            rng,
+          })
+        : undefined;
+    const voiceDropId = voicePick?.id;
+
     moments.push({
       atPct,
       durationMs,
@@ -972,9 +1163,14 @@ function buildSongEffectMoments(params: {
       chopPattern,
       cueJuggleSeq,
       soundTrick,
+      voiceDropId,
       pitchBurst,
       beatSlicePattern,
+      youtubePumpMode,
+      deckCHookPattern,
       label: `Take · ${FX_FRIENDLY_NAME[fxType]}${stemTag}${
+        voicePick ? ` + "${voicePick.label}"` : ''
+      }${deckCHookPattern ? ' + Deck C Hook' : ''}${
         loopBars ? ` + ${loopBars === 0.25 ? '1/4' : loopBars === 0.5 ? '1/2' : '1'}-Bar` : ''
       }`,
     });
@@ -1060,8 +1256,11 @@ function buildTricksForPlan(params: {
       : 8;
 
   // Apply Vocal/Instrumental Mashup awareness to transition duration
-  transitionBars = Math.max(4, Math.min(20, transitionBars + vocalCompat.recommendedBarsBonus));
-  if (hasQuick || (aggr >= 0.8 && transitionBars > 4 && vibe !== 'techno-hypnotic')) {
+  transitionBars = Math.max(
+    4,
+    Math.min(vibe === 'mashup-live' ? 24 : 20, transitionBars + vocalCompat.recommendedBarsBonus)
+  );
+  if (hasQuick || (aggr >= 0.8 && transitionBars > 4 && vibe !== 'techno-hypnotic' && vibe !== 'mashup-live')) {
     transitionBars = 4;
   } else if (hasLong && transitionBars < 16) {
     transitionBars = 16;
@@ -1438,10 +1637,16 @@ function buildTricksForPlan(params: {
     };
   }
 
-  // Session-unique stochastic choreography seeded with Groove DNA + Offline Taste Learning Q-scores
+  // Session-unique stochastic choreography seeded with Groove DNA + Genre Transition Physics + Taste Learning Q-scores
+  const genrePhysics = resolveGenrePhysicsMode(vibe, outGroove, inGroove);
+
   const openerPool: AiTrickActionType[] =
-    vibe === 'chill-sunset' || outGroove === 'lofi-slowed'
+    genrePhysics === 'chill-velvet'
       ? ['lpf-underwater-blend', 'shimmer-lift', 'lofi-tape-warp', 'autopan-drift', 'chorus-shimmer']
+      : genrePhysics === 'dnb-chop'
+      ? ['beat-loop-roll', 'xfade-chop-16th', 'transformer-cut', 'flanger-riser']
+      : genrePhysics === 'trap-to-house'
+      ? ['stem-mid-swap', 'shimmer-lift', 'staircase-drop-build', 'dubdelay-throw']
       : vibe === 'techno-hypnotic'
       ? ['dubdelay-throw', 'phaser-swirl', 'comb-resonator', 'tremolo-gate', 'xfade-ping-pong']
       : vibe === 'mashup-live'
@@ -1466,25 +1671,37 @@ function buildTricksForPlan(params: {
   }
 
   const swapPool: AiTrickActionType[] =
-    aggr > 0.7
+    genrePhysics === 'chill-velvet'
+      ? ['eq-bass-swap', 'stem-mid-swap']
+      : genrePhysics === 'dnb-chop'
+      ? ['kill-drop-slam', 'phrase-drop-swap', 'double-drop-sync']
+      : aggr > 0.7
       ? ['phrase-drop-swap', 'kill-drop-slam', 'double-drop-sync', 'subharm-boost', 'eq-bass-swap']
       : aggr < 0.3
       ? ['eq-bass-swap', 'stem-mid-swap']
       : ['eq-bass-swap', 'phrase-drop-swap', 'subharm-boost', 'stem-mid-swap'];
 
   const exitPool: AiTrickActionType[] =
-    aggr > 0.68
+    genrePhysics === 'chill-velvet'
+      ? ['reverb-wash', 'shimmer-lift', 'lofi-tape-warp', 'filter-sweep']
+      : aggr > 0.68
       ? ['echo-freeze-cut', 'dubdelay-throw', 'vinyl-brake', 'stutter-drop', 'lofi-tape-warp']
       : ['dubdelay-throw', 'echo-out', 'reverb-wash', 'shimmer-lift', 'filter-sweep'];
 
   const sfxPool: SoundTrickType[] =
-    vibe === 'chill-sunset'
-      ? ['chord-stab', 'riser-chord', 'sweep-down']
+    genrePhysics === 'chill-velvet'
+      ? ['chord-stab', 'riser-chord', 'sweep-down', 'vinyl-crack']
       : aggr > 0.68
       ? ['drop-alarm', 'tom-fill', 'vinyl-crack', 'snare-roll', 'sub-drop', 'tape-rewind', 'scratch-chirp', 'riser-chord']
       : aggr < 0.3
       ? ['sweep-down', 'chord-stab', 'riser-chord']
       : ['riser-chord', 'tom-fill', 'vinyl-crack', 'riser', 'sub-drop', 'chord-stab', 'dub-siren'];
+
+  if (genrePhysics === 'chill-velvet' && transitionBars < 16 && !hasQuick) {
+    transitionBars = 16;
+  } else if (genrePhysics === 'dnb-chop' && transitionBars > 8) {
+    transitionBars = 8;
+  }
 
   const openFx = pickOne(weightedOpeners, rng);
   const swapTrick = pickOne(swapPool, rng);
@@ -1634,18 +1851,32 @@ export function generateOfflineWildTake(params: {
   aggressiveness?: number;
   randomness?: number;
   seed?: number;
+  voiceFxEnabled?: boolean;
+  enabledVoiceIds?: DjVoiceDropId[];
+  enabledCustomDrops?: CustomVoiceDropMeta[];
 }): AiSongEffectMoment {
-  const { aggressiveness = 65, randomness = 75, seed = Date.now() } = params;
+  const {
+    aggressiveness = 65,
+    randomness = 75,
+    seed = Date.now(),
+    voiceFxEnabled = false,
+    enabledVoiceIds = [],
+    enabledCustomDrops = [],
+  } = params;
   const rng = createRng((seed ^ 0x9e3779b9) >>> 0);
+  const chosenVibe = pickOne(['club-blend', 'festival-drop', 'mashup-live', 'scratch-chop'] as const, rng);
   const moments = buildSongEffectMoments({
-    vibe: pickOne(['club-blend', 'festival-drop', 'mashup-live', 'scratch-chop'], rng),
+    vibe: chosenVibe,
     remixMode: true,
     aggressiveness: Math.max(55, aggressiveness),
     randomness: Math.max(60, randomness),
     quickMix: false,
+    voiceFxEnabled,
+    enabledVoiceIds,
+    enabledCustomDrops,
     rng,
   });
-  return (
+  const baseMoment =
     moments[0] || {
       atPct: 0.1,
       durationMs: 2200,
@@ -1658,8 +1889,98 @@ export function generateOfflineWildTake(params: {
       beatSlicePattern: [0, 0, 1, 2, 0, 1, 3, 2],
       soundTrick: 'chord-stab',
       label: 'Take · Dotted Dub + Beat Slice',
+    };
+  if (
+    voiceFxEnabled &&
+    (enabledVoiceIds.length > 0 || enabledCustomDrops.some((c) => c.hasAudio && c.enabled)) &&
+    !baseMoment.voiceDropId
+  ) {
+    const wildVoice = pickContextVoiceDrop({
+      voiceFxEnabled,
+      enabledVoiceIds,
+      enabledCustomDrops,
+      vibe: chosenVibe,
+      aggressiveness,
+      rng,
+    });
+    if (wildVoice) {
+      baseMoment.voiceDropId = wildVoice.id;
+      baseMoment.label = `${baseMoment.label} + "${wildVoice.label}"`;
     }
+  }
+  return baseMoment;
+}
+
+/**
+ * Automatic "Club VIP Edit" Arrangement Skipper for long tracks (> 3m05s).
+ * Spots repetitive mid-track verse/breakdown stretches and plans an exact
+ * 8/16/24-bar phrase-locked Beat-Jump skip straight into the upcoming build/drop.
+ */
+function computeClubVipSkipEdit(params: {
+  track: TrackItem | null;
+  waveform?: WaveformBandSample[];
+  bpm: number;
+  quickMix: boolean;
+  remixMode: boolean;
+}): AiTransitionPlan['vipSkipEdit'] {
+  const { track, waveform, bpm, quickMix, remixMode } = params;
+  if (!track || track.durationSec < 185) return undefined;
+  const dur = track.durationSec;
+  const barSec = (60 / Math.max(65, bpm)) * 4;
+  const firstBeat = track.firstBeatSec || 0;
+
+  let triggerSec = dur * 0.26;
+  let targetSec = 0;
+
+  const sections = track.sections || [];
+  const earlyRepetitive = sections.find(
+    (s) => (s.label === 'verse' || s.label === 'breakdown') && s.startSec >= dur * 0.2 && s.startSec <= dur * 0.42
   );
+  const laterHighlight = sections.find(
+    (s) =>
+      (s.label === 'build' || s.label === 'drop') &&
+      s.startSec >= (earlyRepetitive ? earlyRepetitive.startSec : dur * 0.24) + 20 &&
+      s.startSec <= dur * (quickMix ? 0.56 : 0.72)
+  );
+
+  if (laterHighlight) {
+    triggerSec = earlyRepetitive ? earlyRepetitive.startSec + barSec : dur * 0.24;
+    targetSec = laterHighlight.startSec;
+  } else if (waveform && waveform.length >= 48 && (remixMode || dur >= 215)) {
+    // Fallback: locate a calm verse window (~22-34%) jumping ahead to highest energy peak (~48-68%)
+    const scanStart = Math.floor(waveform.length * 0.46);
+    const scanEnd = Math.floor(waveform.length * 0.68);
+    let peakVal = -1;
+    let peakIdx = scanStart;
+    for (let i = scanStart; i < scanEnd; i++) {
+      const e = waveform[i].low * 0.55 + waveform[i].mid * 0.35 + waveform[i].high * 0.1;
+      if (e > peakVal) {
+        peakVal = e;
+        peakIdx = i;
+      }
+    }
+    triggerSec = dur * 0.24;
+    targetSec = Math.max(triggerSec + 22, (peakIdx / waveform.length) * dur - barSec * 2);
+  }
+
+  if (targetSec <= triggerSec + barSec * 6) return undefined;
+
+  const rawBarsGap = (targetSec - triggerSec) / barSec;
+  const barsSkipped = Math.max(8, Math.round(rawBarsGap / 8) * 8);
+  const trigBars = Math.max(4, Math.round((triggerSec - firstBeat) / barSec));
+  const alignedTriggerSec = firstBeat + trigBars * barSec;
+  const alignedTargetSec = alignedTriggerSec + barsSkipped * barSec;
+
+  if (alignedTargetSec >= dur - 24 || alignedTriggerSec / dur >= (quickMix ? 0.31 : 0.44)) {
+    return undefined;
+  }
+
+  return {
+    triggerPct: Math.round((alignedTriggerSec / dur) * 1000) / 1000,
+    targetSec: Math.round(alignedTargetSec * 1000) / 1000,
+    barsSkipped,
+    label: `Club VIP Edit · -${barsSkipped} Bar Skip to Drop`,
+  };
 }
 
 export function planOfflineTransition(params: {
@@ -1678,6 +1999,11 @@ export function planOfflineTransition(params: {
   outWaveform?: WaveformBandSample[];
   inWaveform?: WaveformBandSample[];
   currentTimeSec?: number;
+  setTensionScore?: number;
+  peakMixStreak?: number;
+  voiceFxEnabled?: boolean;
+  enabledVoiceIds?: DjVoiceDropId[];
+  enabledCustomDrops?: CustomVoiceDropMeta[];
 }): AiTransitionPlan {
   const {
     outgoingTrack,
@@ -1695,6 +2021,11 @@ export function planOfflineTransition(params: {
     outWaveform,
     inWaveform,
     currentTimeSec = 0,
+    setTensionScore = 45,
+    peakMixStreak = 0,
+    voiceFxEnabled = false,
+    enabledVoiceIds = [],
+    enabledCustomDrops = [],
   } = params;
   const playedSet = new Set(playedTrackIds);
 
@@ -1779,6 +2110,8 @@ export function planOfflineTransition(params: {
     transitionBars: built.transitionBars,
   });
 
+  const genrePhysicsMode = resolveGenrePhysicsMode(vibe, outGroove, inGroove);
+
   const songMoments = buildSongEffectMoments({
     vibe,
     remixMode,
@@ -1788,6 +2121,11 @@ export function planOfflineTransition(params: {
     beatDivScale: bpmMatch.beatDivScale,
     sections: outgoingTrack?.sections,
     durationSec: outgoingTrack?.durationSec,
+    bpm: refBpm,
+    dropSec: outgoingTrack?.dropCueSec ?? outgoingTrack?.detectedDropSec,
+    voiceFxEnabled,
+    enabledVoiceIds,
+    enabledCustomDrops,
     rng,
   });
 
@@ -1819,33 +2157,211 @@ export function planOfflineTransition(params: {
     ? `${outgoingTrack.musicalKey}→${snap.snapped ? `${snap.snappedKey} (${snap.semitones > 0 ? '+' : ''}${snap.semitones}st)` : chosen.musicalKey}`
     : `${chosen.musicalKey}`;
 
+  // Macro "Set Tension & Breather Arc" Director
+  const isBreatherMix =
+    !direction.trim() &&
+    vibe !== 'techno-hypnotic' &&
+    ((peakMixStreak >= 2 && setTensionScore >= 72) ||
+      (energyMode === 'wave' && peakMixStreak >= 3));
+
+  const breatherFilteredTricks = isBreatherMix
+    ? built.tricks.map((t) => {
+        if (
+          t.action === 'sound-air-horn' ||
+          t.action === 'sound-drop-alarm' ||
+          t.action === 'sound-laser' ||
+          t.action === 'sound-snare-roll' ||
+          t.action === 'staircase-drop-build' ||
+          t.action === 'transformer-cut' ||
+          t.action === 'xfade-chop-16th'
+        ) {
+          return {
+            ...t,
+            action: (t.targetDeck === 'incoming' ? 'shimmer-lift' : 'reverb-wash') as AiTrickActionType,
+            intensity: Math.min(0.65, t.intensity),
+            label: 'Breather Arc · Atmospheric Shimmer Wash',
+          };
+        }
+        return t;
+      })
+    : built.tricks;
+
+  const finalBridge: GrooveBridgePattern = isBreatherMix
+    ? vibe === 'chill-sunset'
+      ? 'chord-arp'
+      : 'top-hats'
+    : resolvedBridge;
+
+  const finalTransitionBars = isBreatherMix
+    ? Math.max(12, transitionBars)
+    : transitionBars;
+
   const useBeatSliceStutter =
-    (remixMode || aggressiveness >= 68) && rng() < 0.35 + (aggressiveness / 100) * 0.3;
+    !isBreatherMix &&
+    genrePhysicsMode !== 'chill-velvet' &&
+    (remixMode || aggressiveness >= 68) &&
+    rng() < 0.35 + (aggressiveness / 100) * 0.3;
+
+  // Upgrade #3: Acapella/Vocal Stem Carryover over next groove (8-12 bars) when ideal mashup or Live Mashup vibe
+  const vocalCarryoverBars =
+    outgoingTrack &&
+    (vocalCompat.clashRisk === 'ideal-mashup' || (vibe === 'mashup-live' && vocalCompat.clashRisk !== 'high'))
+      ? vibe === 'mashup-live'
+        ? 12
+        : 8
+      : 0;
+
+  // Upgrade #4: Dynamic 2-bar Call-and-Response Mid-Carve when mid-band clash or dual vocals are high
+  const dynamicMidCallResponse =
+    !isBreatherMix && (clashProfile.midClash >= 0.45 || vocalCompat.clashRisk === 'high');
+
+  const vipSkipEdit = isBreatherMix
+    ? undefined
+    : computeClubVipSkipEdit({
+        track: outgoingTrack,
+        waveform: outWaveform,
+        bpm: refBpm,
+        quickMix,
+        remixMode,
+      });
+
+  // Curate 1-2 AI transition voice cues (countdown/hype into drop + optional groove/tag opener)
+  const voiceDrops: AiTransitionVoiceCue[] = [];
+  const hasAnyVoices =
+    enabledVoiceIds.length > 0 || enabledCustomDrops.some((c) => c.hasAudio && c.enabled);
+  if (voiceFxEnabled && hasAnyVoices) {
+    const gentleOnly = isBreatherMix || vibe === 'chill-sunset';
+    if (!gentleOnly && (remixMode || aggressiveness >= 45 || rng() < 0.65)) {
+      const openerVoice = pickContextVoiceDrop({
+        voiceFxEnabled,
+        enabledVoiceIds,
+        enabledCustomDrops,
+        vibe,
+        aggressiveness,
+        preferCategories:
+          vibe === 'scratch-chop' ? ['scratch-vox', 'groove'] : ['groove', 'shout', 'scratch-vox'],
+        rng,
+      });
+      if (openerVoice) {
+        voiceDrops.push({
+          atProgress: 0.14,
+          voiceId: openerVoice.id,
+          label: `AI Vox · ${
+            openerVoice.isCustom
+              ? openerVoice.label
+              : VOICE_PRESET_MAP[openerVoice.id as DjVoiceDropId]?.calloutText || openerVoice.label
+          }`,
+        });
+      }
+    }
+    const dropVoice = pickContextVoiceDrop({
+      voiceFxEnabled,
+      enabledVoiceIds,
+      enabledCustomDrops,
+      vibe,
+      aggressiveness,
+      isGentle: gentleOnly,
+      preferCategories: gentleOnly
+        ? ['groove']
+        : vibe === 'scratch-chop'
+        ? ['scratch-vox', 'hype']
+        : ['countdown', 'hype', 'shout'],
+      rng,
+    });
+    if (dropVoice) {
+      voiceDrops.push({
+        atProgress: gentleOnly ? 0.38 : 0.42,
+        voiceId: dropVoice.id,
+        label: `AI Vox · ${
+          dropVoice.isCustom
+            ? dropVoice.label
+            : VOICE_PRESET_MAP[dropVoice.id as DjVoiceDropId]?.calloutText || dropVoice.label
+        }`,
+      });
+    }
+  }
+
+  // Upgrade #5: "Tease the Next Song" Breakdown Mashup Preview
+  let teasePreview: AiTransitionPlan['teasePreview'];
+  if (outgoingTrack && !isBreatherMix && !quickMix && outgoingTrack.durationSec >= 55) {
+    const outDur = outgoingTrack.durationSec;
+    const breakdownSeg = outgoingTrack.sections?.find(
+      (s) =>
+        s.label === 'breakdown' &&
+        s.startSec / outDur >= 0.18 &&
+        s.startSec / outDur <= 0.46
+    );
+    const candidatePct = breakdownSeg
+      ? breakdownSeg.startSec / outDur
+      : remixMode
+      ? 0.28 + rng() * 0.08
+      : -1;
+    const curPct = currentTimeSec / Math.max(10, outDur);
+    if (
+      candidatePct >= Math.max(0.16, curPct + 0.04) &&
+      candidatePct <= 0.48 &&
+      !songMoments.some((m) => Math.abs(m.atPct - candidatePct) < 0.055)
+    ) {
+      const inFirst = chosen.firstBeatSec || 0;
+      const inBeatSec = 60 / Math.max(65, chosen.bpm || 124);
+      const rawInCue =
+        chosen.dropCueSec ??
+        chosen.detectedDropSec ??
+        Math.min(chosen.durationSec * 0.32, 36);
+      const qBeats = Math.max(0, Math.round((rawInCue - inFirst) / inBeatSec));
+      const teaseCueSec = Math.max(
+        0,
+        Math.min(Math.max(8, chosen.durationSec - 12), inFirst + qBeats * inBeatSec)
+      );
+      teasePreview = {
+        triggerPct: Math.round(candidatePct * 1000) / 1000,
+        durationBars: 4,
+        cueSec: Math.round(teaseCueSec * 100) / 100,
+        label: `Breakdown Tease · "${chosen.title.split('(')[0].trim()}" Vocal`,
+      };
+    }
+  }
 
   return {
     nextTrackId: chosen.id,
-    mixStyle,
+    mixStyle: isBreatherMix ? `Breather Reset · ${mixStyle}` : mixStyle,
     mixStyleKey: built.mixStyleKey,
     sessionSignature,
-    transitionBars,
+    transitionBars: finalTransitionBars,
     incomingStartPct,
     tempoTargetBpm: Math.max(70, Math.min(185, tempoTargetBpm)),
     tempoFoldFactor: bpmMatch.foldFactor,
-    grooveRecipeLabel: built.grooveRecipeLabel,
-    recommendedBridge: resolvedBridge,
+    grooveRecipeLabel: isBreatherMix ? 'Breather Arc · Tension Reset' : built.grooveRecipeLabel,
+    outGroove,
+    inGroove,
+    genrePhysicsMode: isBreatherMix ? 'chill-velvet' : genrePhysicsMode,
+    recommendedBridge: finalBridge,
     bpmDeltaLabel,
     keyTransitionLabel,
     semitoneShiftIn: snap.semitones,
     doubleDropCueSec,
     clashProfile,
     useBeatSliceStutter,
-    aiNotes: `${sessionSignature} · ${built.grooveRecipeLabel} · ${keyRel} · ${clashProfile.summary}${
+    vocalCarryoverBars,
+    dynamicMidCallResponse,
+    setTensionScore: Math.round(setTensionScore),
+    isBreatherMix,
+    vipSkipEdit,
+    teasePreview,
+    aiNotes: `${sessionSignature} · ${
+      isBreatherMix ? 'Breather Arc Reset' : built.grooveRecipeLabel
+    } · ${keyRel} · ${clashProfile.summary}${
       typeof doubleDropCueSec === 'number' ? ' · Double-Drop Aligned' : ''
+    }${vocalCarryoverBars > 0 ? ` · +${vocalCarryoverBars}b Vocal Carry` : ''}${
+      vipSkipEdit ? ` · -${vipSkipEdit.barsSkipped}b VIP Skip` : ''
+    }${teasePreview ? ' · Breakdown Tease' : ''}${
+      voiceDrops.length > 0 ? ` · ${voiceDrops.length} Vox` : ''
     }`,
-    tricks: built.tricks,
-    songMoments,
+    tricks: breatherFilteredTricks,
+    voiceDrops,
+    songMoments: isBreatherMix ? songMoments.slice(0, 1) : songMoments,
     upcomingQueue,
-    chopPattern: built.chopPattern,
+    chopPattern: isBreatherMix ? 'off' : built.chopPattern,
     cueJuggleSeq: built.cueJuggleSeq,
     vocalPairingNote: vocalCompat.note,
   };
@@ -1938,69 +2454,106 @@ export function computeOfflineMashupBlend(params: {
   const bassDeckMid = vocalPair.clashRisk === 'high' ? -0.58 : -0.18;
   const stemDeckMid = vocalPair.clashRisk === 'ideal-mashup' ? 0.34 : 0.22;
 
-  // Advance #6: 16-Bar Call-and-Response Choreography Phases
+  const stemA: StemIsolationMode = aHoldsBass ? 'instrumental' : 'vocal-focus';
+  const stemB: StemIsolationMode = aHoldsBass ? 'vocal-focus' : 'instrumental';
+  const swapStemA: StemIsolationMode = aHoldsBass ? 'vocal-focus' : 'drums-only';
+  const swapStemB: StemIsolationMode = aHoldsBass ? 'drums-only' : 'vocal-focus';
+
+  // Upgrade #1: Continuous 32-Bar Live Bootleg Mashup Choreography Phases (powered by 3-Stem HPSS)
   const phases: AiMashupPhase[] = [
     {
       barStart: 0,
-      barEnd: 4,
+      barEnd: 8,
       focusDeck: aHoldsBass ? 'B' : 'A',
-      crossfader: aHoldsBass ? 0.14 : -0.14,
+      crossfader: aHoldsBass ? 0.08 : -0.08,
       deckAEqLow: aHoldsBass ? 0.08 : -0.82,
       deckAEqMid: aHoldsBass ? bassDeckMid : stemDeckMid,
       deckAEqHigh: aHoldsBass ? -0.08 : 0.18,
       deckBEqLow: aHoldsBass ? -0.82 : 0.08,
       deckBEqMid: aHoldsBass ? stemDeckMid : bassDeckMid,
       deckBEqHigh: aHoldsBass ? 0.18 : -0.08,
-      label: `Mashup Bars 1-4 · ${aHoldsBass ? 'A Beat + B Vocal Hook' : 'B Beat + A Vocal Hook'}`,
-    },
-    {
-      barStart: 4,
-      barEnd: 8,
-      focusDeck: aHoldsBass ? 'A' : 'B',
-      crossfader: aHoldsBass ? -0.18 : 0.18,
-      deckAEqLow: aHoldsBass ? 0.1 : -0.55,
-      deckAEqMid: aHoldsBass ? 0.24 : -0.52,
-      deckAEqHigh: 0.12,
-      deckBEqLow: aHoldsBass ? -0.55 : 0.1,
-      deckBEqMid: aHoldsBass ? -0.52 : 0.24,
-      deckBEqHigh: 0.12,
-      label: 'Mashup Bars 5-8 · Call & Response Pocket Swap',
+      deckAStemMode: stemA,
+      deckBStemMode: stemB,
+      deckAFilter: 0,
+      deckBFilter: 0,
+      label: `32-Bar Bootleg (1-8) · ${aHoldsBass ? 'A Beat × B Vocals' : 'B Beat × A Vocals'}`,
     },
     {
       barStart: 8,
-      barEnd: 12,
-      focusDeck: 'alternate',
-      crossfader: 0,
-      deckAEqLow: -0.25,
-      deckAEqMid: 0.14,
-      deckAEqHigh: 0.16,
-      deckBEqLow: -0.25,
-      deckBEqMid: 0.14,
-      deckBEqHigh: 0.16,
-      pingPongBars: 1,
-      label: 'Mashup Bars 9-12 · 1-Bar A↔B Trade Chop',
+      barEnd: 16,
+      focusDeck: aHoldsBass ? 'A' : 'B',
+      crossfader: aHoldsBass ? -0.1 : 0.1,
+      deckAEqLow: aHoldsBass ? -0.78 : 0.12,
+      deckAEqMid: aHoldsBass ? 0.28 : -0.42,
+      deckAEqHigh: 0.14,
+      deckBEqLow: aHoldsBass ? 0.12 : -0.78,
+      deckBEqMid: aHoldsBass ? -0.42 : 0.28,
+      deckBEqHigh: 0.14,
+      deckAStemMode: swapStemA,
+      deckBStemMode: swapStemB,
+      deckAFilter: 0,
+      deckBFilter: 0,
+      label: `32-Bar Bootleg (9-16) · Stem Swap ${aHoldsBass ? 'A Vocals × B Drums' : 'B Vocals × A Drums'}`,
     },
     {
-      barStart: 12,
-      barEnd: 16,
+      barStart: 16,
+      barEnd: 20,
+      focusDeck: 'alternate',
+      crossfader: 0,
+      deckAEqLow: -0.22,
+      deckAEqMid: 0.14,
+      deckAEqHigh: 0.16,
+      deckBEqLow: -0.22,
+      deckBEqMid: 0.14,
+      deckBEqHigh: 0.16,
+      deckAStemMode: 'off',
+      deckBStemMode: 'off',
+      deckAFilter: 0,
+      deckBFilter: 0,
+      pingPongBars: 1,
+      label: '32-Bar Bootleg (17-20) · 1-Bar A↔B Ping-Pong Trade',
+    },
+    {
+      barStart: 20,
+      barEnd: 24,
       focusDeck: 'both',
       crossfader: 0,
-      deckAEqLow: aHoldsBass ? 0.12 : -0.86,
+      deckAEqLow: -0.88,
+      deckAEqMid: 0.18,
+      deckAEqHigh: 0.22,
+      deckBEqLow: -0.88,
+      deckBEqMid: 0.18,
+      deckBEqHigh: 0.22,
+      deckAStemMode: 'off',
+      deckBStemMode: 'off',
+      deckAFilter: 0.48,
+      deckBFilter: 0.42,
+      label: '32-Bar Bootleg (21-24) · Pre-Drop HPF Tension Build',
+    },
+    {
+      barStart: 24,
+      barEnd: 32,
+      focusDeck: 'both',
+      crossfader: 0,
+      deckAEqLow: aHoldsBass ? 0.14 : -0.88,
       deckAEqMid: aHoldsBass ? bassDeckMid : stemDeckMid,
       deckAEqHigh: 0.14,
-      deckBEqLow: aHoldsBass ? -0.86 : 0.12,
+      deckBEqLow: aHoldsBass ? -0.88 : 0.14,
       deckBEqMid: aHoldsBass ? stemDeckMid : bassDeckMid,
       deckBEqHigh: 0.14,
-      label: 'Mashup Bars 13-16 · Climax Dual-Deck Lock',
+      deckAStemMode: 'off',
+      deckBStemMode: 'off',
+      deckAFilter: 0,
+      deckBFilter: 0,
+      isDoubleDrop: true,
+      label: '32-Bar Bootleg (25-32) · Double-Drop Slam + Bass Lock',
     },
   ];
-
-  const stemA: StemIsolationMode = aHoldsBass ? 'instrumental' : 'vocal-focus';
-  const stemB: StemIsolationMode = aHoldsBass ? 'vocal-focus' : 'instrumental';
 
   return {
     syncDeck: aHoldsBass ? 'B' : 'A',
     crossfader: 0,
+    mashupTotalBars: 32,
     deckA: {
       eqLow: aHoldsBass ? 0.08 : -0.82,
       eqMid: aHoldsBass ? bassDeckMid : stemDeckMid,
@@ -2021,9 +2574,9 @@ export function computeOfflineMashupBlend(params: {
       fxWet: aHoldsBass ? fxWet : 0,
       stemMode: stemB,
     },
-    harmonicSummary: `16-Bar Call & Response · Deck ${aHoldsBass ? 'A' : 'B'} Inst + Deck ${
+    harmonicSummary: `32-Bar Live Bootleg · Deck ${aHoldsBass ? 'A' : 'B'} Inst + Deck ${
       aHoldsBass ? 'B' : 'A'
-    } Vocal Stem (${FX_FRIENDLY_NAME[stemDeckFxType]}) · ${vocalPair.note} · ${keyRel}`,
+    } Vocal (${FX_FRIENDLY_NAME[stemDeckFxType]}) · ${vocalPair.note} · ${keyRel}`,
     phases,
   };
 }

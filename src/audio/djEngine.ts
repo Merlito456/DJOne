@@ -2,12 +2,15 @@ import {
   CrossfaderCurve,
   DeckFxState,
   DeckId,
+  DjVoiceDropId,
   FxType,
   GrooveBridgePattern,
   SoundTrickType,
   StemIsolationMode,
+  WaveformBandSample,
 } from '../types/dj';
 import { camelotToHarmony } from './aiMemory';
+import { ensurePitchWorkletLoaded } from './timeStretchWorklet';
 import { encodeStereoChunksToWav } from './waveformAnalyzer';
 
 function makeSaturationCurve(amount = 40): Float32Array<ArrayBuffer> {
@@ -50,12 +53,20 @@ function createStereoReverbImpulse(ctx: AudioContext, duration = 2.2, decay = 2.
 class DeckChannel {
   private ctx: AudioContext;
   public buffer: AudioBuffer | null = null;
+  private harmonicBuffer: AudioBuffer | null = null;
+  private percussiveBuffer: AudioBuffer | null = null;
+  private bassBuffer: AudioBuffer | null = null;
   private source: AudioBufferSourceNode | null = null;
+  private harmonicSource: AudioBufferSourceNode | null = null;
+  private percussiveSource: AudioBufferSourceNode | null = null;
+  private bassSource: AudioBufferSourceNode | null = null;
 
   public isPlaying = false;
   private anchorCtxTime = 0;
   private anchorOffsetSec = 0;
   public playbackRate = 1;
+  private keyLock = true;
+  private semitoneShift = 0;
   private playToken = 0;
 
   public loopActive = false;
@@ -67,6 +78,18 @@ class DeckChannel {
   private stemBypassGain: GainNode;
   private stemVocalGain: GainNode;
   private stemInstGain: GainNode;
+  private stemDrumsGain: GainNode;
+  private midSideStemEnableGain: GainNode;
+  private midSideDrumsEnableGain: GainNode;
+  private hpssVocalEnableGain: GainNode;
+  private hpssInstEnableGain: GainNode;
+  private hpssDrumsEnableGain: GainNode;
+  private hpssBassEnableGain: GainNode;
+  private hpssVocalBus: GainNode;
+  private hpssInstBus: GainNode;
+  private hpssBassBus: GainNode;
+  private preEqSum: GainNode;
+  private pitchWorklet: AudioWorkletNode | null = null;
   public stemMode: StemIsolationMode = 'off';
   private activeTrimValue = 1;
   private sliceDuckUntilCtxTime = 0;
@@ -176,6 +199,12 @@ class DeckChannel {
   public channelGain: GainNode;
   public analyser: AnalyserNode;
   private analyserData: Float32Array<ArrayBuffer>;
+  private analyserFreqData: Uint8Array<ArrayBuffer>;
+  private baseOutputGain = 0.85;
+  private sidechainDuckMult = 1;
+  private stereoWidthGain: GainNode;
+  private midSideInstGate!: GainNode;
+  private tapeBrakingUntilCtxTime = 0;
 
   private currentFx: FxType = 'echo';
   private fxEnabled = false;
@@ -187,18 +216,43 @@ class DeckChannel {
     this.trimGain = ctx.createGain();
     this.trimGain.gain.value = 1;
 
-    // Real-Time Mid/Side Stem Isolator Matrix (Advance #1: Vocal Focus vs Instrumental)
+    // Real-Time 3-Stem Isolator Matrix (HPSS Worker stems when ready + Mid/Side instant fallback)
     this.stemBypassGain = ctx.createGain();
     this.stemBypassGain.gain.value = 1;
     this.stemVocalGain = ctx.createGain();
     this.stemVocalGain.gain.value = 0;
     this.stemInstGain = ctx.createGain();
     this.stemInstGain.gain.value = 0;
+    this.stemDrumsGain = ctx.createGain();
+    this.stemDrumsGain.gain.value = 0;
+
+    this.midSideStemEnableGain = ctx.createGain();
+    this.midSideStemEnableGain.gain.value = 1;
+    this.midSideDrumsEnableGain = ctx.createGain();
+    this.midSideDrumsEnableGain.gain.value = 1;
+    this.hpssVocalEnableGain = ctx.createGain();
+    this.hpssVocalEnableGain.gain.value = 0;
+    this.hpssInstEnableGain = ctx.createGain();
+    this.hpssInstEnableGain.gain.value = 0;
+    this.hpssDrumsEnableGain = ctx.createGain();
+    this.hpssDrumsEnableGain.gain.value = 0;
+    this.hpssBassEnableGain = ctx.createGain();
+    this.hpssBassEnableGain.gain.value = 0;
+
+    this.hpssVocalBus = ctx.createGain();
+    this.hpssVocalBus.gain.value = 1;
+    this.hpssInstBus = ctx.createGain();
+    this.hpssInstBus.gain.value = 1;
+    this.hpssBassBus = ctx.createGain();
+    this.hpssBassBus.gain.value = 1;
+
+    this.preEqSum = ctx.createGain();
+    this.preEqSum.gain.value = 1;
 
     const splitter = ctx.createChannelSplitter(2);
     this.trimGain.connect(splitter);
 
-    // Mid Stem (Vocal Focus: L + R summed -> 260Hz..3.8kHz presence bandpass)
+    // Mid Stem (Vocal Focus fallback: L + R summed -> 260Hz..3.8kHz presence bandpass)
     const midSumGainL = ctx.createGain();
     midSumGainL.gain.value = 0.65;
     const midSumGainR = ctx.createGain();
@@ -223,9 +277,10 @@ class DeckChannel {
     midSumGainR.connect(vocalHp);
     vocalHp.connect(vocalLp);
     vocalLp.connect(vocalPeak);
-    vocalPeak.connect(this.stemVocalGain);
+    vocalPeak.connect(this.midSideStemEnableGain);
+    this.midSideStemEnableGain.connect(this.stemVocalGain);
 
-    // Side-Weighted Stem (Instrumental: (L - R) stereo bed + <175Hz mono bass punch + >5.2kHz hat air)
+    // Side-Weighted Stem (Instrumental fallback)
     const sideGainL = ctx.createGain();
     sideGainL.gain.value = 0.95;
     const sideGainInvR = ctx.createGain();
@@ -251,23 +306,59 @@ class DeckChannel {
     airHp.type = 'highpass';
     airHp.frequency.value = 5200;
 
+    const midSideInstSum = ctx.createGain();
+    midSideInstSum.gain.value = 1;
+    const midSideInstGate = ctx.createGain();
+    midSideInstGate.gain.value = 1;
+
     splitter.connect(sideGainL, 0);
     splitter.connect(sideGainInvR, 1);
     sideGainL.connect(sideHp);
     sideGainInvR.connect(sideHp);
-    sideHp.connect(this.stemInstGain);
+    sideHp.connect(midSideInstSum);
 
     splitter.connect(subSumL, 0);
     splitter.connect(subSumR, 1);
     subSumL.connect(subLp);
     subSumR.connect(subLp);
-    subLp.connect(this.stemInstGain);
+    subLp.connect(midSideInstSum);
 
     splitter.connect(airSumL, 0);
     splitter.connect(airSumR, 1);
     airSumL.connect(airHp);
     airSumR.connect(airHp);
-    airHp.connect(this.stemInstGain);
+    airHp.connect(midSideInstSum);
+
+    midSideInstSum.connect(midSideInstGate);
+    midSideInstGate.connect(this.stemInstGain);
+    this.midSideInstGate = midSideInstGate;
+
+    // Drums-Only Fallback (Side transients + 160Hz..9kHz punch without sustained sub)
+    const fallbackDrumHp = ctx.createBiquadFilter();
+    fallbackDrumHp.type = 'highpass';
+    fallbackDrumHp.frequency.value = 140;
+    sideGainL.connect(fallbackDrumHp);
+    sideGainInvR.connect(fallbackDrumHp);
+    fallbackDrumHp.connect(this.midSideDrumsEnableGain);
+    this.midSideDrumsEnableGain.connect(this.stemDrumsGain);
+
+    // HPSS 3-Stem Routing (Harmonic Vocals + Percussive Drums + Sub-Bass)
+    const hpssVocHp = ctx.createBiquadFilter();
+    hpssVocHp.type = 'highpass';
+    hpssVocHp.frequency.value = 165;
+    hpssVocHp.Q.value = 0.75;
+    this.hpssVocalBus.connect(hpssVocHp);
+    hpssVocHp.connect(this.hpssVocalEnableGain);
+    this.hpssVocalEnableGain.connect(this.stemVocalGain);
+
+    this.hpssInstBus.connect(this.hpssInstEnableGain);
+    this.hpssInstEnableGain.connect(this.stemInstGain);
+
+    this.hpssInstBus.connect(this.hpssDrumsEnableGain);
+    this.hpssDrumsEnableGain.connect(this.stemDrumsGain);
+
+    this.hpssBassBus.connect(this.hpssBassEnableGain);
+    this.hpssBassEnableGain.connect(this.stemInstGain);
 
     this.eqLow = ctx.createBiquadFilter();
     this.eqLow.type = 'lowshelf';
@@ -616,18 +707,59 @@ class DeckChannel {
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 256;
     this.analyserData = new Float32Array(new ArrayBuffer(this.analyser.fftSize * 4));
+    this.analyserFreqData = new Uint8Array(new ArrayBuffer(this.analyser.frequencyBinCount));
 
-    // Wire DSP graph
+    // Real-Time Mid/Side Stereo Width Matrix (width = 0..1.35; 1.0 = identity)
+    const widthSplitter = ctx.createChannelSplitter(2);
+    const widthMidSum = ctx.createGain();
+    widthMidSum.gain.value = 1;
+    const wMidL = ctx.createGain();
+    wMidL.gain.value = 0.5;
+    const wMidR = ctx.createGain();
+    wMidR.gain.value = 0.5;
+    const widthSidePre = ctx.createGain();
+    widthSidePre.gain.value = 1;
+    const wSideL = ctx.createGain();
+    wSideL.gain.value = 0.5;
+    const wSideR = ctx.createGain();
+    wSideR.gain.value = -0.5;
+    this.stereoWidthGain = ctx.createGain();
+    this.stereoWidthGain.gain.value = 1;
+    const widthSideInvert = ctx.createGain();
+    widthSideInvert.gain.value = -1;
+    const widthMerger = ctx.createChannelMerger(2);
+
+    this.sweepFilter.connect(widthSplitter);
+    widthSplitter.connect(wMidL, 0);
+    widthSplitter.connect(wMidR, 1);
+    wMidL.connect(widthMidSum);
+    wMidR.connect(widthMidSum);
+
+    widthSplitter.connect(wSideL, 0);
+    widthSplitter.connect(wSideR, 1);
+    wSideL.connect(widthSidePre);
+    wSideR.connect(widthSidePre);
+    widthSidePre.connect(this.stereoWidthGain);
+
+    widthMidSum.connect(widthMerger, 0, 0);
+    widthMidSum.connect(widthMerger, 0, 1);
+    this.stereoWidthGain.connect(widthMerger, 0, 0);
+    this.stereoWidthGain.connect(widthSideInvert);
+    widthSideInvert.connect(widthMerger, 0, 1);
+
+    // Wire DSP graph through preEqSum (and pitch shifter AudioWorklet once attached)
     this.trimGain.connect(this.stemBypassGain);
-    this.stemBypassGain.connect(this.eqLow);
-    this.stemVocalGain.connect(this.eqLow);
-    this.stemInstGain.connect(this.eqLow);
+    this.stemBypassGain.connect(this.preEqSum);
+    this.stemVocalGain.connect(this.preEqSum);
+    this.stemInstGain.connect(this.preEqSum);
+    this.stemDrumsGain.connect(this.preEqSum);
+    this.preEqSum.connect(this.eqLow);
     this.eqLow.connect(this.eqMid);
     this.eqMid.connect(this.eqHigh);
     this.eqHigh.connect(this.sweepFilter);
 
-    this.sweepFilter.connect(this.dryGain);
-    this.sweepFilter.connect(this.fxInput);
+    widthMerger.connect(this.dryGain);
+    widthMerger.connect(this.fxInput);
 
     this.dryGain.connect(this.channelGain);
     this.wetGain.connect(this.channelGain);
@@ -636,13 +768,144 @@ class DeckChannel {
     this.channelGain.connect(destination);
   }
 
+  attachPitchWorklet() {
+    if (this.pitchWorklet) return;
+    try {
+      const node = new AudioWorkletNode(this.ctx, 'deckforge-pitch-shifter', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+      this.preEqSum.disconnect(this.eqLow);
+      this.preEqSum.connect(node);
+      node.connect(this.eqLow);
+      this.pitchWorklet = node;
+      this.updatePitchShiftParam();
+    } catch {
+      // keep direct preEqSum -> eqLow path if AudioWorklet unavailable
+    }
+  }
+
+  private updatePitchShiftParam() {
+    if (!this.pitchWorklet) return;
+    const param = this.pitchWorklet.parameters.get('pitchFactor');
+    if (!param) return;
+    const baseComp = this.keyLock ? 1 / Math.max(0.4, this.playbackRate) : 1;
+    const semitoneMult = Math.pow(2, this.semitoneShift / 12);
+    const factor = Math.max(0.55, Math.min(1.85, baseComp * semitoneMult));
+    param.setTargetAtTime(factor, this.ctx.currentTime, 0.018);
+  }
+
+  setKeyLock(enabled: boolean) {
+    this.keyLock = enabled;
+    this.updatePitchShiftParam();
+  }
+
+  setSemitoneShift(semitones: number) {
+    this.semitoneShift = Math.max(-4, Math.min(4, semitones));
+    this.updatePitchShiftParam();
+  }
+
+  setHpssBuffers(
+    harmonic: AudioBuffer | null,
+    percussive: AudioBuffer | null,
+    bass: AudioBuffer | null = null
+  ) {
+    this.harmonicBuffer = harmonic;
+    this.percussiveBuffer = percussive;
+    this.bassBuffer = bass;
+    const hasHpss = Boolean(harmonic && percussive);
+    const t = this.ctx.currentTime;
+    this.midSideStemEnableGain.gain.setTargetAtTime(hasHpss ? 0 : 1, t, 0.03);
+    this.midSideInstGate.gain.setTargetAtTime(hasHpss ? 0 : 1, t, 0.03);
+    this.midSideDrumsEnableGain.gain.setTargetAtTime(hasHpss ? 0 : 1, t, 0.03);
+    this.hpssVocalEnableGain.gain.setTargetAtTime(hasHpss ? 1.12 : 0, t, 0.03);
+    this.hpssInstEnableGain.gain.setTargetAtTime(hasHpss ? 1.05 : 0, t, 0.03);
+    this.hpssDrumsEnableGain.gain.setTargetAtTime(hasHpss ? 1.15 : 0, t, 0.03);
+    this.hpssBassEnableGain.gain.setTargetAtTime(hasHpss && bass ? 1.02 : 0, t, 0.03);
+
+    // If playing when background HPSS finishes, start synced stem sources cleanly
+    if (hasHpss && this.isPlaying && !this.harmonicSource && !this.percussiveSource) {
+      this.startHpssSourcesAt(this.getCurrentTime());
+    }
+  }
+
+  getHarmonicBuffer(): AudioBuffer | null {
+    return this.harmonicBuffer;
+  }
+
+  getPercussiveBuffer(): AudioBuffer | null {
+    return this.percussiveBuffer;
+  }
+
+  getBassBuffer(): AudioBuffer | null {
+    return this.bassBuffer;
+  }
+
+  private startHpssSourcesAt(offset: number) {
+    if (!this.harmonicBuffer || !this.percussiveBuffer) return;
+    this.stopHpssSources();
+
+    const makeSyncedSrc = (buf: AudioBuffer, dest: AudioNode) => {
+      const s = this.ctx.createBufferSource();
+      s.buffer = buf;
+      s.playbackRate.setValueAtTime(this.playbackRate, this.ctx.currentTime);
+      if (this.loopActive && this.loopEndSec > this.loopStartSec + 0.02) {
+        s.loop = true;
+        s.loopStart = this.loopStartSec;
+        s.loopEnd = this.loopEndSec;
+      }
+      s.connect(dest);
+      s.start(0, Math.max(0, Math.min(buf.duration - 0.02, offset)));
+      return s;
+    };
+
+    this.harmonicSource = makeSyncedSrc(this.harmonicBuffer, this.hpssVocalBus);
+    this.percussiveSource = makeSyncedSrc(this.percussiveBuffer, this.hpssInstBus);
+    if (this.bassBuffer) {
+      this.bassSource = makeSyncedSrc(this.bassBuffer, this.hpssBassBus);
+    }
+  }
+
+  private stopHpssSources() {
+    for (const src of [this.harmonicSource, this.percussiveSource, this.bassSource]) {
+      if (!src) continue;
+      try {
+        src.stop(0);
+      } catch {
+        // ignore
+      }
+      try {
+        src.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+    this.harmonicSource = null;
+    this.percussiveSource = null;
+    this.bassSource = null;
+  }
+
   setBuffer(buffer: AudioBuffer | null) {
     this.playToken++;
     this.stopSource();
     this.buffer = buffer;
+    this.harmonicBuffer = null;
+    this.percussiveBuffer = null;
+    this.bassBuffer = null;
+    this.semitoneShift = 0;
+    const t = this.ctx.currentTime;
+    this.midSideStemEnableGain.gain.setValueAtTime(1, t);
+    this.midSideInstGate.gain.setValueAtTime(1, t);
+    this.midSideDrumsEnableGain.gain.setValueAtTime(1, t);
+    this.hpssVocalEnableGain.gain.setValueAtTime(0, t);
+    this.hpssInstEnableGain.gain.setValueAtTime(0, t);
+    this.hpssDrumsEnableGain.gain.setValueAtTime(0, t);
+    this.hpssBassEnableGain.gain.setValueAtTime(0, t);
     this.isPlaying = false;
     this.anchorOffsetSec = 0;
     this.loopActive = false;
+    this.updatePitchShiftParam();
   }
 
   getPlayToken(): number {
@@ -702,6 +965,7 @@ class DeckChannel {
           this.isPlaying = false;
           this.anchorOffsetSec = this.buffer.duration;
           this.source = null;
+          this.stopHpssSources();
         }
       }
     };
@@ -709,6 +973,8 @@ class DeckChannel {
     this.source = src;
     this.anchorCtxTime = this.ctx.currentTime;
     this.isPlaying = true;
+    this.startHpssSourcesAt(offset);
+    this.updatePitchShiftParam();
   }
 
   pause() {
@@ -730,15 +996,43 @@ class DeckChannel {
   }
 
   setPlaybackRate(rate: number) {
+    if (this.ctx.currentTime < this.tapeBrakingUntilCtxTime) {
+      return;
+    }
     const safeRate = Math.max(0.25, Math.min(2.5, rate));
     if (this.isPlaying) {
       this.anchorOffsetSec = this.getCurrentTime();
       this.anchorCtxTime = this.ctx.currentTime;
-      if (this.source) {
-        this.source.playbackRate.setTargetAtTime(safeRate, this.ctx.currentTime, 0.012);
+      for (const s of [this.source, this.harmonicSource, this.percussiveSource, this.bassSource]) {
+        if (s) s.playbackRate.setTargetAtTime(safeRate, this.ctx.currentTime, 0.012);
       }
     }
     this.playbackRate = safeRate;
+    this.updatePitchShiftParam();
+  }
+
+  triggerTapeBrake(durationSec = 0.85) {
+    if (!this.source || !this.isPlaying) return;
+    const now = this.ctx.currentTime;
+    const dur = Math.max(0.3, Math.min(1.8, durationSec));
+    this.tapeBrakingUntilCtxTime = now + dur;
+    this.anchorOffsetSec = this.getCurrentTime();
+    this.anchorCtxTime = now;
+    try {
+      for (const s of [this.source, this.harmonicSource, this.percussiveSource, this.bassSource]) {
+        if (!s) continue;
+        s.playbackRate.cancelScheduledValues(now);
+        s.playbackRate.setValueAtTime(Math.max(0.25, this.playbackRate), now);
+        s.playbackRate.exponentialRampToValueAtTime(0.08, now + dur);
+      }
+    } catch {
+      // ignore scheduling edge cases
+    }
+  }
+
+  setStereoWidth(width: number) {
+    const safeWidth = Math.max(0.15, Math.min(1.35, width));
+    this.stereoWidthGain.gain.setTargetAtTime(safeWidth, this.ctx.currentTime, 0.02);
   }
 
   setScratchRate(rate: number) {
@@ -746,7 +1040,9 @@ class DeckChannel {
     const safeRate = Math.max(0.1, Math.min(3.0, rate));
     this.anchorOffsetSec = this.getCurrentTime();
     this.anchorCtxTime = this.ctx.currentTime;
-    this.source.playbackRate.setTargetAtTime(safeRate, this.ctx.currentTime, 0.008);
+    for (const s of [this.source, this.harmonicSource, this.percussiveSource, this.bassSource]) {
+      if (s) s.playbackRate.setTargetAtTime(safeRate, this.ctx.currentTime, 0.008);
+    }
     this.playbackRate = safeRate;
   }
 
@@ -754,10 +1050,11 @@ class DeckChannel {
     this.loopActive = active;
     this.loopStartSec = startSec;
     this.loopEndSec = endSec;
-    if (this.source) {
-      this.source.loop = active && endSec > startSec + 0.02;
-      this.source.loopStart = startSec;
-      this.source.loopEnd = endSec;
+    for (const s of [this.source, this.harmonicSource, this.percussiveSource, this.bassSource]) {
+      if (!s) continue;
+      s.loop = active && endSec > startSec + 0.02;
+      s.loopStart = startSec;
+      s.loopEnd = endSec;
     }
   }
 
@@ -767,6 +1064,125 @@ class DeckChannel {
     this.stemBypassGain.gain.setTargetAtTime(mode === 'off' ? 1 : 0, t, 0.018);
     this.stemVocalGain.gain.setTargetAtTime(mode === 'vocal-focus' ? 1.15 : 0, t, 0.018);
     this.stemInstGain.gain.setTargetAtTime(mode === 'instrumental' ? 1.05 : 0, t, 0.018);
+    this.stemDrumsGain.gain.setTargetAtTime(mode === 'drums-only' ? 1.18 : 0, t, 0.018);
+  }
+
+  /**
+   * Upgrade #3: Real AudioBuffer Turntable Scratch Synthesizer.
+   * Slices a short phrase (preferring HPSS vocal harmonic stem when ready) into forward +
+   * time-reversed stereo micro-buffers with curved turntable platter rate sweeps & crisp fader cuts.
+   */
+  triggerTurntableScratch(params: {
+    currentSec: number;
+    bpm: number;
+    pattern: 'baby' | 'chirp' | '2click-flare' | 'crab';
+    preferHarmonic?: boolean;
+  }) {
+    const srcBuf =
+      params.preferHarmonic && this.harmonicBuffer ? this.harmonicBuffer : this.buffer;
+    if (!srcBuf || srcBuf.duration < 6) return;
+
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+    const bpm = Math.max(65, Math.min(185, params.bpm || 124));
+    const beatSec = 60 / bpm;
+    const sr = srcBuf.sampleRate;
+
+    const sliceSec = Math.max(0.18, Math.min(0.45, beatSec * 0.65));
+    const startSec = Math.max(0.2, Math.min(srcBuf.duration - sliceSec - 0.1, params.currentSec));
+    const startSample = Math.floor(startSec * sr);
+    const frameCount = Math.max(2048, Math.min(srcBuf.length - startSample, Math.floor(sliceSec * sr)));
+    if (frameCount < 2048) return;
+
+    const numCh = Math.min(2, srcBuf.numberOfChannels);
+    const fwdBuf = ctx.createBuffer(numCh, frameCount, sr);
+    const revBuf = ctx.createBuffer(numCh, frameCount, sr);
+    for (let ch = 0; ch < numCh; ch++) {
+      const sData = srcBuf.getChannelData(ch);
+      const fData = fwdBuf.getChannelData(ch);
+      const rData = revBuf.getChannelData(ch);
+      for (let i = 0; i < frameCount; i++) {
+        const sample = sData[startSample + i];
+        fData[i] = sample;
+        rData[frameCount - 1 - i] = sample;
+      }
+    }
+
+    // Crisp scratch tone bandpass so vocal/synth phrasing pops above sub
+    const scratchHp = ctx.createBiquadFilter();
+    scratchHp.type = 'highpass';
+    scratchHp.frequency.setValueAtTime(210, now);
+    scratchHp.Q.value = 1.1;
+    scratchHp.connect(this.sweepFilter);
+
+    type Grain = {
+      dir: 'fwd' | 'rev';
+      offsetSec: number;
+      durSec: number;
+      rStart: number;
+      rEnd: number;
+      faderClosedMid?: boolean;
+    };
+
+    const gDur = Math.max(0.06, Math.min(0.16, beatSec * 0.25));
+    const grains: Grain[] =
+      params.pattern === 'crab'
+        ? [
+            { dir: 'fwd', offsetSec: 0, durSec: gDur * 0.55, rStart: 1.55, rEnd: 1.15 },
+            { dir: 'fwd', offsetSec: 0.02, durSec: gDur * 0.55, rStart: 1.45, rEnd: 1.1 },
+            { dir: 'fwd', offsetSec: 0.04, durSec: gDur * 0.55, rStart: 1.6, rEnd: 1.2 },
+            { dir: 'rev', offsetSec: 0, durSec: gDur * 1.1, rStart: 1.4, rEnd: 0.85 },
+          ]
+        : params.pattern === '2click-flare'
+        ? [
+            { dir: 'fwd', offsetSec: 0, durSec: gDur * 1.15, rStart: 1.45, rEnd: 1.05, faderClosedMid: true },
+            { dir: 'rev', offsetSec: 0, durSec: gDur * 1.15, rStart: 1.35, rEnd: 0.9, faderClosedMid: true },
+            { dir: 'fwd', offsetSec: 0, durSec: gDur * 1.25, rStart: 1.15, rEnd: 1.0 },
+          ]
+        : params.pattern === 'chirp'
+        ? [
+            { dir: 'fwd', offsetSec: 0, durSec: gDur * 0.85, rStart: 1.65, rEnd: 1.1 },
+            { dir: 'rev', offsetSec: 0.02, durSec: gDur * 0.9, rStart: 1.5, rEnd: 0.95 },
+            { dir: 'fwd', offsetSec: 0, durSec: gDur * 1.1, rStart: 1.35, rEnd: 1.0 },
+          ]
+        : [
+            { dir: 'fwd', offsetSec: 0, durSec: gDur, rStart: 1.35, rEnd: 0.95 },
+            { dir: 'rev', offsetSec: 0.01, durSec: gDur, rStart: 1.3, rEnd: 0.9 },
+            { dir: 'fwd', offsetSec: 0, durSec: gDur * 1.2, rStart: 1.2, rEnd: 1.0 },
+          ];
+
+    let cursor = now;
+    const totalDur = grains.reduce((acc, g) => acc + g.durSec, 0);
+    this.sliceDuckUntilCtxTime = cursor + totalDur;
+    this.trimGain.gain.setValueAtTime(this.activeTrimValue, cursor);
+    this.trimGain.gain.linearRampToValueAtTime(this.activeTrimValue * 0.14, cursor + 0.01);
+    this.trimGain.gain.setValueAtTime(this.activeTrimValue * 0.14, Math.max(cursor + 0.04, cursor + totalDur - 0.03));
+    this.trimGain.gain.linearRampToValueAtTime(this.activeTrimValue, cursor + totalDur + 0.02);
+
+    for (const g of grains) {
+      const s = ctx.createBufferSource();
+      s.buffer = g.dir === 'fwd' ? fwdBuf : revBuf;
+      s.playbackRate.setValueAtTime(g.rStart, cursor);
+      s.playbackRate.exponentialRampToValueAtTime(Math.max(0.4, g.rEnd), cursor + g.durSec);
+
+      const vca = ctx.createGain();
+      const att = 0.005;
+      vca.gain.setValueAtTime(0.001, cursor);
+      vca.gain.linearRampToValueAtTime(1.12, cursor + att);
+      if (g.faderClosedMid && g.durSec > 0.06) {
+        // Sharp transformer click cut inside the flare stroke
+        vca.gain.linearRampToValueAtTime(0.04, cursor + g.durSec * 0.44);
+        vca.gain.linearRampToValueAtTime(1.1, cursor + g.durSec * 0.56);
+      }
+      vca.gain.setValueAtTime(1.05, Math.max(cursor + att, cursor + g.durSec - 0.008));
+      vca.gain.exponentialRampToValueAtTime(0.001, cursor + g.durSec);
+
+      s.connect(vca);
+      vca.connect(scratchHp);
+      const maxRead = Math.max(0.01, fwdBuf.duration - g.durSec * Math.max(g.rStart, g.rEnd) - 0.01);
+      s.start(cursor, Math.min(maxRead, g.offsetSec), g.durSec * Math.max(g.rStart, g.rEnd) + 0.02);
+      cursor += g.durSec;
+    }
   }
 
   /**
@@ -951,7 +1367,33 @@ class DeckChannel {
   }
 
   setOutputGain(gain: number) {
-    this.channelGain.gain.setTargetAtTime(Math.max(0, Math.min(1.5, gain)), this.ctx.currentTime, 0.012);
+    this.baseOutputGain = Math.max(0, Math.min(1.5, gain));
+    this.channelGain.gain.setTargetAtTime(
+      this.baseOutputGain * this.sidechainDuckMult,
+      this.ctx.currentTime,
+      0.012
+    );
+  }
+
+  setSidechainDuck(mult: number) {
+    this.sidechainDuckMult = Math.max(0.35, Math.min(1, mult));
+    this.channelGain.gain.setTargetAtTime(
+      this.baseOutputGain * this.sidechainDuckMult,
+      this.ctx.currentTime,
+      0.018
+    );
+  }
+
+  getLowBandEnergy(): number {
+    if (!this.isPlaying) return 0;
+    this.analyser.getByteFrequencyData(this.analyserFreqData);
+    // Bins 0..3 cover sub & kick (< ~350Hz at 44.1kHz / 256 FFT)
+    let sum = 0;
+    const bins = Math.min(4, this.analyserFreqData.length);
+    for (let i = 0; i < bins; i++) {
+      sum += this.analyserFreqData[i];
+    }
+    return Math.min(1, sum / (bins * 255));
   }
 
   getLevel(): number {
@@ -982,6 +1424,7 @@ class DeckChannel {
         // already disconnected
       }
     }
+    this.stopHpssSources();
   }
 }
 
@@ -989,6 +1432,9 @@ export class DjAudioEngine {
   private ctx: AudioContext | null = null;
   private decks: Record<DeckId, DeckChannel> | null = null;
   private masterSum: GainNode | null = null;
+  private voiceDuckFilter: BiquadFilterNode | null = null;
+  private postDuckSum: GainNode | null = null;
+  private voiceDuckUntilCtxTime = 0;
   private masterLimiter: DynamicsCompressorNode | null = null;
   private masterGainNode: GainNode | null = null;
   private masterAnalyser: AnalyserNode | null = null;
@@ -1007,11 +1453,19 @@ export class DjAudioEngine {
   private bridgePattern: GrooveBridgePattern = 'off';
   private bridgeBpm = 124;
   private bridgeKey = '8A';
+  private bridgePitchRate = 1;
   private bridgeTimerId: ReturnType<typeof setInterval> | null = null;
   private bridgeStep = 0;
   private bridgeBar = 0;
   private bridgeNextStepTime = 0;
   private bridgeNoiseBuffer: AudioBuffer | null = null;
+
+  // Remix Deck C: Captured 1-bar Vocal/Hook Micro-Sampler buffer
+  private deckCHookBuffer: AudioBuffer | null = null;
+  private deckCHookBpm = 124;
+  private deckCHookTitle = '';
+  private roomReverbImpulse: AudioBuffer | null = null;
+  private pitchWorkletReady = false;
 
   private ensureInit() {
     if (this.ctx && this.decks) return;
@@ -1020,14 +1474,102 @@ export class DjAudioEngine {
     this.ctx = ctx;
 
     const reverbImpulse = createStereoReverbImpulse(ctx, 2.4, 2.7);
+    this.roomReverbImpulse = reverbImpulse;
 
     this.masterSum = ctx.createGain();
+    // Upgrade #1: Master Bus Mid-Pocket Voice Ducker + 3-Band Club Mastering Chain
+    this.voiceDuckFilter = ctx.createBiquadFilter();
+    this.voiceDuckFilter.type = 'peaking';
+    this.voiceDuckFilter.frequency.value = 1100;
+    this.voiceDuckFilter.Q.value = 0.65;
+    this.voiceDuckFilter.gain.value = 0;
+
+    this.postDuckSum = ctx.createGain();
+    this.postDuckSum.gain.value = 1;
+
+    this.masterSum.connect(this.voiceDuckFilter);
+    this.voiceDuckFilter.connect(this.postDuckSum);
+
+    // Band 1: Mono-Tightened Club Sub (< 125 Hz)
+    const lowLp1 = ctx.createBiquadFilter();
+    lowLp1.type = 'lowpass';
+    lowLp1.frequency.value = 125;
+    lowLp1.Q.value = 0.707;
+    const lowSplit = ctx.createChannelSplitter(2);
+    const lowMonoSum = ctx.createGain();
+    lowMonoSum.gain.value = 0.5;
+    const lowMonoMerge = ctx.createChannelMerger(2);
+    const lowComp = ctx.createDynamicsCompressor();
+    lowComp.threshold.value = -12;
+    lowComp.knee.value = 6;
+    lowComp.ratio.value = 3.5;
+    lowComp.attack.value = 0.008;
+    lowComp.release.value = 0.14;
+    const lowBandGain = ctx.createGain();
+    lowBandGain.gain.value = 1.02;
+
+    this.postDuckSum.connect(lowLp1);
+    lowLp1.connect(lowSplit);
+    lowSplit.connect(lowMonoSum, 0);
+    lowSplit.connect(lowMonoSum, 1);
+    lowMonoSum.connect(lowMonoMerge, 0, 0);
+    lowMonoSum.connect(lowMonoMerge, 0, 1);
+    lowMonoMerge.connect(lowComp);
+    lowComp.connect(lowBandGain);
+
+    // Band 2: Punchy Mid Glue (125 Hz .. 3.5 kHz)
+    const midHp = ctx.createBiquadFilter();
+    midHp.type = 'highpass';
+    midHp.frequency.value = 125;
+    midHp.Q.value = 0.707;
+    const midLp = ctx.createBiquadFilter();
+    midLp.type = 'lowpass';
+    midLp.frequency.value = 3500;
+    midLp.Q.value = 0.707;
+    const midComp = ctx.createDynamicsCompressor();
+    midComp.threshold.value = -10;
+    midComp.knee.value = 6;
+    midComp.ratio.value = 2.6;
+    midComp.attack.value = 0.006;
+    midComp.release.value = 0.12;
+    const midBandGain = ctx.createGain();
+    midBandGain.gain.value = 1.0;
+
+    this.postDuckSum.connect(midHp);
+    midHp.connect(midLp);
+    midLp.connect(midComp);
+    midComp.connect(midBandGain);
+
+    // Band 3: Crisp Air Highs (> 3.5 kHz)
+    const highHp = ctx.createBiquadFilter();
+    highHp.type = 'highpass';
+    highHp.frequency.value = 3500;
+    highHp.Q.value = 0.707;
+    const highComp = ctx.createDynamicsCompressor();
+    highComp.threshold.value = -11;
+    highComp.knee.value = 5;
+    highComp.ratio.value = 2.4;
+    highComp.attack.value = 0.003;
+    highComp.release.value = 0.09;
+    const highBandGain = ctx.createGain();
+    highBandGain.gain.value = 1.05;
+
+    this.postDuckSum.connect(highHp);
+    highHp.connect(highComp);
+    highComp.connect(highBandGain);
+
+    const masteringSum = ctx.createGain();
+    masteringSum.gain.value = 1.0;
+    lowBandGain.connect(masteringSum);
+    midBandGain.connect(masteringSum);
+    highBandGain.connect(masteringSum);
+
     this.masterLimiter = ctx.createDynamicsCompressor();
-    this.masterLimiter.threshold.value = -3.0;
-    this.masterLimiter.knee.value = 4.0;
-    this.masterLimiter.ratio.value = 12.0;
-    this.masterLimiter.attack.value = 0.002;
-    this.masterLimiter.release.value = 0.1;
+    this.masterLimiter.threshold.value = -1.5;
+    this.masterLimiter.knee.value = 2.5;
+    this.masterLimiter.ratio.value = 20.0;
+    this.masterLimiter.attack.value = 0.001;
+    this.masterLimiter.release.value = 0.075;
 
     this.masterGainNode = ctx.createGain();
     this.masterGainNode.gain.value = 0.9;
@@ -1039,7 +1581,7 @@ export class DjAudioEngine {
     this.recordBus = ctx.createGain();
     this.recordBus.gain.value = 1.0;
 
-    this.masterSum.connect(this.masterLimiter);
+    masteringSum.connect(this.masterLimiter);
     this.masterLimiter.connect(this.masterGainNode);
     this.masterGainNode.connect(this.masterAnalyser);
     this.masterGainNode.connect(ctx.destination);
@@ -1049,12 +1591,30 @@ export class DjAudioEngine {
       A: new DeckChannel(ctx, this.masterSum, reverbImpulse),
       B: new DeckChannel(ctx, this.masterSum, reverbImpulse),
     };
+
+    // Load offline Pitch/Key-Lock AudioWorklet asynchronously without blocking first audio frame
+    ensurePitchWorkletLoaded(ctx).then((ok) => {
+      this.pitchWorkletReady = ok;
+      if (ok && this.decks) {
+        this.decks.A.attachPitchWorklet();
+        this.decks.B.attachPitchWorklet();
+      }
+    });
   }
 
   public async resume(): Promise<AudioContext> {
     this.ensureInit();
     if (this.ctx!.state === 'suspended') {
       await this.ctx!.resume();
+    }
+    if (!this.pitchWorkletReady) {
+      ensurePitchWorkletLoaded(this.ctx!).then((ok) => {
+        if (ok && this.decks) {
+          this.pitchWorkletReady = true;
+          this.decks.A.attachPitchWorklet();
+          this.decks.B.attachPitchWorklet();
+        }
+      });
     }
     return this.ctx!;
   }
@@ -1143,6 +1703,74 @@ export class DjAudioEngine {
     this.decks![deckId].setStemMode(mode);
   }
 
+  public setDeckKeyLock(deckId: DeckId, enabled: boolean) {
+    this.ensureInit();
+    this.decks![deckId].setKeyLock(enabled);
+  }
+
+  public setDeckSemitoneShift(deckId: DeckId, semitones: number) {
+    this.ensureInit();
+    this.decks![deckId].setSemitoneShift(semitones);
+  }
+
+  public setDeckHpssBuffers(
+    deckId: DeckId,
+    harmonic: AudioBuffer | null,
+    percussive: AudioBuffer | null,
+    bass: AudioBuffer | null = null
+  ) {
+    this.ensureInit();
+    this.decks![deckId].setHpssBuffers(harmonic, percussive, bass);
+  }
+
+  public getDeckAudioBuffers(deckId: DeckId): {
+    buffer: AudioBuffer | null;
+    harmonicBuffer: AudioBuffer | null;
+    percussiveBuffer: AudioBuffer | null;
+    bassBuffer: AudioBuffer | null;
+  } {
+    if (!this.decks) {
+      return { buffer: null, harmonicBuffer: null, percussiveBuffer: null, bassBuffer: null };
+    }
+    const ch = this.decks[deckId];
+    return {
+      buffer: ch.buffer,
+      harmonicBuffer: ch.getHarmonicBuffer(),
+      percussiveBuffer: ch.getPercussiveBuffer(),
+      bassBuffer: ch.getBassBuffer(),
+    };
+  }
+
+  public triggerDeckTurntableScratch(
+    deckId: DeckId,
+    params: {
+      currentSec: number;
+      bpm: number;
+      pattern: 'baby' | 'chirp' | '2click-flare' | 'crab';
+      preferHarmonic?: boolean;
+    }
+  ) {
+    this.ensureInit();
+    this.decks![deckId].triggerTurntableScratch(params);
+  }
+
+  private duckMasterForVoice(durationSec: number) {
+    if (!this.ctx || !this.voiceDuckFilter) return;
+    const now = this.ctx.currentTime;
+    const holdUntil = Math.max(this.voiceDuckUntilCtxTime, now + Math.max(0.25, Math.min(4.5, durationSec)));
+    this.voiceDuckUntilCtxTime = holdUntil;
+    const p = this.voiceDuckFilter.gain;
+    try {
+      p.cancelScheduledValues(now);
+      p.setValueAtTime(p.value, now);
+      p.linearRampToValueAtTime(-3.2, now + 0.04);
+      p.setValueAtTime(-3.2, Math.max(now + 0.06, holdUntil - 0.14));
+      p.linearRampToValueAtTime(0, holdUntil);
+    } catch {
+      // ignore automation overlap
+    }
+  }
+
   public triggerDeckBeatSlices(
     deckId: DeckId,
     params: {
@@ -1201,6 +1829,211 @@ export class DjAudioEngine {
     this.decks!.A.setOutputGain(params.volA * gainA);
     this.decks!.B.setOutputGain(params.volB * gainB);
     this.masterGainNode!.gain.setTargetAtTime(params.masterGain, this.ctx!.currentTime, 0.015);
+  }
+
+  public getDeckLevel(deckId: DeckId): number {
+    return this.decks ? this.decks[deckId].getLevel() : 0;
+  }
+
+  public getDeckLowBandLevel(deckId: DeckId): number {
+    return this.decks ? this.decks[deckId].getLowBandEnergy() : 0;
+  }
+
+  public setDeckSidechainDuck(deckId: DeckId, mult: number) {
+    if (!this.decks) return;
+    this.decks[deckId].setSidechainDuck(mult);
+  }
+
+  public setDeckStereoWidth(deckId: DeckId, width: number) {
+    if (!this.decks) return;
+    this.decks[deckId].setStereoWidth(width);
+  }
+
+  public triggerDeckTapeBrake(deckId: DeckId, durationSec = 0.85) {
+    if (!this.decks) return;
+    this.decks[deckId].triggerTapeBrake(durationSec);
+  }
+
+  // =========================================================================
+  // Remix Deck C: Live Vocal/Hook Micro-Sampler Capture & Ping-Pong Callback
+  // =========================================================================
+
+  public captureDeckVocalHook(
+    deckId: DeckId,
+    params: {
+      bpm: number;
+      dropCueSec?: number;
+      waveform?: WaveformBandSample[];
+      title?: string;
+    }
+  ): boolean {
+    if (!this.ctx || !this.decks) return false;
+    // Upgrade #2: Prefer separated HPSS Harmonic (Vocal/Synth) buffer over raw full mix
+    const hpssHarm = this.decks[deckId].getHarmonicBuffer();
+    const srcBuf = hpssHarm || this.decks[deckId].buffer;
+    if (!srcBuf || srcBuf.duration < 12) return false;
+
+    const bpm = Math.max(65, Math.min(185, params.bpm || 124));
+    const barSec = Math.max(1.2, Math.min(2.8, (60 / bpm) * 4));
+    let startSec = srcBuf.duration * 0.35;
+
+    if (
+      typeof params.dropCueSec === 'number' &&
+      params.dropCueSec > 4 &&
+      params.dropCueSec + barSec < srcBuf.duration - 2
+    ) {
+      startSec = params.dropCueSec;
+    } else if (params.waveform && params.waveform.length >= 24) {
+      // Find peak vocal/mid-band energy window in [24%..68%] of track
+      const wf = params.waveform;
+      const startIdx = Math.floor(wf.length * 0.24);
+      const endIdx = Math.floor(wf.length * 0.68);
+      let bestScore = -1;
+      let bestIdx = startIdx;
+      for (let i = startIdx; i < endIdx; i++) {
+        const s = wf[i];
+        const score = s.mid * 1.45 - s.low * 0.35 + s.peak * 0.2;
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+      startSec = (bestIdx / wf.length) * srcBuf.duration;
+    }
+
+    startSec = Math.max(1, Math.min(srcBuf.duration - barSec - 0.5, startSec));
+    const sr = srcBuf.sampleRate;
+    const startFrame = Math.floor(startSec * sr);
+    const frameCount = Math.max(1024, Math.min(srcBuf.length - startFrame, Math.floor(barSec * sr)));
+    if (frameCount < 2048) return false;
+
+    const channels = Math.min(2, srcBuf.numberOfChannels);
+    const clip = this.ctx.createBuffer(channels, frameCount, sr);
+    const fadeSamples = Math.min(Math.floor(sr * 0.012), Math.floor(frameCount * 0.1));
+
+    for (let ch = 0; ch < channels; ch++) {
+      const srcData = srcBuf.getChannelData(ch);
+      const dstData = clip.getChannelData(ch);
+      for (let i = 0; i < frameCount; i++) {
+        let env = 1;
+        if (i < fadeSamples) env = i / fadeSamples;
+        else if (i > frameCount - fadeSamples) env = (frameCount - i) / fadeSamples;
+        dstData[i] = srcData[startFrame + i] * env;
+      }
+    }
+
+    this.deckCHookBuffer = clip;
+    this.deckCHookBpm = bpm;
+    this.deckCHookTitle = params.title || 'Previous Track';
+    return true;
+  }
+
+  public hasDeckCHook(): boolean {
+    return Boolean(this.deckCHookBuffer);
+  }
+
+  public getDeckCHookLabel(): string {
+    return this.deckCHookTitle;
+  }
+
+  public clearDeckCHook() {
+    this.deckCHookBuffer = null;
+    this.deckCHookTitle = '';
+  }
+
+  public async triggerDeckCHook(params: {
+    pattern: 'quarter' | 'half' | 'full-echo';
+    targetBpm: number;
+    gainAmt?: number;
+  }) {
+    if (!this.deckCHookBuffer) return;
+    const ctx = await this.resume();
+    if (!this.masterSum) return;
+
+    const now = ctx.currentTime;
+    const targetBpm = Math.max(65, Math.min(185, params.targetBpm || 124));
+    const beatSec = 60 / targetBpm;
+    const rate = Math.max(0.76, Math.min(1.32, targetBpm / Math.max(65, this.deckCHookBpm)));
+    const gainAmt = Math.max(0.15, Math.min(0.95, params.gainAmt ?? 0.62));
+
+    // Vocal bandpass (260Hz - 3.8kHz) + stereo ping-pong delay bus
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.setValueAtTime(260, now);
+    hp.Q.value = 0.85;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(3800, now);
+    lp.Q.value = 0.85;
+
+    const dryBus = ctx.createGain();
+    dryBus.gain.value = gainAmt;
+
+    const delayL = ctx.createDelay(2.0);
+    delayL.delayTime.value = Math.min(1.5, beatSec * 0.5);
+    const delayR = ctx.createDelay(2.0);
+    delayR.delayTime.value = Math.min(1.5, beatSec * 0.75);
+    const fbL = ctx.createGain();
+    fbL.gain.value = 0.36;
+    const fbR = ctx.createGain();
+    fbR.gain.value = 0.36;
+    const panL = ctx.createStereoPanner();
+    panL.pan.value = -0.68;
+    const panR = ctx.createStereoPanner();
+    panR.pan.value = 0.68;
+    const wetBus = ctx.createGain();
+    wetBus.gain.value = gainAmt * 0.55;
+
+    const voiceOut = this.postDuckSum || this.masterSum;
+    hp.connect(lp);
+    lp.connect(dryBus);
+    dryBus.connect(voiceOut);
+
+    lp.connect(delayL);
+    delayL.connect(fbL);
+    fbL.connect(delayR);
+    delayR.connect(fbR);
+    fbR.connect(delayL);
+
+    delayL.connect(panL);
+    delayR.connect(panR);
+    panL.connect(wetBus);
+    panR.connect(wetBus);
+    wetBus.connect(voiceOut);
+
+    const bufDur = this.deckCHookBuffer.duration / rate;
+    const triggerSlice = (startWhen: number, sliceDur: number, offsetSec = 0) => {
+      if (!this.deckCHookBuffer) return;
+      const src = ctx.createBufferSource();
+      src.buffer = this.deckCHookBuffer;
+      src.playbackRate.setValueAtTime(rate, startWhen);
+      const env = ctx.createGain();
+      const fade = Math.min(0.015, sliceDur * 0.15);
+      env.gain.setValueAtTime(0.001, startWhen);
+      env.gain.linearRampToValueAtTime(1, startWhen + fade);
+      env.gain.setValueAtTime(1, startWhen + Math.max(fade, sliceDur - fade));
+      env.gain.exponentialRampToValueAtTime(0.001, startWhen + sliceDur);
+      src.connect(env);
+      env.connect(hp);
+      src.start(startWhen, Math.max(0, Math.min(this.deckCHookBuffer.duration - 0.15, offsetSec)), sliceDur * rate + 0.02);
+    };
+
+    if (params.pattern === 'quarter') {
+      const slice = Math.min(bufDur * 0.5, beatSec * 0.9);
+      this.duckMasterForVoice(beatSec * 1.6);
+      triggerSlice(now, slice, 0);
+      triggerSlice(now + beatSec, slice, 0);
+    } else if (params.pattern === 'half') {
+      const slice = Math.min(bufDur * 0.65, beatSec * 1.8);
+      this.duckMasterForVoice(beatSec * 3.0);
+      triggerSlice(now, slice, 0);
+      triggerSlice(now + beatSec * 2, slice, this.deckCHookBuffer.duration * 0.35);
+    } else {
+      const dur = Math.min(bufDur, beatSec * 3.8);
+      this.duckMasterForVoice(dur + 0.2);
+      triggerSlice(now, dur, 0);
+    }
   }
 
   public getLevels(): { deckA: number; deckB: number; master: number } {
@@ -1318,12 +2151,17 @@ export class DjAudioEngine {
    * Fires a synthesized stereo DJ sound trick directly into the Master Bus
    * (captured by VU meters and WAV Master Recorder).
    */
-  public async playSoundTrick(type: SoundTrickType, bpm = 124, musicalKey?: string) {
+  public async playSoundTrick(
+    type: SoundTrickType,
+    bpm = 124,
+    musicalKey?: string,
+    pitchRate = 1
+  ) {
     const ctx = await this.resume();
     if (!this.masterSum) return;
     const now = ctx.currentTime;
     const beatSec = 60 / Math.max(60, bpm);
-    const harmony = camelotToHarmony(musicalKey);
+    const harmony = camelotToHarmony(musicalKey, pitchRate);
 
     if (type === 'riser') {
       const dur = Math.min(3.5, beatSec * 4);
@@ -1804,6 +2642,1093 @@ export class DjAudioEngine {
   }
 
   // =========================================================================
+  // Offline Multi-Formant DJ Voice, Grooving, Shout & Hype Synth Engine
+  // =========================================================================
+
+  public async playVoiceDrop(
+    voiceId: DjVoiceDropId,
+    bpm = 124,
+    musicalKey?: string,
+    pitchRate = 1
+  ) {
+    const ctx = await this.resume();
+    if (!this.masterSum) return;
+    const now = ctx.currentTime + 0.01;
+    const safeBpm = Math.max(65, Math.min(185, bpm || 124));
+    const beatSec = 60 / safeBpm;
+    const harmony = camelotToHarmony(musicalKey, pitchRate);
+    const noiseBuf = this.ensureBridgeNoise(ctx);
+
+    const VOWELS = {
+      a: [730, 1180, 2460],
+      e: [510, 1860, 2560],
+      i: [300, 2240, 2940],
+      o: [470, 850, 2410],
+      u: [320, 880, 2230],
+      ae: [660, 1740, 2450],
+      uh: [620, 1220, 2380],
+    } as const;
+    type VowelKey = keyof typeof VOWELS;
+
+    // Master Voice Bus with presence comp + optional stereo slapback + club room reverb
+    const voiceBus = ctx.createGain();
+    voiceBus.gain.value = 0.92;
+
+    const presence = ctx.createBiquadFilter();
+    presence.type = 'peaking';
+    presence.frequency.value = 2600;
+    presence.Q.value = 1.1;
+    presence.gain.value = 4.5;
+
+    const hipass = ctx.createBiquadFilter();
+    hipass.type = 'highpass';
+    hipass.frequency.value = 115;
+
+    const voiceOut = this.postDuckSum || this.masterSum;
+    this.duckMasterForVoice(Math.max(0.75, Math.min(2.2, beatSec * 2.2)));
+
+    voiceBus.connect(hipass);
+    hipass.connect(presence);
+    presence.connect(voiceOut);
+
+    const attachClubSpace = (slapSec: number, fbAmt: number, verbAmt: number) => {
+      if (slapSec > 0.02) {
+        const delayL = ctx.createDelay(1.2);
+        const delayR = ctx.createDelay(1.2);
+        delayL.delayTime.value = Math.min(1.0, slapSec);
+        delayR.delayTime.value = Math.min(1.0, slapSec * 1.5);
+        const fb = ctx.createGain();
+        fb.gain.value = fbAmt;
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.value = 2600;
+        const panL = ctx.createStereoPanner();
+        panL.pan.value = -0.58;
+        const panR = ctx.createStereoPanner();
+        panR.pan.value = 0.58;
+        const wet = ctx.createGain();
+        wet.gain.value = 0.36;
+
+        presence.connect(lp);
+        lp.connect(delayL);
+        delayL.connect(fb);
+        fb.connect(delayR);
+        delayR.connect(delayL);
+        delayL.connect(panL);
+        delayR.connect(panR);
+        panL.connect(wet);
+        panR.connect(wet);
+        wet.connect(voiceOut!);
+      }
+      if (verbAmt > 0 && this.roomReverbImpulse) {
+        const conv = ctx.createConvolver();
+        conv.buffer = this.roomReverbImpulse;
+        const vg = ctx.createGain();
+        vg.gain.value = verbAmt;
+        presence.connect(conv);
+        conv.connect(vg);
+        vg.connect(voiceOut!);
+      }
+    };
+
+    const spawnConsonant = (
+      atTime: number,
+      dur: number,
+      freq: number,
+      q: number,
+      gainAmt: number,
+      panVal = 0
+    ) => {
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(freq, atTime);
+      bp.Q.value = q;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, atTime);
+      g.gain.linearRampToValueAtTime(gainAmt, atTime + Math.min(0.008, dur * 0.25));
+      g.gain.exponentialRampToValueAtTime(0.001, atTime + dur);
+      const pan = ctx.createStereoPanner();
+      pan.pan.value = panVal;
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(pan);
+      pan.connect(voiceBus);
+      src.start(atTime);
+      src.stop(atTime + dur + 0.02);
+    };
+
+    const spawnSyllable = (opts: {
+      start: number;
+      dur: number;
+      pitchStart: number;
+      pitchMid?: number;
+      pitchEnd: number;
+      vowelStart: VowelKey;
+      vowelEnd?: VowelKey;
+      gain?: number;
+      crowdCount?: number;
+      pan?: number;
+      aspirateAmt?: number;
+      subPunch?: boolean;
+      vibratoHz?: number;
+      vibratoDepth?: number;
+    }) => {
+      const count = opts.crowdCount ?? 1;
+      const gainTotal = opts.gain ?? 0.36;
+      const perVoiceGain = gainTotal / Math.sqrt(count);
+      const vStart = VOWELS[opts.vowelStart];
+      const vEnd = VOWELS[opts.vowelEnd ?? opts.vowelStart];
+
+      for (let v = 0; v < count; v++) {
+        const microDelay = count > 1 ? v * 0.0055 : 0;
+        const st = opts.start + microDelay;
+        const d = opts.dur;
+        const detuneRatio =
+          count > 1 ? 1 + ((v - (count - 1) / 2) / Math.max(1, count)) * 0.028 : 1;
+        const voicePan =
+          count > 1
+            ? Math.max(-0.85, Math.min(0.85, ((v / Math.max(1, count - 1)) * 2 - 1) * 0.72))
+            : opts.pan ?? 0;
+
+        // Glottal source (saw + slightly detuned saw + breathy whisper noise)
+        const exc = ctx.createGain();
+        exc.gain.value = 1;
+
+        const osc1 = ctx.createOscillator();
+        osc1.type = 'sawtooth';
+        osc1.frequency.setValueAtTime(opts.pitchStart * detuneRatio, st);
+        if (opts.pitchMid) {
+          osc1.frequency.linearRampToValueAtTime(opts.pitchMid * detuneRatio, st + d * 0.45);
+        }
+        osc1.frequency.linearRampToValueAtTime(opts.pitchEnd * detuneRatio, st + d);
+
+        const osc2 = ctx.createOscillator();
+        osc2.type = 'sawtooth';
+        osc2.frequency.setValueAtTime(opts.pitchStart * detuneRatio * 1.006, st);
+        if (opts.pitchMid) {
+          osc2.frequency.linearRampToValueAtTime(opts.pitchMid * detuneRatio * 1.006, st + d * 0.45);
+        }
+        osc2.frequency.linearRampToValueAtTime(opts.pitchEnd * detuneRatio * 1.006, st + d);
+
+        if (opts.vibratoHz && opts.vibratoDepth) {
+          const lfo = ctx.createOscillator();
+          lfo.frequency.value = opts.vibratoHz;
+          const lg = ctx.createGain();
+          lg.gain.value = opts.vibratoDepth;
+          lfo.connect(lg);
+          lg.connect(osc1.frequency);
+          lg.connect(osc2.frequency);
+          lfo.start(st);
+          lfo.stop(st + d + 0.03);
+        }
+
+        const o1Gain = ctx.createGain();
+        o1Gain.gain.value = 0.55;
+        const o2Gain = ctx.createGain();
+        o2Gain.gain.value = 0.45;
+        osc1.connect(o1Gain);
+        osc2.connect(o2Gain);
+        o1Gain.connect(exc);
+        o2Gain.connect(exc);
+
+        if ((opts.aspirateAmt ?? 0.16) > 0) {
+          const nSrc = ctx.createBufferSource();
+          nSrc.buffer = noiseBuf;
+          nSrc.loop = true;
+          const nGain = ctx.createGain();
+          nGain.gain.value = opts.aspirateAmt ?? 0.16;
+          nSrc.connect(nGain);
+          nGain.connect(exc);
+          nSrc.start(st);
+          nSrc.stop(st + d + 0.03);
+        }
+
+        // Parallel 3-formant resonant vocal tract filter bank
+        const sumFormants = ctx.createGain();
+        const formantQ = [6.5, 8.5, 10.5];
+        const formantWeights = [0.68, 0.42, 0.24];
+        for (let fIdx = 0; fIdx < 3; fIdx++) {
+          const bp = ctx.createBiquadFilter();
+          bp.type = 'bandpass';
+          bp.Q.value = formantQ[fIdx];
+          bp.frequency.setValueAtTime(vStart[fIdx], st);
+          bp.frequency.linearRampToValueAtTime(vEnd[fIdx], st + d * 0.85);
+          const fg = ctx.createGain();
+          fg.gain.value = formantWeights[fIdx];
+          exc.connect(bp);
+          bp.connect(fg);
+          fg.connect(sumFormants);
+        }
+
+        const env = ctx.createGain();
+        const atk = Math.min(0.028, d * 0.14);
+        env.gain.setValueAtTime(0.001, st);
+        env.gain.linearRampToValueAtTime(perVoiceGain, st + atk);
+        env.gain.setValueAtTime(perVoiceGain * 0.92, st + Math.max(atk, d * 0.72));
+        env.gain.exponentialRampToValueAtTime(0.001, st + d);
+
+        const panNode = ctx.createStereoPanner();
+        panNode.pan.value = voicePan;
+
+        sumFormants.connect(env);
+        env.connect(panNode);
+        panNode.connect(voiceBus);
+
+        if (opts.subPunch && v === 0) {
+          const subOsc = ctx.createOscillator();
+          subOsc.type = 'sine';
+          subOsc.frequency.setValueAtTime(Math.max(48, opts.pitchStart * 0.5), st);
+          subOsc.frequency.exponentialRampToValueAtTime(38, st + d);
+          const subG = ctx.createGain();
+          subG.gain.setValueAtTime(0.28, st);
+          subG.gain.exponentialRampToValueAtTime(0.001, st + d);
+          subOsc.connect(subG);
+          subG.connect(voiceBus);
+          subOsc.start(st);
+          subOsc.stop(st + d + 0.03);
+        }
+
+        osc1.start(st);
+        osc2.start(st);
+        osc1.stop(st + d + 0.03);
+        osc2.stop(st + d + 0.03);
+      }
+    };
+
+    const keyRoot = Math.max(115, Math.min(220, harmony.rootHz * 0.65));
+
+    switch (voiceId) {
+      case 'hey-chant': {
+        attachClubSpace(beatSec * 0.5, 0.32, 0.28);
+        for (let i = 0; i < 3; i++) {
+          const st = now + i * beatSec * 0.5;
+          spawnConsonant(st, 0.045, 2200, 1.4, 0.25);
+          spawnSyllable({
+            start: st + 0.015,
+            dur: Math.min(0.28, beatSec * 0.42),
+            pitchStart: 165 + i * 10,
+            pitchEnd: 138 + i * 8,
+            vowelStart: 'e',
+            vowelEnd: 'i',
+            crowdCount: 5,
+            gain: 0.42,
+            aspirateAmt: 0.24,
+          });
+        }
+        break;
+      }
+      case 'lets-go': {
+        attachClubSpace(beatSec * 0.375, 0.42, 0.32);
+        spawnConsonant(now, 0.04, 3400, 1.8, 0.24);
+        spawnSyllable({
+          start: now + 0.01,
+          dur: 0.14,
+          pitchStart: 175,
+          pitchEnd: 192,
+          vowelStart: 'e',
+          vowelEnd: 'e',
+          crowdCount: 4,
+          gain: 0.38,
+        });
+        spawnConsonant(now + 0.145, 0.035, 1600, 2.2, 0.28);
+        spawnSyllable({
+          start: now + 0.16,
+          dur: 0.42,
+          pitchStart: 225,
+          pitchMid: 245,
+          pitchEnd: 172,
+          vowelStart: 'o',
+          vowelEnd: 'u',
+          crowdCount: 5,
+          gain: 0.48,
+          subPunch: true,
+        });
+        break;
+      }
+      case 'hands-up': {
+        attachClubSpace(beatSec * 0.5, 0.38, 0.35);
+        spawnConsonant(now, 0.055, 2100, 1.2, 0.28);
+        spawnSyllable({
+          start: now + 0.02,
+          dur: 0.22,
+          pitchStart: 155,
+          pitchEnd: 195,
+          vowelStart: 'ae',
+          vowelEnd: 'ae',
+          crowdCount: 5,
+          gain: 0.4,
+          aspirateAmt: 0.28,
+        });
+        spawnConsonant(now + 0.22, 0.05, 4200, 2.5, 0.2);
+        spawnSyllable({
+          start: now + 0.25,
+          dur: 0.38,
+          pitchStart: 215,
+          pitchEnd: 265,
+          vowelStart: 'uh',
+          vowelEnd: 'a',
+          crowdCount: 6,
+          gain: 0.48,
+        });
+        break;
+      }
+      case 'put-em-up': {
+        attachClubSpace(beatSec * 0.25, 0.36, 0.26);
+        const step = Math.min(0.18, beatSec * 0.33);
+        const pts: [VowelKey, number, number][] = [
+          ['u', 165, 0.11],
+          ['uh', 180, 0.11],
+          ['a', 235, 0.32],
+        ];
+        pts.forEach(([vw, f, d], idx) => {
+          const st = now + idx * step;
+          spawnConsonant(st, 0.03, 1800 + idx * 600, 2.0, 0.24);
+          spawnSyllable({
+            start: st + 0.01,
+            dur: d,
+            pitchStart: f,
+            pitchEnd: idx === 2 ? f * 1.12 : f * 0.94,
+            vowelStart: vw,
+            crowdCount: 4,
+            gain: idx === 2 ? 0.48 : 0.36,
+          });
+        });
+        break;
+      }
+      case 'make-some-noise': {
+        attachClubSpace(beatSec * 0.5, 0.44, 0.42);
+        const st1 = now;
+        const st2 = now + 0.19;
+        const st3 = now + 0.38;
+        spawnSyllable({
+          start: st1,
+          dur: 0.16,
+          pitchStart: 170,
+          pitchEnd: 185,
+          vowelStart: 'e',
+          vowelEnd: 'i',
+          crowdCount: 4,
+          gain: 0.36,
+        });
+        spawnConsonant(st2, 0.05, 5200, 2.2, 0.26);
+        spawnSyllable({
+          start: st2 + 0.02,
+          dur: 0.15,
+          pitchStart: 185,
+          pitchEnd: 198,
+          vowelStart: 'uh',
+          crowdCount: 4,
+          gain: 0.36,
+        });
+        spawnSyllable({
+          start: st3,
+          dur: 0.52,
+          pitchStart: 225,
+          pitchMid: 242,
+          pitchEnd: 175,
+          vowelStart: 'o',
+          vowelEnd: 'i',
+          crowdCount: 6,
+          gain: 0.52,
+          aspirateAmt: 0.28,
+        });
+        break;
+      }
+      case 'crowd-roar': {
+        attachClubSpace(0.09, 0.2, 0.52);
+        const dur = Math.min(1.6, beatSec * 2.5);
+        const src = ctx.createBufferSource();
+        src.buffer = noiseBuf;
+        src.loop = true;
+        const f1 = ctx.createBiquadFilter();
+        f1.type = 'bandpass';
+        f1.Q.value = 3.2;
+        f1.frequency.setValueAtTime(520, now);
+        f1.frequency.linearRampToValueAtTime(980, now + dur * 0.5);
+        f1.frequency.linearRampToValueAtTime(640, now + dur);
+
+        const f2 = ctx.createBiquadFilter();
+        f2.type = 'bandpass';
+        f2.Q.value = 3.6;
+        f2.frequency.setValueAtTime(1400, now);
+        f2.frequency.linearRampToValueAtTime(2100, now + dur * 0.45);
+        f2.frequency.linearRampToValueAtTime(1350, now + dur);
+
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.001, now);
+        g.gain.linearRampToValueAtTime(0.45, now + dur * 0.25);
+        g.gain.exponentialRampToValueAtTime(0.001, now + dur);
+
+        src.connect(f1);
+        src.connect(f2);
+        f1.connect(g);
+        f2.connect(g);
+        g.connect(voiceBus);
+        src.start(now);
+        src.stop(now + dur + 0.04);
+
+        spawnSyllable({
+          start: now + 0.04,
+          dur: dur * 0.72,
+          pitchStart: 190,
+          pitchMid: 235,
+          pitchEnd: 165,
+          vowelStart: 'o',
+          vowelEnd: 'a',
+          crowdCount: 6,
+          gain: 0.34,
+          aspirateAmt: 0.35,
+        });
+        break;
+      }
+      case 'everybody-jump': {
+        attachClubSpace(beatSec * 0.5, 0.34, 0.28);
+        for (let i = 0; i < 4; i++) {
+          const st = now + i * beatSec * 0.5;
+          spawnConsonant(st, 0.035, 2400, 2.4, 0.28);
+          spawnSyllable({
+            start: st + 0.01,
+            dur: Math.min(0.2, beatSec * 0.36),
+            pitchStart: 195 + (i % 2) * 28,
+            pitchEnd: 145,
+            vowelStart: 'uh',
+            vowelEnd: 'uh',
+            crowdCount: 5,
+            gain: 0.42,
+            subPunch: true,
+          });
+        }
+        break;
+      }
+      case 'pump-it': {
+        attachClubSpace(beatSec * 0.25, 0.32, 0.24);
+        const step = Math.min(0.19, beatSec * 0.35);
+        spawnConsonant(now, 0.035, 1900, 2.0, 0.26);
+        spawnSyllable({
+          start: now + 0.01,
+          dur: 0.14,
+          pitchStart: 180,
+          pitchEnd: 170,
+          vowelStart: 'uh',
+          crowdCount: 4,
+          gain: 0.38,
+        });
+        spawnSyllable({
+          start: now + step,
+          dur: 0.12,
+          pitchStart: 195,
+          pitchEnd: 185,
+          vowelStart: 'i',
+          crowdCount: 4,
+          gain: 0.35,
+        });
+        spawnSyllable({
+          start: now + step * 2,
+          dur: 0.34,
+          pitchStart: 230,
+          pitchEnd: 270,
+          vowelStart: 'a',
+          vowelEnd: 'uh',
+          crowdCount: 5,
+          gain: 0.48,
+          subPunch: true,
+        });
+        break;
+      }
+      case 'turn-it-up': {
+        attachClubSpace(beatSec * 0.375, 0.38, 0.28);
+        spawnConsonant(now, 0.04, 3200, 2.0, 0.24);
+        spawnSyllable({
+          start: now + 0.015,
+          dur: 0.16,
+          pitchStart: 160,
+          pitchEnd: 188,
+          vowelStart: 'uh',
+          crowdCount: 4,
+          gain: 0.36,
+        });
+        spawnSyllable({
+          start: now + 0.18,
+          dur: 0.12,
+          pitchStart: 192,
+          pitchEnd: 210,
+          vowelStart: 'i',
+          crowdCount: 4,
+          gain: 0.35,
+        });
+        spawnSyllable({
+          start: now + 0.3,
+          dur: 0.42,
+          pitchStart: 220,
+          pitchEnd: 295,
+          vowelStart: 'uh',
+          vowelEnd: 'a',
+          crowdCount: 5,
+          gain: 0.48,
+        });
+        break;
+      }
+      case 'oh-my-god': {
+        attachClubSpace(beatSec * 0.5, 0.44, 0.38);
+        spawnSyllable({
+          start: now,
+          dur: 0.24,
+          pitchStart: 195,
+          pitchEnd: 275,
+          vowelStart: 'o',
+          vowelEnd: 'a',
+          crowdCount: 3,
+          gain: 0.38,
+        });
+        spawnSyllable({
+          start: now + 0.26,
+          dur: 0.54,
+          pitchStart: 265,
+          pitchMid: 245,
+          pitchEnd: 155,
+          vowelStart: 'a',
+          vowelEnd: 'o',
+          crowdCount: 6,
+          gain: 0.5,
+          subPunch: true,
+        });
+        break;
+      }
+      case 'groove-yeah': {
+        attachClubSpace(beatSec * 0.5, 0.46, 0.34);
+        spawnSyllable({
+          start: now,
+          dur: Math.min(0.95, beatSec * 1.5),
+          pitchStart: keyRoot * 0.9,
+          pitchMid: keyRoot * 1.25,
+          pitchEnd: keyRoot,
+          vowelStart: 'u',
+          vowelEnd: 'ae',
+          crowdCount: 2,
+          gain: 0.38,
+          vibratoHz: 5.5,
+          vibratoDepth: 6,
+        });
+        break;
+      }
+      case 'ah-yeah-chop': {
+        attachClubSpace(beatSec * 0.375, 0.45, 0.26);
+        const step = Math.min(0.22, beatSec * 0.5);
+        const pattern: [VowelKey, number, number][] = [
+          ['a', keyRoot, -0.35],
+          ['a', keyRoot * 1.12, 0.35],
+          ['ae', keyRoot * 1.25, 0],
+        ];
+        pattern.forEach(([vw, f, pan], i) => {
+          spawnSyllable({
+            start: now + i * step,
+            dur: i === 2 ? step * 1.35 : step * 0.72,
+            pitchStart: f,
+            pitchEnd: i === 2 ? f * 0.92 : f,
+            vowelStart: vw,
+            vowelEnd: i === 2 ? 'a' : vw,
+            gain: i === 2 ? 0.42 : 0.34,
+            pan,
+          });
+        });
+        break;
+      }
+      case 'funk-woo': {
+        attachClubSpace(beatSec * 0.5, 0.42, 0.38);
+        spawnConsonant(now, 0.04, 1500, 1.5, 0.16);
+        spawnSyllable({
+          start: now + 0.01,
+          dur: Math.min(0.75, beatSec * 1.2),
+          pitchStart: 280,
+          pitchMid: 520,
+          pitchEnd: 410,
+          vowelStart: 'u',
+          vowelEnd: 'o',
+          crowdCount: 2,
+          gain: 0.36,
+          aspirateAmt: 0.22,
+          vibratoHz: 6.2,
+          vibratoDepth: 11,
+        });
+        break;
+      }
+      case 'afro-eyy': {
+        attachClubSpace(beatSec * 0.375, 0.4, 0.28);
+        const step = Math.min(0.26, beatSec * 0.5);
+        spawnSyllable({
+          start: now,
+          dur: step * 0.75,
+          pitchStart: keyRoot * 1.2,
+          pitchEnd: keyRoot * 1.33,
+          vowelStart: 'e',
+          vowelEnd: 'a',
+          crowdCount: 4,
+          gain: 0.38,
+        });
+        spawnSyllable({
+          start: now + step,
+          dur: step * 0.95,
+          pitchStart: keyRoot * 1.0,
+          pitchEnd: keyRoot * 0.88,
+          vowelStart: 'o',
+          vowelEnd: 'u',
+          crowdCount: 4,
+          gain: 0.42,
+        });
+        break;
+      }
+      case 'vocoder-harmony': {
+        attachClubSpace(beatSec * 0.5, 0.48, 0.42);
+        const dur = Math.min(1.4, beatSec * 2.2);
+        harmony.chordHz.slice(0, 3).forEach((freq, idx) => {
+          spawnSyllable({
+            start: now + idx * 0.015,
+            dur,
+            pitchStart: freq * 0.5,
+            pitchMid: freq * 0.504,
+            pitchEnd: freq * 0.5,
+            vowelStart: idx === 1 ? 'a' : 'u',
+            vowelEnd: 'o',
+            gain: 0.24,
+            pan: (idx - 1) * 0.45,
+            aspirateAmt: 0.12,
+          });
+        });
+        break;
+      }
+      case 'sunset-breathe': {
+        attachClubSpace(beatSec * 0.75, 0.52, 0.55);
+        spawnSyllable({
+          start: now,
+          dur: Math.min(1.6, beatSec * 2.5),
+          pitchStart: keyRoot,
+          pitchEnd: keyRoot * 0.98,
+          vowelStart: 'a',
+          vowelEnd: 'u',
+          gain: 0.26,
+          crowdCount: 2,
+          aspirateAmt: 0.46,
+          vibratoHz: 4.2,
+          vibratoDepth: 3,
+        });
+        break;
+      }
+      case 'count-1234': {
+        attachClubSpace(beatSec * 0.5, 0.34, 0.24);
+        const counts: [VowelKey, VowelKey, number][] = [
+          ['uh', 'a', 155],
+          ['u', 'u', 172],
+          ['i', 'i', 192],
+          ['o', 'a', 222],
+        ];
+        counts.forEach(([v1, v2, p], idx) => {
+          const st = now + idx * beatSec;
+          spawnConsonant(st, 0.04, 2400 + idx * 500, 2.2, 0.25);
+          spawnSyllable({
+            start: st + 0.012,
+            dur: Math.min(0.28, beatSec * 0.48),
+            pitchStart: p,
+            pitchEnd: idx === 3 ? p * 1.15 : p * 0.94,
+            vowelStart: v1,
+            vowelEnd: v2,
+            crowdCount: idx === 3 ? 5 : 3,
+            gain: idx === 3 ? 0.48 : 0.36,
+          });
+        });
+        break;
+      }
+      case 'three-two-one': {
+        attachClubSpace(beatSec * 0.5, 0.42, 0.34);
+        const counts: [VowelKey, number][] = [
+          ['i', 175],
+          ['u', 202],
+          ['uh', 238],
+        ];
+        counts.forEach(([vw, p], idx) => {
+          const st = now + idx * beatSec * 0.75;
+          spawnConsonant(st, 0.045, 2900, 2.2, 0.26);
+          spawnSyllable({
+            start: st + 0.01,
+            dur: Math.min(0.32, beatSec * 0.52),
+            pitchStart: p,
+            pitchEnd: p * 1.08,
+            vowelStart: vw,
+            vowelEnd: idx === 2 ? 'a' : vw,
+            crowdCount: idx === 2 ? 5 : 3,
+            gain: 0.38 + idx * 0.05,
+          });
+        });
+        break;
+      }
+      case 'bass-drop': {
+        attachClubSpace(beatSec * 0.375, 0.4, 0.3);
+        spawnConsonant(now, 0.035, 1600, 2.0, 0.26);
+        spawnSyllable({
+          start: now + 0.01,
+          dur: 0.22,
+          pitchStart: 135,
+          pitchEnd: 118,
+          vowelStart: 'e',
+          vowelEnd: 'ae',
+          crowdCount: 3,
+          gain: 0.42,
+        });
+        spawnConsonant(now + 0.23, 0.045, 2200, 1.8, 0.28);
+        spawnSyllable({
+          start: now + 0.25,
+          dur: 0.55,
+          pitchStart: 155,
+          pitchEnd: 88,
+          vowelStart: 'a',
+          vowelEnd: 'o',
+          crowdCount: 4,
+          gain: 0.52,
+          subPunch: true,
+        });
+        break;
+      }
+      case 'pull-up': {
+        attachClubSpace(beatSec * 0.375, 0.54, 0.36);
+        spawnConsonant(now, 0.035, 1800, 2.2, 0.26);
+        spawnSyllable({
+          start: now + 0.01,
+          dur: 0.16,
+          pitchStart: 180,
+          pitchEnd: 205,
+          vowelStart: 'u',
+          crowdCount: 3,
+          gain: 0.4,
+        });
+        spawnSyllable({
+          start: now + 0.17,
+          dur: 0.4,
+          pitchStart: 215,
+          pitchEnd: 310,
+          vowelStart: 'uh',
+          vowelEnd: 'a',
+          crowdCount: 4,
+          gain: 0.46,
+        });
+        break;
+      }
+      case 'dj-scratch-aaah': {
+        attachClubSpace(beatSec * 0.25, 0.32, 0.18);
+        const hits = [0, 0.12, 0.24, 0.39];
+        hits.forEach((off, idx) => {
+          const isLong = idx === 3;
+          spawnSyllable({
+            start: now + off,
+            dur: isLong ? 0.34 : 0.095,
+            pitchStart: idx % 2 === 0 ? 150 : 230,
+            pitchMid: isLong ? 245 : undefined,
+            pitchEnd: isLong ? 140 : idx % 2 === 0 ? 255 : 145,
+            vowelStart: 'ae',
+            vowelEnd: 'a',
+            gain: 0.44,
+          });
+        });
+        break;
+      }
+      case 'yo-yo-yo': {
+        attachClubSpace(beatSec * 0.375, 0.42, 0.22);
+        const step = Math.min(0.14, beatSec * 0.33);
+        [0, 1, 2].forEach((i) => {
+          spawnSyllable({
+            start: now + i * step,
+            dur: i === 2 ? 0.28 : step * 0.78,
+            pitchStart: 195 + i * 16,
+            pitchEnd: i === 2 ? 148 : 175,
+            vowelStart: 'i',
+            vowelEnd: 'o',
+            crowdCount: i === 2 ? 3 : 1,
+            gain: 0.42,
+          });
+        });
+        break;
+      }
+      case 'check-mic': {
+        attachClubSpace(beatSec * 0.25, 0.3, 0.16);
+        spawnConsonant(now, 0.045, 3600, 2.4, 0.28);
+        spawnSyllable({
+          start: now + 0.015,
+          dur: 0.14,
+          pitchStart: 155,
+          pitchEnd: 142,
+          vowelStart: 'e',
+          gain: 0.38,
+        });
+        spawnSyllable({
+          start: now + 0.19,
+          dur: 0.13,
+          pitchStart: 165,
+          pitchEnd: 155,
+          vowelStart: 'uh',
+          gain: 0.36,
+        });
+        spawnConsonant(now + 0.34, 0.035, 3200, 2.2, 0.24);
+        spawnSyllable({
+          start: now + 0.355,
+          dur: 0.24,
+          pitchStart: 182,
+          pitchEnd: 148,
+          vowelStart: 'u',
+          crowdCount: 2,
+          gain: 0.42,
+        });
+        break;
+      }
+      case 'vip-remix': {
+        attachClubSpace(beatSec * 0.5, 0.48, 0.32);
+        const step = Math.min(0.16, beatSec * 0.35);
+        const tag: [VowelKey, VowelKey, number, number][] = [
+          ['i', 'i', keyRoot * 1.25, 0.12],
+          ['a', 'i', keyRoot * 1.5, 0.12],
+          ['e', 'i', keyRoot * 1.25, 0.14],
+          ['i', 'e', keyRoot, 0.34],
+        ];
+        tag.forEach(([v1, v2, f, d], idx) => {
+          spawnConsonant(now + idx * step, 0.03, 2800, 2.0, 0.18);
+          spawnSyllable({
+            start: now + idx * step + 0.008,
+            dur: d,
+            pitchStart: f,
+            pitchEnd: idx === 3 ? f * 0.96 : f * 1.04,
+            vowelStart: v1,
+            vowelEnd: v2,
+            crowdCount: 2,
+            gain: 0.36,
+          });
+        });
+        break;
+      }
+    }
+  }
+
+  // =========================================================================
+  // Upgrade #6: Custom User Mic / Audio Drop Player (through Mastering & Duck)
+  // =========================================================================
+
+  public async playCustomVoiceBuffer(buffer: AudioBuffer, bpm = 124, delaySec = 0) {
+    const ctx = await this.resume();
+    if (!this.masterSum) return;
+    const voiceOut = this.postDuckSum || this.masterSum;
+    const safeBpm = Math.max(65, Math.min(185, bpm || 124));
+    const beatSec = 60 / safeBpm;
+    const startAt = ctx.currentTime + Math.max(0.01, delaySec);
+    const dur = Math.min(6.0, buffer.duration);
+
+    this.duckMasterForVoice(Math.min(4.2, dur + delaySec + 0.15));
+
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 110;
+
+    const presence = ctx.createBiquadFilter();
+    presence.type = 'peaking';
+    presence.frequency.value = 2650;
+    presence.Q.value = 1.1;
+    presence.gain.value = 4.2;
+
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -16;
+    comp.ratio.value = 4.5;
+    comp.attack.value = 0.004;
+    comp.release.value = 0.09;
+
+    const dryGain = ctx.createGain();
+    dryGain.gain.setValueAtTime(1.08, startAt);
+
+    src.connect(hp);
+    hp.connect(presence);
+    presence.connect(comp);
+    comp.connect(dryGain);
+    dryGain.connect(voiceOut);
+
+    // Subtle club slapback + tail
+    const delay = ctx.createDelay(1.2);
+    delay.delayTime.value = Math.min(0.8, beatSec * 0.5);
+    const fb = ctx.createGain();
+    fb.gain.value = 0.32;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 2800;
+    const wet = ctx.createGain();
+    wet.gain.value = 0.24;
+
+    comp.connect(lp);
+    lp.connect(delay);
+    delay.connect(fb);
+    fb.connect(delay);
+    delay.connect(wet);
+    wet.connect(voiceOut);
+
+    if (this.roomReverbImpulse) {
+      const conv = ctx.createConvolver();
+      conv.buffer = this.roomReverbImpulse;
+      const vg = ctx.createGain();
+      vg.gain.value = 0.18;
+      comp.connect(conv);
+      conv.connect(vg);
+      vg.connect(voiceOut);
+    }
+
+    src.start(startAt, 0, dur);
+  }
+
+  // =========================================================================
+  // Upgrade #4: Sample-Accurate Build-Up Escalator on Web Audio Clock
+  // =========================================================================
+
+  public async scheduleBuildUpSequence(params: {
+    bpm: number;
+    musicalKey?: string;
+    pitchRate?: number;
+    bars?: number;
+    voiceId?: DjVoiceDropId | null;
+    customVoiceBuffer?: AudioBuffer | null;
+  }) {
+    const ctx = await this.resume();
+    if (!this.masterSum) return;
+
+    const safeBpm = Math.max(65, Math.min(185, params.bpm || 124));
+    const beatSec = 60 / safeBpm;
+    const bars = Math.max(1, Math.min(2, params.bars ?? 1));
+    const totalBeats = bars * 4;
+    const silenceGap = Math.min(0.45, beatSec * 0.72);
+    const buildDur = Math.max(0.8, totalBeats * beatSec - silenceGap);
+    const startAt = ctx.currentTime + 0.02;
+    const dropAt = startAt + totalBeats * beatSec;
+    const harmony = camelotToHarmony(params.musicalKey, params.pitchRate ?? 1);
+    const noiseBuf = this.ensureBridgeNoise(ctx);
+    const masterDest = this.masterSum;
+
+    // 1. Sample-accurate escalating snare/clap roll (1/4 -> 1/8 -> 1/16 -> 1/32)
+    const hitTimes: number[] = [];
+    let t = startAt;
+    while (t < startAt + buildDur - 0.02) {
+      hitTimes.push(t);
+      const progress = (t - startAt) / buildDur;
+      const subdiv =
+        progress < 0.35
+          ? beatSec * 0.5
+          : progress < 0.65
+          ? beatSec * 0.25
+          : progress < 0.86
+          ? beatSec * 0.125
+          : beatSec * 0.0625;
+      t += subdiv;
+    }
+
+    hitTimes.forEach((ht, idx) => {
+      const p = idx / Math.max(1, hitTimes.length - 1);
+      // Snare body tone
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(190 + p * 120, ht);
+      osc.frequency.exponentialRampToValueAtTime(115 + p * 45, ht + 0.06);
+
+      const og = ctx.createGain();
+      og.gain.setValueAtTime(0.001, ht);
+      og.gain.linearRampToValueAtTime(0.14 + p * 0.2, ht + 0.004);
+      og.gain.exponentialRampToValueAtTime(0.001, ht + 0.075);
+      osc.connect(og);
+      og.connect(masterDest);
+      osc.start(ht);
+      osc.stop(ht + 0.085);
+
+      // Crisp snare/clap noise transient
+      const nSrc = ctx.createBufferSource();
+      nSrc.buffer = noiseBuf;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(1800 + p * 2600, ht);
+      bp.Q.value = 1.4;
+      const ng = ctx.createGain();
+      ng.gain.setValueAtTime(0.001, ht);
+      ng.gain.linearRampToValueAtTime(0.16 + p * 0.24, ht + 0.003);
+      ng.gain.exponentialRampToValueAtTime(0.001, ht + 0.07);
+      nSrc.connect(bp);
+      bp.connect(ng);
+      ng.connect(masterDest);
+      nSrc.start(ht);
+      nSrc.stop(ht + 0.08);
+    });
+
+    // 2. Rising Camelot chord riser sweeping up into the silence gap
+    const riserLp = ctx.createBiquadFilter();
+    riserLp.type = 'lowpass';
+    riserLp.frequency.setValueAtTime(280, startAt);
+    riserLp.frequency.exponentialRampToValueAtTime(7200, startAt + buildDur);
+    riserLp.Q.value = 3.0;
+
+    const riserGain = ctx.createGain();
+    riserGain.gain.setValueAtTime(0.001, startAt);
+    riserGain.gain.exponentialRampToValueAtTime(0.22, startAt + buildDur * 0.92);
+    riserGain.gain.exponentialRampToValueAtTime(0.001, startAt + buildDur + 0.03);
+    riserLp.connect(riserGain);
+    riserGain.connect(masterDest);
+
+    harmony.chordHz.slice(0, 3).forEach((f, idx) => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(f, startAt);
+      osc.frequency.exponentialRampToValueAtTime(f * 1.498, startAt + buildDur);
+      osc.detune.setValueAtTime((idx - 1) * 10, startAt);
+      osc.connect(riserLp);
+      osc.start(startAt);
+      osc.stop(startAt + buildDur + 0.04);
+    });
+
+    // 3. Downbeat Sub-Drop Slam right on dropAt (after the 1-beat dead-silence cut)
+    const subOsc = ctx.createOscillator();
+    subOsc.type = 'sine';
+    subOsc.frequency.setValueAtTime(Math.max(92, harmony.rootHz * 0.5), dropAt);
+    subOsc.frequency.exponentialRampToValueAtTime(34, dropAt + Math.min(1.1, beatSec * 1.8));
+    const subGain = ctx.createGain();
+    subGain.gain.setValueAtTime(0.001, dropAt);
+    subGain.gain.linearRampToValueAtTime(0.7, dropAt + 0.014);
+    subGain.gain.exponentialRampToValueAtTime(0.001, dropAt + Math.min(1.2, beatSec * 2.0));
+    subOsc.connect(subGain);
+    subGain.connect(masterDest);
+    subOsc.start(dropAt);
+    subOsc.stop(dropAt + Math.min(1.25, beatSec * 2.1));
+
+    // Downbeat noise crash on dropAt
+    const crashSrc = ctx.createBufferSource();
+    crashSrc.buffer = noiseBuf;
+    const crashHp = ctx.createBiquadFilter();
+    crashHp.type = 'highpass';
+    crashHp.frequency.value = 3200;
+    const crashGain = ctx.createGain();
+    crashGain.gain.setValueAtTime(0.001, dropAt);
+    crashGain.gain.linearRampToValueAtTime(0.28, dropAt + 0.01);
+    crashGain.gain.exponentialRampToValueAtTime(0.001, dropAt + Math.min(0.95, beatSec * 1.6));
+    crashSrc.connect(crashHp);
+    crashHp.connect(crashGain);
+    crashGain.connect(masterDest);
+    crashSrc.start(dropAt);
+    crashSrc.stop(dropAt + Math.min(1.0, beatSec * 1.7));
+
+    // 4. Optional Drop Voice / Custom Drop landed cleanly inside the pre-drop gap
+    const voiceDelaySec = Math.max(0.05, startAt + buildDur - ctx.currentTime);
+    if (params.customVoiceBuffer) {
+      void this.playCustomVoiceBuffer(params.customVoiceBuffer, safeBpm, voiceDelaySec);
+    } else if (params.voiceId) {
+      const voiceTimeoutMs = Math.max(0, Math.round(voiceDelaySec * 1000));
+      setTimeout(() => {
+        if (params.voiceId) {
+          void this.playVoiceDrop(params.voiceId, safeBpm, params.musicalKey, params.pitchRate);
+        }
+      }, voiceTimeoutMs);
+    }
+  }
+
+  // =========================================================================
   // Advance #3: Live In-Key Groove & Drum Bridge Sequencer (AudioContext Clock)
   // =========================================================================
 
@@ -1823,7 +3748,7 @@ export class DjAudioEngine {
     if (!this.ctx || !this.masterSum || this.bridgePattern === 'off') return;
     const ctx = this.ctx;
     const step16 = stepIdx % 16;
-    const harmony = camelotToHarmony(this.bridgeKey);
+    const harmony = camelotToHarmony(this.bridgeKey, this.bridgePitchRate);
     const subRoot = Math.max(41, Math.min(82, harmony.rootHz * 0.25));
     const pat = this.bridgePattern;
     const noiseBuf = this.ensureBridgeNoise(ctx);
@@ -1940,25 +3865,72 @@ export class DjAudioEngine {
       osc.stop(time + decay + 0.02);
     };
 
+    const playAcidBass = (freq: number, gainAmt: number, dur: number, accent = false) => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq, time);
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.Q.setValueAtTime(accent ? 5.2 : 3.2, time);
+      lp.frequency.setValueAtTime(accent ? 1950 : 980, time);
+      lp.frequency.exponentialRampToValueAtTime(165, time + dur);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.001, time);
+      g.gain.linearRampToValueAtTime(gainAmt, time + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.001, time + dur);
+      osc.connect(lp);
+      lp.connect(g);
+      g.connect(this.masterSum!);
+      osc.start(time);
+      osc.stop(time + dur + 0.02);
+    };
+
+    const playSnareFill = (gainAmt: number) => {
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.setValueAtTime(2350, time);
+      bp.Q.value = 1.6;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(gainAmt, time);
+      g.gain.exponentialRampToValueAtTime(0.001, time + 0.09);
+      src.connect(bp);
+      bp.connect(g);
+      g.connect(this.masterSum!);
+      src.start(time);
+      src.stop(time + 0.1);
+    };
+
     // 4-bar chord root progression matching Camelot mode: i–VI–III–VII (minor) or I–V–vi–IV (major)
     const progression = harmony.isMinor ? [0, -4, -9, -2] : [0, -5, -3, -7];
     const barSemitone = progression[this.bridgeBar % progression.length];
     const barMult = Math.pow(2, barSemitone / 12);
+    const beatSec = 60 / Math.max(65, this.bridgeBpm);
+    const isTurnaroundBar = this.bridgeBar === 3;
+
+    // Upgrade #6: Auto Bar-4 Turnaround Drum Fill on final beat (steps 12..15)
+    if (isTurnaroundBar && step16 >= 12 && pat !== 'top-hats') {
+      playSnareFill(0.11 + (step16 - 12) * 0.032);
+    }
 
     if (pat === 'top-hats') {
       if (step16 % 2 === 0) playHat(step16 % 4 === 2 ? 0.16 : 0.09, step16 % 4 === 2 ? 0.09 : 0.04, 6200);
       if (step16 === 4 || step16 === 12) playClap(0.15);
-      if (step16 === 14) playHat(0.08, 0.04, 7200);
+      if (step16 === 14 || (isTurnaroundBar && step16 >= 13)) playHat(0.09, 0.04, 7200);
     } else if (pat === 'house-4x4') {
       if (step16 % 4 === 0) playKick(0.28);
       if (step16 % 4 === 2) playHat(0.13, 0.08, 5600);
       else playHat(0.045, 0.03, 7400);
       if (step16 === 4 || step16 === 12) playClap(0.16);
-      if (step16 === 3 || step16 === 11) {
-        playSub808(harmony.rootHz * 0.5 * barMult, 0.08, 0.11);
+      // 16-step offbeat In-Key Acid/Sub Groove bassline
+      if (step16 === 2 || step16 === 6 || step16 === 10 || step16 === 14 || step16 === 15) {
+        const acidFreq =
+          harmony.rootHz * 0.5 * barMult * (step16 === 14 ? 1.498 : step16 === 15 ? 1.189 : 1);
+        playAcidBass(acidFreq, step16 === 14 ? 0.13 : 0.095, beatSec * 0.28, step16 === 14);
       }
-      if (this.bridgeBar === 3 && (step16 === 12 || step16 === 14)) {
-        playArpNote(harmony.chordHz[step16 === 12 ? 1 : 2] * barMult, 0.08, 0.14);
+      if (isTurnaroundBar && (step16 === 12 || step16 === 14)) {
+        playArpNote(harmony.chordHz[step16 === 12 ? 1 : 2] * barMult, 0.085, 0.14);
       }
     } else if (pat === 'sub-808') {
       if (step16 === 0 || step16 === 6 || step16 === 10) {
@@ -1968,20 +3940,32 @@ export class DjAudioEngine {
       if (step16 === 0 || step16 === 10) playKick(0.22, 110, 42);
       if (step16 === 8) playClap(0.16);
       if (step16 % 2 === 0 || step16 === 13 || step16 === 15) playHat(0.075, 0.035, 6800);
+      if (isTurnaroundBar && (step16 === 13 || step16 === 15)) {
+        playAcidBass(harmony.rootHz * 0.5 * barMult * 1.498, 0.11, beatSec * 0.24, true);
+      }
     } else if (pat === 'afro-perc') {
+      // Metric Modulation Bridge feel: 3-against-2 dotted polyrhythm accents in bars 0-1 -> straight drive
+      const isPolyrhythmStep = this.bridgeBar < 2 && (step16 === 0 || step16 === 3 || step16 === 6 || step16 === 9 || step16 === 12);
       if (step16 === 0 || step16 === 8) playKick(0.22, 120, 48);
-      if (step16 === 0 || step16 === 3 || step16 === 6 || step16 === 10 || step16 === 12) {
+      if (isPolyrhythmStep || (this.bridgeBar >= 2 && (step16 === 3 || step16 === 6 || step16 === 10 || step16 === 12))) {
         const pitchMult = step16 === 6 || step16 === 12 ? 1.25 : 1;
         playSub808(harmony.rootHz * 0.5 * pitchMult * barMult, 0.16, 0.14);
       }
       if (step16 === 4 || step16 === 14) playClap(0.11);
       playHat(step16 % 2 === 0 ? 0.07 : 0.035, 0.03, 5200);
     } else if (pat === 'chord-arp') {
-      // Advance #7: In-Key 4-bar Chord Progression + Sidechained Pulse + Rolling 16th Arp
-      const beatSec = 60 / Math.max(65, this.bridgeBpm);
+      // Advance #7 + Upgrade #6: In-Key 4-bar Chord Progression + Acid Bass + Rolling 16th Arp
       if (step16 === 0 || step16 === 8) {
         playChordPad(barSemitone, 0.11, beatSec * 1.75);
         playSub808(subRoot * barMult, 0.18, beatSec * 0.65);
+      }
+      if (step16 === 3 || step16 === 6 || step16 === 11 || step16 === 14) {
+        playAcidBass(
+          harmony.rootHz * 0.5 * barMult * (step16 === 14 ? 1.498 : 1),
+          0.095,
+          beatSec * 0.25,
+          step16 === 14
+        );
       }
       const arpNotes = [
         harmony.chordHz[0],
@@ -1989,7 +3973,7 @@ export class DjAudioEngine {
         harmony.chordHz[2],
         harmony.chordHz[0] * 2,
       ];
-      if (step16 % 2 === 0 || (this.bridgeBar === 3 && step16 >= 8)) {
+      if (step16 % 2 === 0 || (isTurnaroundBar && step16 >= 8)) {
         const noteFreq = arpNotes[(step16 + this.bridgeBar) % arpNotes.length] * barMult;
         playArpNote(noteFreq, step16 % 4 === 2 ? 0.12 : 0.075, beatSec * 0.35);
       }
@@ -2000,7 +3984,8 @@ export class DjAudioEngine {
   public async startGrooveBridge(
     pattern: GrooveBridgePattern,
     bpm = 124,
-    musicalKey = '8A'
+    musicalKey = '8A',
+    pitchRate = 1
   ) {
     if (pattern === 'off') {
       this.stopGrooveBridge();
@@ -2010,6 +3995,7 @@ export class DjAudioEngine {
     this.bridgePattern = pattern;
     this.bridgeBpm = Math.max(65, Math.min(185, bpm));
     this.bridgeKey = musicalKey || '8A';
+    this.bridgePitchRate = Math.max(0.5, Math.min(2.0, pitchRate || 1));
 
     if (this.bridgeTimerId) return;
     this.bridgeStep = 0;
@@ -2030,9 +4016,12 @@ export class DjAudioEngine {
     }, 25);
   }
 
-  public updateGrooveBridge(bpm: number, musicalKey?: string) {
+  public updateGrooveBridge(bpm: number, musicalKey?: string, pitchRate?: number) {
     this.bridgeBpm = Math.max(65, Math.min(185, bpm));
     if (musicalKey) this.bridgeKey = musicalKey;
+    if (typeof pitchRate === 'number' && Number.isFinite(pitchRate) && pitchRate > 0) {
+      this.bridgePitchRate = Math.max(0.5, Math.min(2.0, pitchRate));
+    }
   }
 
   public stopGrooveBridge() {

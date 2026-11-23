@@ -653,18 +653,22 @@ export const DeckPanel: React.FC<DeckPanelProps> = ({
                       ? 'bg-purple-500/25 border-purple-400/60 text-purple-200'
                       : deck.stemMode === 'instrumental'
                       ? 'bg-cyan-500/25 border-cyan-400/60 text-cyan-200'
+                      : deck.stemMode === 'drums-only'
+                      ? 'bg-amber-500/25 border-amber-400/60 text-amber-200'
                       : 'bg-[#171C26] border-white/10 text-slate-300 hover:text-white'
                   }`}
                   title={
                     deck.playbackMode === 'youtube-iframe'
-                      ? 'Mid/Side Stem Isolator requires Web Audio decoded audio'
-                      : 'Cycle Real-Time Mid/Side Stem Isolator (Off -> Vocal Focus -> Instrumental)'
+                      ? '3-Stem HPSS / Mid-Side Isolator requires Web Audio decoded audio'
+                      : 'Cycle 3-Stem Isolator (Off -> Vocal Focus -> Instrumental -> Drums Only)'
                   }
                 >
                   {deck.stemMode === 'vocal-focus'
                     ? 'Stem: Voc'
                     : deck.stemMode === 'instrumental'
                     ? 'Stem: Inst'
+                    : deck.stemMode === 'drums-only'
+                    ? 'Stem: Drums'
                     : 'Stem: Off'}
                 </button>
               )}

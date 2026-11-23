@@ -60,7 +60,13 @@ export type GrooveDnaGenre =
   | 'pop-vocal'
   | 'rock-live';
 
-export type StemIsolationMode = 'off' | 'vocal-focus' | 'instrumental';
+export type StemIsolationMode = 'off' | 'vocal-focus' | 'instrumental' | 'drums-only';
+
+export interface TempoSegmentPoint {
+  startSec: number;
+  bpm: number;
+  downbeatSec: number;
+}
 
 export type GrooveBridgePattern =
   | 'off'
@@ -112,6 +118,7 @@ export interface TrackItem {
   dropCueSec?: number;
   detectedDropSec?: number;
   sections?: TrackSectionSegment[];
+  tempoMap?: TempoSegmentPoint[];
   autoTrimGain?: number;
   calibrated?: boolean;
   addedAt: number;
@@ -161,6 +168,7 @@ export interface DeckState {
   playbackRate: number; // e.g. 1.0 = 0% pitch
   pitchRange: 0.08 | 0.16 | 0.5;
   keyLock: boolean;
+  semitoneShift?: number;
   isMaster: boolean;
   syncLocked: boolean;
   cuePointSec: number;
@@ -249,6 +257,66 @@ export type SoundTrickType =
   | 'vinyl-crack'
   | 'riser-chord';
 
+export type DjVoiceCategory = 'shout' | 'hype' | 'groove' | 'countdown' | 'scratch-vox';
+
+export type DjVoiceDropId =
+  | 'hey-chant'
+  | 'lets-go'
+  | 'hands-up'
+  | 'put-em-up'
+  | 'make-some-noise'
+  | 'crowd-roar'
+  | 'everybody-jump'
+  | 'pump-it'
+  | 'turn-it-up'
+  | 'oh-my-god'
+  | 'groove-yeah'
+  | 'ah-yeah-chop'
+  | 'funk-woo'
+  | 'afro-eyy'
+  | 'vocoder-harmony'
+  | 'sunset-breathe'
+  | 'count-1234'
+  | 'three-two-one'
+  | 'bass-drop'
+  | 'pull-up'
+  | 'dj-scratch-aaah'
+  | 'yo-yo-yo'
+  | 'check-mic'
+  | 'vip-remix';
+
+export type CustomVoiceSlotId = 'custom-1' | 'custom-2' | 'custom-3' | 'custom-4';
+
+export type AnyVoiceDropId = DjVoiceDropId | CustomVoiceSlotId;
+
+export interface CustomVoiceDropMeta {
+  id: CustomVoiceSlotId;
+  label: string;
+  durationSec: number;
+  hasAudio: boolean;
+  enabled: boolean;
+}
+
+export interface WaveformAiMarker {
+  id: string;
+  deckId: DeckId;
+  kind: 'moment' | 'fakeout' | 'vip-skip' | 'tease' | 'mix-out';
+  timeSec: number;
+  label: string;
+  muted?: boolean;
+  momentIndex?: number;
+}
+
+export interface DjVoicePresetMeta {
+  id: DjVoiceDropId;
+  label: string;
+  calloutText: string;
+  category: DjVoiceCategory;
+  energyMin: number; // 0..100
+  chillSafe: boolean;
+  description: string;
+}
+
 export type AiTrickActionType =
   | 'eq-bass-swap'
   | 'stem-mid-swap'
@@ -320,7 +388,7 @@ export interface AiSetlistItem {
 
 export interface AiSongEffectMoment {
   atPct: number;       // 0.08 .. 0.56 during cruising
-  durationMs: number;  // 900 .. 3200
+  durationMs: number;  // 900 .. 4500
   fxType: FxType;
   fxWet: number;
   beatDiv: number;
@@ -332,8 +400,13 @@ export interface AiSongEffectMoment {
   chopPattern?: AiChopPatternType;
   cueJuggleSeq?: number[];
   soundTrick?: SoundTrickType;
+  voiceDropId?: AnyVoiceDropId;
   pitchBurst?: number;
   beatSlicePattern?: number[];
+  isVipDropFakeout?: boolean;
+  useSampleAccurateBuild?: boolean;
+  youtubePumpMode?: 'sidechain' | 'gate-8th' | 'drop-takeover';
+  deckCHookPattern?: 'quarter' | 'half' | 'full-echo';
   label: string;
 }
 
@@ -346,6 +419,14 @@ export interface OverlapClashProfile {
   summary: string;
 }
 
+export type GenrePhysicsMode = 'trap-to-house' | 'chill-velvet' | 'dnb-chop' | 'standard';
+
+export interface AiTransitionVoiceCue {
+  atProgress: number;
+  voiceId: AnyVoiceDropId;
+  label: string;
+}
+
 export interface AiTransitionPlan {
   nextTrackId: string;
   mixStyle: string;
@@ -356,6 +437,9 @@ export interface AiTransitionPlan {
   tempoTargetBpm: number;   // smooth master BPM ramp target
   tempoFoldFactor?: 1 | 2 | 0.5;
   grooveRecipeLabel?: string;
+  outGroove?: GrooveDnaGenre;
+  inGroove?: GrooveDnaGenre;
+  genrePhysicsMode?: GenrePhysicsMode;
   recommendedBridge?: GrooveBridgePattern;
   bpmDeltaLabel?: string;
   keyTransitionLabel?: string;
@@ -363,8 +447,27 @@ export interface AiTransitionPlan {
   doubleDropCueSec?: number;
   clashProfile?: OverlapClashProfile;
   useBeatSliceStutter?: boolean;
+  vocalCarryoverBars?: number;
+  dynamicMidCallResponse?: boolean;
+  recommendedOutStartPct?: number;
+  pocketSummary?: string;
+  setTensionScore?: number;
+  isBreatherMix?: boolean;
+  vipSkipEdit?: {
+    triggerPct: number;
+    targetSec: number;
+    barsSkipped: number;
+    label: string;
+  };
+  teasePreview?: {
+    triggerPct: number;
+    durationBars: number;
+    cueSec: number;
+    label: string;
+  };
   aiNotes: string;
   tricks: AiTrickStep[];
+  voiceDrops?: AiTransitionVoiceCue[];
   songMoments: AiSongEffectMoment[];
   upcomingQueue?: AiSetlistItem[];
   chopPattern?: AiChopPatternType;
@@ -383,13 +486,19 @@ export interface AiMashupPhase {
   deckBEqLow: number;
   deckBEqMid: number;
   deckBEqHigh: number;
+  deckAStemMode?: StemIsolationMode;
+  deckBStemMode?: StemIsolationMode;
+  deckAFilter?: number;
+  deckBFilter?: number;
   pingPongBars?: number;
+  isDoubleDrop?: boolean;
   label: string;
 }
 
 export interface AiMashupBlendAdvice {
   syncDeck: 'A' | 'B';
   crossfader: number;
+  mashupTotalBars?: number;
   deckA: {
     eqLow: number;
     eqMid: number;
@@ -432,6 +541,9 @@ export interface AutopilotState {
   currentActionLabel: string;
   errorMessage: string | null;
   muteSoundTricks: boolean;
+  voiceFxEnabled: boolean;
+  enabledVoiceIds: DjVoiceDropId[];
+  mutedMomentIndices?: number[];
   grooveBridgePattern: GrooveBridgePattern;
   nextTransitionEtaSec: number | null;
   holdExtraBars: number;
